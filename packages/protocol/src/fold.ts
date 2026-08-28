@@ -85,7 +85,7 @@ import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "./sse.js";
 import { decodeEnduring, isZeroUUID } from "./enduring.js";
 import type { Gate } from "./gate.js";
 import type { AssistantRow, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft } from "./rows.js";
-import { narrationOf, refusalOf, splitStepGroup, thinkingOf } from "./rows.js";
+import { narrationOf, refusalOf, splitStepGroup, thinkingOf, toolResultText, toolUsesOf } from "./rows.js";
 
 // --- Session view -----------------------------------------------------------
 
@@ -787,19 +787,18 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
       // rejects an empty Messages): the segment belonged to a step that has
       // ended, and keeping it would dangle it into the next one.
       const snapped = dropLiveRows(next, decoded.loopId);
-      const { assistant } = splitStepGroup(decoded.payload.messages);
+      const { assistant, results } = splitStepGroup(decoded.payload.messages);
       if (assistant === undefined) return { ok: true, view: snapped };
       const thinking = thinkingOf(assistant.blocks);
       const text = narrationOf(assistant.blocks);
       const refusal = refusalOf(assistant.blocks);
-      // A pure-tool step commits no assistant row: its tool cards stand alone.
+      let out = snapped;
+      // A pure-tool step commits NO assistant row: its tool cards stand alone.
       // A truncated step is NOT special here — its notice is an ordinary text
       // block with no distinguishing tag, so it commits as narration and the
       // turn TERMINAL is what tells a truncated group from a clean one.
-      if (thinking === "" && text === "" && refusal === "") return { ok: true, view: snapped };
-      return {
-        ok: true,
-        view: appendRow(snapped, {
+      if (thinking !== "" || text !== "" || refusal !== "") {
+        out = appendRow(out, {
           kind: "assistant",
           loopId: decoded.loopId,
           turnId: decoded.turnId,
@@ -809,8 +808,36 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           thinking,
           text,
           refusal,
-        }),
-      };
+        });
+      }
+      // Block order, paired by ToolUseID. The step shape is one AIMessage
+      // followed by its ToolResultMessages, so the pairing key is the block's ID
+      // against ToolResultMessage.ToolUseID — NOT the ephemeral
+      // tool_execution_id, which never reaches the journal, and NOT the results'
+      // own order, which is the order they completed in. The prose row is
+      // committed first however late in the block order its text sits: the
+      // narration introduces the calls it accompanies.
+      for (const use of toolUsesOf(assistant)) {
+        const result = results.get(use.id);
+        out = appendRow(out, {
+          kind: "tool",
+          loopId: decoded.loopId,
+          turnId: decoded.turnId,
+          journalSeq,
+          live: false,
+          orphanedLoop: false,
+          toolUseId: use.id,
+          toolExecutionId: "",
+          toolName: use.name,
+          summary: "",
+          // A missing result is a call whose outcome the group does not carry;
+          // "ok" matches tui's storedStepToolCard rather than inventing an error.
+          status: result?.isError === true ? "error" : "ok",
+          result: toolResultText(result),
+          spawnedLoopId: "",
+        });
+      }
+      return { ok: true, view: out };
     }
     case "GateOpened": {
       // Copy-on-write, like every other branch here: fold() must never mutate

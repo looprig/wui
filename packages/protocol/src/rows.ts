@@ -159,6 +159,22 @@ export function splitStepGroup(messages: ConversationMessage[]): {
 }
 
 /**
+ * The AIMessage's tool-use blocks in BLOCK order — the executable children of
+ * the assistant message. The pairing key against a result is the block's `ID`
+ * (`ToolResultMessage.ToolUseID`), which is the DURABLE key: the ephemeral
+ * `tool_execution_id` the live card is keyed by never reaches the journal, so a
+ * cold replay could not pair with it.
+ */
+export function toolUsesOf(
+  message: ConversationMessage | undefined,
+): Array<Extract<ContentBlock, { type: "tool_use" }>> {
+  if (message === undefined) return [];
+  return message.blocks.filter(
+    (b): b is Extract<ContentBlock, { type: "tool_use" }> => b.type === "tool_use",
+  );
+}
+
+/**
  * Concatenates ONLY the TextBlocks, in block order, joined by "\n" — tui's
  * `textOnly`. Thinking blocks render as their own rail and tool-use blocks as
  * their own cards, so neither belongs in the narration; a refusal is excluded

@@ -47,7 +47,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { emptySessionView } from "../src/fold.js";
-import { narrationOf, refusalOf, splitStepGroup, thinkingOf, toolResultText } from "../src/rows.js";
+import { narrationOf, refusalOf, splitStepGroup, thinkingOf, toolResultText, toolUsesOf } from "../src/rows.js";
 import { decodeMessages, type ContentBlock } from "../src/blocks.js";
 import type { EventEnvelope } from "../src/types.js";
 import {
@@ -90,6 +90,18 @@ const STEP_DONE_MULTI_TEXT_WIRE =
 /** REDACTED reasoning: the provider bytes are the whole block; Thinking is "". */
 const STEP_DONE_REDACTED_THINKING_WIRE =
   '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"ProviderState":"opaque","ProviderStateFormat":"anthropic","Signature":"","Thinking":"","type":"thinking"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+/** Reasoning, narration and TWO tool calls, whose results arrive in the REVERSE order. */
+const STEP_DONE_PROSE_AND_TOOLS_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"Signature":"sig","SignatureFormat":"anthropic","Thinking":"half a thought","type":"thinking"},{"Text":"reading both","type":"text"},{"ID":"toolu_1","Input":{"path":"/a"},"Name":"Read","type":"tool_use"},{"ID":"toolu_2","Input":{"path":"/b"},"Name":"Read","type":"tool_use"}]},{"role":"tool","blocks":[{"Text":"B body","type":"text"}],"tool_use_id":"toolu_2"},{"role":"tool","blocks":[{"Text":"no such file","type":"text"}],"tool_use_id":"toolu_1","is_error":true}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+/** The tool-use block comes FIRST, the narration after it. */
+const STEP_DONE_TOOL_THEN_TEXT_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"ID":"toolu_1","Input":{},"Name":"Read","type":"tool_use"},{"Text":"narration after the call","type":"text"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+/** A result carrying several blocks, one of which has no display form at all. */
+const STEP_DONE_MULTIBLOCK_RESULT_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"ID":"toolu_5","Input":{},"Name":"Bash","type":"tool_use"}]},{"role":"tool","blocks":[{"Text":"line one\\n","type":"text"},{"MediaType":"image/png","Source":{"URL":"","Data":"iVA="},"type":"image"},{"Text":"line two","type":"text"}],"tool_use_id":"toolu_5"}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
 
 function wireEnvelope(json: string): EventEnvelope {
   return JSON.parse(json) as EventEnvelope;
@@ -331,5 +343,106 @@ describe("rows: the StepDone snap", () => {
     // The snap still happens: the live segment belonged to a step that has now
     // ended, and keeping it would dangle it into the next step.
     expect(view.rows).toStrictEqual([]);
+  });
+});
+
+describe("rows: StepDone tool expansion", () => {
+  it("toolUsesOf returns the tool-use blocks in BLOCK order and nothing else", () => {
+    const [message] = decodeMessages([
+      {
+        role: "assistant",
+        blocks: [
+          textBlockWire("narration"),
+          { type: "tool_use", ID: "toolu_1", Name: "Read", Input: {} },
+          { type: "thinking", Thinking: "t", Signature: "" },
+          { type: "tool_use", ID: "toolu_2", Name: "Bash", Input: {} },
+        ],
+      },
+    ]);
+    expect(toolUsesOf(message).map((b) => b.id)).toStrictEqual(["toolu_1", "toolu_2"]);
+    expect(toolUsesOf(undefined)).toStrictEqual([]);
+  });
+
+  it("commits one tool row per tool-use block, in block order, paired by ToolUseID", () => {
+    // The results arrive REVERSED on the wire (toolu_2 before toolu_1), so a
+    // positional pairing produces the right count and the wrong contents.
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_PROSE_AND_TOOLS_WIRE), 20)]);
+    expect(view.rows.map((r) => r.kind)).toStrictEqual(["assistant", "tool", "tool"]);
+    expect(view.rows[1]).toStrictEqual({
+      kind: "tool",
+      ordinal: 1,
+      loopId: LOOP_A,
+      turnId: TURN_1,
+      journalSeq: 20,
+      live: false,
+      orphanedLoop: false,
+      toolUseId: "toolu_1",
+      // "" on a snapped row: the ephemeral tool_execution_id never reaches the
+      // journal, so a cold replay has no value to put here.
+      toolExecutionId: "",
+      toolName: "Read",
+      summary: "",
+      status: "error",
+      result: "no such file",
+      spawnedLoopId: "",
+    });
+    expect(view.rows[2]).toMatchObject({
+      ordinal: 2,
+      toolUseId: "toolu_2",
+      toolName: "Read",
+      status: "ok",
+      result: "B body",
+      journalSeq: 20,
+    });
+  });
+
+  it("commits a tool row with status ok and no result when the result message is missing", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_PURE_TOOL_WIRE), 21)]);
+    expect(view.rows).toStrictEqual([
+      expect.objectContaining({ kind: "tool", toolUseId: "toolu_9", toolName: "Bash", status: "ok", result: "" }),
+    ]);
+  });
+
+  it("commits the assistant row BEFORE its tool rows, whatever the block order", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_TOOL_THEN_TEXT_WIRE), 22)]);
+    expect(view.rows.map((r) => r.ordinal)).toStrictEqual([0, 1]);
+    expect(view.rows[0]).toMatchObject({ kind: "assistant", text: "narration after the call" });
+    expect(view.rows[1]).toMatchObject({ kind: "tool", toolUseId: "toolu_1" });
+  });
+
+  it("flattens a multi-block result into the row's display text", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_MULTIBLOCK_RESULT_WIRE), 23)]);
+    expect(view.rows).toHaveLength(1);
+    expect(view.rows[0]).toMatchObject({ kind: "tool", toolUseId: "toolu_5", result: "line one\nline two" });
+  });
+
+  it("replaces the live card with the committed row rather than showing both", () => {
+    // The dedup the snap solves with no shared key: the live card is keyed by
+    // tool_execution_id, the committed row by ToolUseID, and nothing on the
+    // wire relates the two. Discarding the whole live segment is what makes
+    // that unnecessary.
+    resetSeq();
+    const view = run(emptySessionView(), [
+      liveEphemeral(
+        "tool_call_started",
+        { tool_execution_id: "f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1", tool_name: "Bash", summary: "Bash(ls)" },
+        LOOP_A,
+        TURN_1,
+      ),
+      liveEphemeral(
+        "tool_call_completed",
+        { tool_execution_id: "f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1", result_preview: "capped preview" },
+        LOOP_A,
+        TURN_1,
+      ),
+      history(wireEnvelope(STEP_DONE_PURE_TOOL_WIRE), 24),
+    ]);
+    const tools = view.rows.filter((r) => r.kind === "tool");
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({ live: false, toolUseId: "toolu_9", toolExecutionId: "", journalSeq: 24 });
   });
 });
