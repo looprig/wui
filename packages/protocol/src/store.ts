@@ -97,6 +97,7 @@ export class SessionViewStore {
   private readonly options: SessionViewStoreOptions;
   private readonly scheduler: FrameScheduler;
   private readonly listeners = new Set<() => void>();
+  private readonly errorListeners = new Set<(error: Error) => void>();
 
   private current: SessionView = emptySessionView();
   private published: SessionViewSnapshot;
@@ -119,6 +120,30 @@ export class SessionViewStore {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
+    };
+  }
+
+  /**
+   * Subscribes to fold and join errors. Returns an unsubscribe.
+   *
+   * Fold errors are EVENTS, not state. Coalescing state would hide them exactly
+   * as batching inside `join` would: two errors inside one frame would collapse
+   * to one observable value, and an error immediately followed by a success
+   * would vanish entirely — the view published at the end of the frame carries
+   * no trace of it. So this channel is deliberately NOT coalesced: every error
+   * is delivered synchronously, in order, at the moment it is folded.
+   *
+   * A `FoldError` is non-fatal — fold.ts's contract is that the loop keeps
+   * going past one bad input — so the store stays active. A FATAL join failure
+   * (a rejected `readHistory`, or a live iterator that threw with
+   * `autoReconnect` off) arrives on this same channel as a plain `Error` and IS
+   * followed by the store going inactive; `isActive()` is how a consumer tells
+   * the two apart, and `instanceof FoldError` is how it classifies them.
+   */
+  subscribeErrors(listener: (error: Error) => void): () => void {
+    this.errorListeners.add(listener);
+    return () => {
+      this.errorListeners.delete(listener);
     };
   }
 
@@ -200,8 +225,12 @@ export class SessionViewStore {
       for await (const event of generator) {
         if (generation !== this.generation) return; // superseded by a newer cycle
         this.current = event.view;
+        if (!event.ok) this.emitError(event.error);
         this.publish();
       }
+    } catch (error) {
+      if (generation !== this.generation) return;
+      this.emitError(asError(error));
     } finally {
       if (generation === this.generation) {
         this.active = false;
@@ -210,6 +239,10 @@ export class SessionViewStore {
         this.finalize();
       }
     }
+  }
+
+  private emitError(error: Error): void {
+    for (const listener of [...this.errorListeners]) listener(error);
   }
 
   /** Marks state dirty and schedules at most one notify per frame. */
@@ -266,6 +299,11 @@ function cancelableLiveSource(inner: LiveFrameSource): { source: LiveFrameSource
       activeIterator = undefined;
     },
   };
+}
+
+/** Narrows a `catch`'s `unknown` without an `as`; every rejection here is already an Error. */
+function asError(cause: unknown): Error {
+  return cause instanceof Error ? cause : new Error(String(cause), { cause });
 }
 
 /** `joinSessionView` does not thread a signal into `readHistory`; this does. */
