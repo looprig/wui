@@ -1,0 +1,35 @@
+{
+  // One config for both `tsc --noEmit` and the editor. Unlike the packages,
+  // this project emits nothing, so there is no `rootDir`/`declaration`
+  // constraint forcing a second file: `paths` may point straight at the
+  // sibling workspace sources.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "types": ["vite/client", "@vitest/browser-playwright"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "forceConsistentCasingInFileNames": true,
+    // Mirrors vite.config.ts's resolve.alias so the type checker and the
+    // bundler agree on where @looprig/protocol lives. Without it, tsc resolves
+    // the package `exports` to ./dist/index.d.ts, which a fresh checkout has
+    // not built.
+    "paths": {
+      "@looprig/protocol": ["../packages/protocol/src/index.ts"]
+    }
+  },
+  "include": ["src", "vite.config.ts", "vite.config.test.ts"],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}

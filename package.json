@@ -1,5 +1,8 @@
 {
   "name": "looprig-wui-workspace",
   "private": true,
-  "workspaces": ["packages/*"]
+  "workspaces": [
+    "packages/*",
+    "app"
+  ]
 }

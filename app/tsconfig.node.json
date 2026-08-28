@@ -1,0 +1,19 @@
+{
+  // The build-tooling half of the project: `vite.config.ts` and its test run in
+  // node, not in the browser, so they are the only files that may see node's
+  // globals and `node:*` builtins.
+  "compilerOptions": {
+    "composite": true,
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true
+  },
+  "include": ["vite.config.ts", "vite.config.test.ts"]
+}
