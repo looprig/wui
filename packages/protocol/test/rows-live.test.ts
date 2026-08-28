@@ -35,6 +35,8 @@ import {
   liveEphemeral,
   loopStarted,
   resetSeq,
+  imageDelta,
+  refusalDelta,
   textBlockWire,
   textDelta,
   thinkingDelta,
@@ -198,15 +200,180 @@ describe("rows: the live segment", () => {
     ]);
   });
 
-  it("DOCUMENTS A GAP: a streamed refusal chunk never reaches the live segment", () => {
-    // harness emits a refusal as its own chunk type — pkg/serve/ephemeral.go's
-    // refusalChunkDTO, pinned by harness's own
-    // handlers_events_test.go: `"chunk_type":"refusal"`, `"text":"I can't"`.
-    // fold's parseTokenDeltaChunk (inherited verbatim from client/sdk/core)
-    // knows only text/thinking/tool_use, so the frame is REJECTED rather than
-    // folded, and AssistantRow.refusal is populated only by the StepDone snap.
-    // Pinned rather than left silent: closing the gap must break this test.
-    const result = fold(emptySessionView(), liveEphemeral("token_delta", { chunk_type: "refusal", text: "I can't" }, LOOP_A));
+  it("streams a refusal into the live segment's refusal field", () => {
+    // THE GAP THIS FILE USED TO PIN. harness emits a refusal as its OWN chunk
+    // type — pkg/serve/ephemeral.go's refusalChunkDTO, whose delta marshals to
+    // {"chunk_type":"refusal","text":"I can't"} — and the inherited
+    // parseTokenDeltaChunk (copied from client/sdk/core) knew only
+    // text/thinking/tool_use, so a streamed refusal came back as an
+    // unknown_chunk_type FOLD ERROR and its text appeared only later, via the
+    // StepDone snap. A user watching a refusal stream saw an error, then text.
+    //
+    // It lands in `refusal`, never `text`: a RefusalBlock's payload is
+    // byte-identical to a TextBlock's and the tag is the only thing that keeps
+    // a declined request from rendering as the model answering it. The same
+    // reason harness gave the chunk its own chunk_type rather than mapping it
+    // onto "text".
+    resetSeq();
+    const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
+      refusalDelta("I ca", LOOP_A, TURN_1),
+      refusalDelta("n't", LOOP_A, TURN_1),
+    ]);
+    expect(view.rows).toStrictEqual([
+      {
+        kind: "assistant",
+        ordinal: 0,
+        loopId: LOOP_A,
+        turnId: TURN_1,
+        journalSeq: undefined,
+        live: true,
+        orphanedLoop: false,
+        thinking: "",
+        text: "",
+        refusal: "I can't",
+      },
+    ]);
+  });
+
+  it("accumulates a refusal into the SAME segment text and thinking opened", () => {
+    // One segment per loop, whatever the chunk mix: a model that narrates and
+    // then declines is one assistant turn, not two rows.
+    resetSeq();
+    const view = run(emptySessionView(), [
+      textDelta("let me see", LOOP_A, TURN_1),
+      thinkingDelta("hmm", LOOP_A, TURN_1),
+      refusalDelta("no", LOOP_A, TURN_1),
+    ]);
+    expect(view.rows).toHaveLength(1);
+    expect(view.rows[0]).toMatchObject({ text: "let me see", thinking: "hmm", refusal: "no", ordinal: 0 });
+  });
+
+  it("REPLACES the live row on a refusal chunk rather than mutating it", () => {
+    resetSeq();
+    let view = run(emptySessionView(), [refusalDelta("I ", LOOP_A, TURN_1)]);
+    const before = view.rows[0];
+    Object.freeze(before);
+    view = run(view, [refusalDelta("won't", LOOP_A, TURN_1)]);
+    expect(view.rows[0]).not.toBe(before);
+    expect(before).toMatchObject({ refusal: "I " });
+    expect(view.rows[0]).toMatchObject({ refusal: "I won't" });
+  });
+
+  it("still appends a refusal chunk to the legacy content bucket", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [refusalDelta("no", LOOP_A)]);
+    expect(view.content).toStrictEqual([
+      { chunkType: "refusal", text: "no", header: view.content[0]?.header },
+    ]);
+  });
+
+  it("rejects a refusal chunk with no string text as malformed, not unknown", () => {
+    const result = fold(emptySessionView(), liveEphemeral("token_delta", { chunk_type: "refusal" }, LOOP_A));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.reason).toBe("malformed_delta");
+  });
+});
+
+describe("rows: image chunks", () => {
+  /**
+   * harness's imageChunkDTO, verbatim from `pkg/serve/ephemeral.go`
+   * (harness@v0.30.0):
+   *
+   *     ChunkType string            `json:"chunk_type"`
+   *     Index     int               `json:"index"`
+   *     MediaType content.MediaType `json:"media_type,omitempty"`
+   *     URL       string            `json:"url,omitempty"`
+   *     Data      []byte            `json:"data,omitempty"`
+   *
+   * Marshalling a real `content.ImageChunk` through it yields
+   * `{"chunk_type":"image","index":3,"media_type":"image/png","data":"iVA="}`
+   * for a byte delta and `{"chunk_type":"image","index":0}` for a zero chunk —
+   * so `index` is ALWAYS present (no omitempty) and the other three are not.
+   *
+   * ## Why an image chunk commits no row
+   *
+   * It is a per-image FRAGMENT: `Data` appends in arrival order and `URL`
+   * arrives whole, and core's own doc records that splicing one image's bytes
+   * onto another's yields a file no decoder can recover. Reassembly is real
+   * work, and there is nothing at the far end of it — no row variant carries an
+   * image, and the enduring `StepDone` commits the finished ImageBlock anyway
+   * (blocks.ts decodes it as the opaque `other` variant, which no row projects).
+   * So the honest handling is the one `tool_use` chunks already get: parse it,
+   * append it to `content`, burn no ordinal, and above all do not fail the
+   * fold. A frame the transport legitimately emits must never surface as an
+   * error notice.
+   */
+  it("folds an image chunk without error and commits no row", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      imageDelta({ index: 3, media_type: "image/png", data: "iVA=" }, LOOP_A, TURN_1),
+    ]);
+    expect(view.rows).toStrictEqual([]);
+    expect(view.nextOrdinal).toBe(0);
+  });
+
+  it("appends the image chunk to the legacy content bucket, fields intact", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      imageDelta({ index: 3, media_type: "image/png", data: "iVA=" }, LOOP_A),
+    ]);
+    expect(view.content).toStrictEqual([
+      {
+        chunkType: "image",
+        index: 3,
+        mediaType: "image/png",
+        url: "",
+        data: "iVA=",
+        header: view.content[0]?.header,
+      },
+    ]);
+  });
+
+  it("folds the omitempty-stripped zero chunk the wire really carries", () => {
+    // `{"chunk_type":"image","index":0}` — media_type, url and data are all
+    // omitempty, so a chunk can legitimately carry none of them.
+    resetSeq();
+    const view = run(emptySessionView(), [imageDelta({ index: 0 }, LOOP_A)]);
+    expect(view.content).toStrictEqual([
+      { chunkType: "image", index: 0, mediaType: "", url: "", data: "", header: view.content[0]?.header },
+    ]);
+  });
+
+  it("carries a url-sourced image chunk", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      imageDelta({ index: 0, media_type: "image/png", url: "https://x/y.png" }, LOOP_A),
+    ]);
+    expect(view.content[0]).toMatchObject({ url: "https://x/y.png", data: "" });
+  });
+
+  it("does not open a live segment, so an image-only step commits nothing", () => {
+    // The whole point of committing no row: a step whose only ephemeral content
+    // was an image must not leave a blank assistant bubble behind either.
+    resetSeq();
+    const view = run(emptySessionView(), [
+      imageDelta({ index: 0, data: "iVA=" }, LOOP_A, TURN_1),
+      textDelta("after", LOOP_A, TURN_1),
+    ]);
+    expect(view.rows).toHaveLength(1);
+    expect(view.rows[0]).toMatchObject({ ordinal: 0, text: "after", thinking: "", refusal: "" });
+  });
+
+  it("rejects an image chunk with no numeric index as malformed", () => {
+    // `index` has no omitempty and is load-bearing: it identifies WHICH image
+    // of the response a fragment belongs to, and core records that splicing
+    // fragments across images produces an undetectably corrupt file.
+    const result = fold(emptySessionView(), liveEphemeral("token_delta", { chunk_type: "image", data: "iVA=" }, LOOP_A));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.reason).toBe("malformed_delta");
+  });
+
+  it("still reports a genuinely unrecognized chunk_type as unknown_chunk_type", () => {
+    // The reason exists to tell "the wire sent something never-before-seen"
+    // apart from "a known kind with a broken payload", and adding two known
+    // kinds must not blunt it.
+    const result = fold(emptySessionView(), liveEphemeral("token_delta", { chunk_type: "hologram" }, LOOP_A));
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.reason).toBe("unknown_chunk_type");
   });

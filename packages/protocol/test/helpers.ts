@@ -115,6 +115,27 @@ export function thinkingDelta(thinking: string, loopId?: string, turnId?: string
   return liveEphemeral("token_delta", { chunk_type: "thinking", thinking }, loopId, turnId);
 }
 
+/**
+ * harness's `refusalChunkDTO` — its own `chunk_type`, deliberately NOT riding
+ * on "text", because a client that rendered a refusal as text would show the
+ * model answering a request it declined.
+ */
+export function refusalDelta(text: string, loopId?: string, turnId?: string): FoldInput {
+  return liveEphemeral("token_delta", { chunk_type: "refusal", text }, loopId, turnId);
+}
+
+/**
+ * harness's `imageChunkDTO`. `index` is the only field with no omitempty, so
+ * the caller passes exactly the keys the wire would carry.
+ */
+export function imageDelta(
+  delta: Record<string, unknown>,
+  loopId?: string,
+  turnId?: string,
+): FoldInput {
+  return liveEphemeral("token_delta", { chunk_type: "image", ...delta }, loopId, turnId);
+}
+
 /** A Go-cased text content block, as core/content.TextBlock encodes. */
 export function textBlockWire(text: string): Record<string, unknown> {
   return { type: "text", Text: text };

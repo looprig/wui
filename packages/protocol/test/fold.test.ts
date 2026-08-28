@@ -200,10 +200,15 @@ describe("foldEphemeral: unknown kind", () => {
   });
 
   it("an unrecognized token_delta chunk_type (no schema backing at all, unlike kind) also produces a typed error, not a silent drop", () => {
+    // The fixture was "image" until the streamed-refusal fix. That was not a
+    // neutral placeholder: "image" is one of the FIVE variants of harness's
+    // sealed chunk union (encodeChunkDelta), so this test was pinning a real
+    // frame as unrecognized. A genuinely never-before-seen tag is what this
+    // reason is for.
     const frame = validateEphemeralFrame({
       v: 1,
       kind: "token_delta",
-      delta: { chunk_type: "image", data: "..." },
+      delta: { chunk_type: "hologram", data: "..." },
     });
     const result = foldFreshEphemeral(frame);
     expect(result.ok).toBe(false);

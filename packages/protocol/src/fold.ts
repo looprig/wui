@@ -47,8 +47,11 @@
  * (`TokenDeltaChunk`, `ToolCallStartedDelta`, `ToolCallCompletedDelta`,
  * `CompactionStartedDelta`) are hand-authored from harness's actual encoder
  * (`pkg/serve/ephemeral.go`'s `textChunkDTO`/`thinkingChunkDTO`/
- * `toolUseChunkDTO`/`toolCallStartedDelta`/`toolCallCompletedDelta`/
- * `compactionStartedDelta` structs), not from the vendored JSON Schema, and
+ * `toolUseChunkDTO`/`refusalChunkDTO`/`imageChunkDTO`/`toolCallStartedDelta`/
+ * `toolCallCompletedDelta`/`compactionStartedDelta` structs — all FIVE chunk
+ * variants of `encodeChunkDelta`'s sealed union, because a variant this parser
+ * does not know surfaces as a fold ERROR to a user who is only watching a
+ * model stream), not from the vendored JSON Schema, and
  * are validated by hand-rolled runtime guards below rather than ajv (there is
  * no per-kind schema to compile). A malformed `delta` (present but missing an
  * expected field, wrong type) yields a typed `FoldError`
@@ -122,7 +125,50 @@ export interface ToolUseContentDelta {
   header: EventHeader | undefined;
 }
 
-export type ContentDelta = TextContentDelta | ThinkingContentDelta | ToolUseContentDelta;
+/**
+ * A `token_delta` refusal chunk, folded from `content.RefusalChunk`'s tagged
+ * wire DTO. It carries its OWN `chunk_type` rather than riding on "text", and
+ * harness's own comment says why: "a client that saw a refusal as text would
+ * render the model answering a request it declined, and the two are not
+ * interchangeable on the wire any more than they are in memory." The payload is
+ * byte-identical to a text chunk's; the tag is the whole distinction.
+ */
+export interface RefusalContentDelta {
+  chunkType: "refusal";
+  text: string;
+  header: EventHeader | undefined;
+}
+
+/**
+ * A `token_delta` image chunk, folded from `content.ImageChunk`'s tagged wire
+ * DTO (`imageChunkDTO`).
+ *
+ * It is a per-image FRAGMENT, not an image: `data` appends in arrival order and
+ * `url` arrives whole and replaces any earlier value. `index` identifies WHICH
+ * image of the response the fragment belongs to and is load-bearing in a way a
+ * text chunk's absent index is not — core's own doc records that splicing one
+ * image's bytes onto another's yields a corrupt file no decoder can recover and
+ * no validation can detect. It is the one field with no `omitempty`.
+ *
+ * `data` is kept as the base64 string the JSON codec produced (Go `[]byte`), not
+ * decoded: nothing in this layer reassembles images, and a renderer that wants
+ * to has the exact bytes the wire carried.
+ */
+export interface ImageContentDelta {
+  chunkType: "image";
+  index: number;
+  mediaType: string;
+  url: string;
+  data: string;
+  header: EventHeader | undefined;
+}
+
+export type ContentDelta =
+  | TextContentDelta
+  | ThinkingContentDelta
+  | ToolUseContentDelta
+  | RefusalContentDelta
+  | ImageContentDelta;
 
 /**
  * One tool call's execution lifecycle, built by folding a `tool_call_started`
@@ -387,7 +433,23 @@ interface ToolUseChunkDelta {
   name: string;
   inputJson: string;
 }
-type TokenDeltaChunk = TextChunkDelta | ThinkingChunkDelta | ToolUseChunkDelta;
+interface RefusalChunkDelta {
+  chunkType: "refusal";
+  text: string;
+}
+interface ImageChunkDelta {
+  chunkType: "image";
+  index: number;
+  mediaType: string;
+  url: string;
+  data: string;
+}
+type TokenDeltaChunk =
+  | TextChunkDelta
+  | ThinkingChunkDelta
+  | ToolUseChunkDelta
+  | RefusalChunkDelta
+  | ImageChunkDelta;
 
 type GuardResult<T> = { ok: true; value: T } | { ok: false; error: FoldError };
 
@@ -398,6 +460,15 @@ type GuardResult<T> = { ok: true; value: T } | { ok: false; error: FoldError };
  * new chunk variant, not just a malformed one) gets its own reason so a
  * caller can tell "the wire sent something never-before-seen" apart from
  * "the wire sent a known kind with a broken payload".
+ *
+ * All FIVE variants of harness's sealed chunk union are here — text, thinking,
+ * tool_use, refusal and image (`pkg/serve/ephemeral.go`'s `encodeChunkDelta`).
+ * The version inherited from `client/sdk/core` knew only the first three, so a
+ * streamed refusal came back as an `unknown_chunk_type` fold error and its text
+ * appeared only later via the `StepDone` snap: a user watching a refusal stream
+ * saw an error, then the text. A frame the transport legitimately emits must
+ * never surface as an error notice, which is why the last two are parsed even
+ * though only one of them opens a row.
  */
 function parseTokenDeltaChunk(delta: Record<string, unknown> | undefined): GuardResult<TokenDeltaChunk> {
   if (!isRecord(delta)) {
@@ -421,6 +492,30 @@ function parseTokenDeltaChunk(delta: Record<string, unknown> | undefined): Guard
         return { ok: false, error: new FoldError("malformed_delta", 'token_delta "tool_use" chunk is missing one of its required fields (index/id/name/input_json)') };
       }
       return { ok: true, value: { chunkType: "tool_use", index, id, name, inputJson } };
+    }
+    case "refusal":
+      if (typeof delta["text"] !== "string") {
+        return { ok: false, error: new FoldError("malformed_delta", 'token_delta "refusal" chunk is missing a string "text" field') };
+      }
+      return { ok: true, value: { chunkType: "refusal", text: delta["text"] } };
+    case "image": {
+      // `index` is the ONLY field imageChunkDTO does not tag omitempty, so it
+      // is always on the wire, and it is the one a fragment cannot be placed
+      // without. media_type/url/data are legitimately absent.
+      const index = delta["index"];
+      if (typeof index !== "number") {
+        return { ok: false, error: new FoldError("malformed_delta", 'token_delta "image" chunk is missing a numeric "index" field') };
+      }
+      return {
+        ok: true,
+        value: {
+          chunkType: "image",
+          index,
+          mediaType: optionalString(delta["media_type"]) ?? "",
+          url: optionalString(delta["url"]) ?? "",
+          data: optionalString(delta["data"]) ?? "",
+        },
+      };
     }
     default:
       return { ok: false, error: new FoldError("unknown_chunk_type", `token_delta frame has an unrecognized "chunk_type": ${JSON.stringify(chunkType)}`) };
@@ -602,17 +697,29 @@ function frameTurnId(header: EventHeader | undefined): string {
  * Folds one streamed chunk into the loop's live assistant segment, creating the
  * segment when the loop has none.
  *
- * A `tool_use` chunk is deliberately skipped: it is the model's in-progress
- * tool-call CONSTRUCTION (index/id/name/partial JSON — harness's
- * `toolUseChunkDTO`), not an execution, and it has no committable display form.
- * The `tool_call_started`/`tool_call_completed` frames drive the live tool card
- * instead. It still reaches `view.content`, and it never burns an ordinal.
+ * TWO of the five chunk types are deliberately skipped. Both still reach
+ * `view.content`, and neither burns an ordinal:
+ *
+ *  - `tool_use` is the model's in-progress tool-call CONSTRUCTION
+ *    (index/id/name/partial JSON — harness's `toolUseChunkDTO`), not an
+ *    execution, and it has no committable display form. The
+ *    `tool_call_started`/`tool_call_completed` frames drive the live tool card.
+ *  - `image` is a per-image FRAGMENT whose reassembly this layer does not do
+ *    and has nowhere to put: no row variant carries an image, and the enduring
+ *    `StepDone` commits the finished ImageBlock regardless. Skipping it is not
+ *    the same as rejecting it — rejecting it turned a legitimate frame into a
+ *    fold error, which is the bug this arm exists to not have.
+ *
+ * A refusal accumulates into `refusal`, never `text`. A RefusalBlock's payload
+ * is byte-identical to a TextBlock's, so folding one into the other would show
+ * a viewer the model answering a request it declined — the same reason harness
+ * gives the chunk its own `chunk_type`.
  *
  * An extending chunk keeps the segment's `ordinal` (its stable render key) and
  * the `turnId` it opened with.
  */
 function applyLiveChunk(view: SessionView, header: EventHeader | undefined, chunk: TokenDeltaChunk): SessionView {
-  if (chunk.chunkType === "tool_use") return view;
+  if (chunk.chunkType === "tool_use" || chunk.chunkType === "image") return view;
   const loopId = frameLoopId(header);
   const index = liveAssistantIndex(view, loopId);
   if (index === -1) {
@@ -625,14 +732,18 @@ function applyLiveChunk(view: SessionView, header: EventHeader | undefined, chun
       orphanedLoop: isOrphanLoop(view, loopId),
       thinking: chunk.chunkType === "thinking" ? chunk.thinking : "",
       text: chunk.chunkType === "text" ? chunk.text : "",
-      refusal: "",
+      refusal: chunk.chunkType === "refusal" ? chunk.text : "",
     });
   }
   const prior = view.rows[index] as AssistantRow;
-  const next: AssistantRow =
-    chunk.chunkType === "thinking"
-      ? { ...prior, thinking: prior.thinking + chunk.thinking }
-      : { ...prior, text: prior.text + chunk.text };
+  let next: AssistantRow;
+  if (chunk.chunkType === "thinking") {
+    next = { ...prior, thinking: prior.thinking + chunk.thinking };
+  } else if (chunk.chunkType === "refusal") {
+    next = { ...prior, refusal: prior.refusal + chunk.text };
+  } else {
+    next = { ...prior, text: prior.text + chunk.text };
+  }
   return replaceRow(view, index, next);
 }
 
