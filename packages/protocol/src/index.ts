@@ -18,6 +18,7 @@ export * from "./sse.js";
 export * from "./fold.js";
 export * from "./join.js";
 export * from "./live.js";
+export * from "./store.js";
 export * from "./content.js";
 export * from "./blocks.js";
 export * from "./gate-actions.js";
