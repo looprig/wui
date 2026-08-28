@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      # `make check` is the single gate: fmt-check, vet, staticcheck, gosec,
+      # go mod verify, govulncheck, go test -race and go build. Every target
+      # already sets GOWORK=off, so this runs the module standalone.
+      - name: Repository checks
+        run: make check
+      # AGENTS.md mandates an explicit standalone run with no workspace masking.
+      - name: Standalone verification
+        run: GOWORK=off go test ./...
