@@ -21,6 +21,11 @@ export const DEV_PROXY_TARGET = "http://127.0.0.1:8722";
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
+    // One React instance for everything. Without this a prebundled dependency
+    // (@tanstack/react-router) and the app can end up with separate copies,
+    // and every hook in the router's own components reads a null dispatcher:
+    // "Cannot read properties of null (reading 'useContext')".
+    dedupe: ["react", "react-dom"],
     alias: {
       // @looprig/protocol's package.json points `main` at ./dist, mirroring
       // client/sdk/core. Aliasing straight to its source removes the
