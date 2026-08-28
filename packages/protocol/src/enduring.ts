@@ -23,7 +23,7 @@
  * NOT decoded: it keeps the generic `other` payload, exactly as before.
  */
 import type { EventEnvelope } from "./types.js";
-import { decodeMessage, isRecord, str, type ConversationMessage } from "./blocks.js";
+import { decodeMessage, decodeMessages, isRecord, str, type ConversationMessage } from "./blocks.js";
 
 /** The canonical all-zeros uuid, as `uuid.UUID.String()` renders `[16]byte{}`. */
 const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
@@ -76,8 +76,36 @@ export interface TurnOpenerPayload {
   message: ConversationMessage | undefined;
 }
 
+/**
+ * StepDone is the authoritative commit point AND the self-heal anchor: its
+ * Messages is exactly the group that entered history — one AIMessage followed
+ * by its ToolResultMessages — emitted once the commit handshake lands, so it
+ * never claims a commit that did not happen. This is where the cold journal's
+ * prose lives.
+ *
+ * A TRUNCATED step emits StepDone too: the loop commits the safe prefix of the
+ * response (text and sealed reasoning, never a partial or unpaired tool call)
+ * so watched content is not discarded, and the turn still ends on TurnFailed.
+ * The truncation notice is an ordinary text block with no distinguishing tag, so
+ * a consumer that must tell a truncated group from a clean one reads the turn
+ * TERMINAL, not this payload.
+ *
+ * A step that decoded nothing usable emits NO StepDone at all — and that is
+ * enforced, not merely conventional: MarshalEvent refuses a StepDone with an
+ * empty Messages (validateStepDoneMessages). This is why the turn terminals
+ * must commit any dangling live segment themselves.
+ *
+ * The AIMessage's own `usage` key is inside these messages on the wire and is
+ * deliberately dropped by decodeMessage; turn accounting reads TurnDone's
+ * top-level `usage`, which is a different shape.
+ */
+export interface StepDonePayload {
+  kind: "StepDone";
+  messages: ConversationMessage[];
+}
+
 /** The type-specific half of a decoded enduring event. Extended per task. */
-export type EnduringPayload = TurnOpenerPayload | { kind: "other" };
+export type EnduringPayload = TurnOpenerPayload | StepDonePayload | { kind: "other" };
 
 /**
  * A decoded enduring event: the shared header coordinates (promoted onto the
@@ -129,6 +157,8 @@ function decodePayload(type: string, raw: Record<string, unknown>): EnduringPayl
         turnIndex: num(raw["turn_index"]),
         message: isRecord(raw["message"]) ? decodeMessage(raw["message"]) : undefined,
       };
+    case "StepDone":
+      return { kind: "StepDone", messages: decodeMessages(raw["messages"]) };
     default:
       // The long tail keeps the generic marker, per design §3a.
       return { kind: "other" };

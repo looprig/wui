@@ -232,12 +232,6 @@ describe("decodeEnduring: the untyped long tail", () => {
     expect(decodeEnduring(asEnvelope(fixtureTurnDone())).payload).toEqual({ kind: "other" });
   });
 
-  it("gives the fixture's REAL StepDone the same fallback", () => {
-    const stepDone = fixtureStepDone();
-    expect(stepDone["type"]).toBe("StepDone");
-    expect(decodeEnduring(asEnvelope(stepDone)).payload).toEqual({ kind: "other" });
-  });
-
   it("falls back for ContextMeasured, design §3a's named long tail", () => {
     const decoded = decodeEnduring(envelope({ type: "ContextMeasured", loopId: LOOP_A }));
     expect(decoded.payload).toEqual({ kind: "other" });
@@ -390,5 +384,120 @@ describe("decodeEnduring: turn openers", () => {
       turnIndex: 0,
       message: undefined,
     });
+  });
+});
+
+// --- Task 3.6: StepDone, the authoritative commit point ----------------------
+
+const STEP_DONE_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"Signature":"sig","Thinking":"plan","type":"thinking"},{"Text":"reading it now","type":"text"},{"ID":"toolu_1","Input":{"path":"/a"},"Name":"Read","type":"tool_use"}],"usage":{"InputTokens":10,"OutputTokens":4}},{"role":"tool","blocks":[{"Text":"file contents","type":"text"}],"tool_use_id":"toolu_1"}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+const STEP_DONE_TRUNCATED_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"Text":"partial answer","type":"text"},{"Text":"[response truncated: stream failed]","type":"text"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+describe("decodeEnduring: StepDone", () => {
+  it("decodes a REAL finalized step group in order", () => {
+    const decoded = decodeEnduring(wireEnvelope(STEP_DONE_WIRE));
+    expect(decoded.stepId).toBe(STEP_1);
+    expect(decoded.payload).toStrictEqual({
+      kind: "StepDone",
+      messages: [
+        {
+          role: "assistant",
+          blocks: [
+            { type: "thinking", thinking: "plan", signature: "sig" },
+            { type: "text", text: "reading it now" },
+            { type: "tool_use", id: "toolu_1", name: "Read", input: { path: "/a" } },
+          ],
+          toolUseId: "",
+          isError: false,
+        },
+        {
+          role: "tool",
+          blocks: [{ type: "text", text: "file contents" }],
+          toolUseId: "toolu_1",
+          isError: false,
+        },
+      ],
+    });
+  });
+
+  it("decodes the REAL vendored fixture's StepDone: one blockless AIMessage", () => {
+    // status_running.json's `last_step` is the only StepDone in the vendored
+    // corpus, and its group is a lone {"role":"assistant"} with NO blocks key.
+    // Before this task it fell through to `other`, which is exactly why a
+    // replayed session rendered blank.
+    const stepDone = fixtureStepDone();
+    expect(stepDone["type"]).toBe("StepDone");
+    expect(decodeEnduring(asEnvelope(stepDone)).payload).toStrictEqual({
+      kind: "StepDone",
+      messages: [{ role: "assistant", blocks: [], toolUseId: "", isError: false }],
+    });
+  });
+
+  it("keeps the AIMessage's OWN usage out of the decoded message", () => {
+    // The real bytes above carry `"usage":{"InputTokens":10,"OutputTokens":4}`
+    // inside the assistant message. decodeMessage deliberately drops it: turn
+    // accounting comes from TurnDone's top-level `usage`, whose shape is
+    // different (all five counters, never omitted), so decoding both would give
+    // two easily double-counted sources. Read it out of the bytes rather than
+    // asserting a belief that it is there.
+    const messages = JSON.parse(STEP_DONE_WIRE) as { messages: Array<Record<string, unknown>> };
+    expect(messages.messages[0]?.["usage"]).toEqual({ InputTokens: 10, OutputTokens: 4 });
+    const decoded = decodeEnduring(wireEnvelope(STEP_DONE_WIRE));
+    if (decoded.payload.kind !== "StepDone") throw new Error("unreachable");
+    expect(Object.hasOwn(decoded.payload.messages[0] ?? {}, "usage")).toBe(false);
+  });
+
+  it("decodes a TRUNCATED step, whose group is a lone AIMessage ending in the notice", () => {
+    // harness emits StepDone for a truncated step too: the loop commits the safe
+    // prefix (text and sealed reasoning, never a partial tool call) so watched
+    // content is not discarded, and the turn still ends on TurnFailed. The
+    // notice is an ordinary text block — there is no distinguishing tag, so a
+    // consumer that needs to tell the two apart reads the turn TERMINAL.
+    const decoded = decodeEnduring(wireEnvelope(STEP_DONE_TRUNCATED_WIRE));
+    if (decoded.payload.kind !== "StepDone") throw new Error("unreachable");
+    expect(decoded.payload.messages).toHaveLength(1);
+    expect(decoded.payload.messages[0]?.blocks).toStrictEqual([
+      { type: "text", text: "partial answer" },
+      { type: "text", text: "[response truncated: stream failed]" },
+    ]);
+  });
+
+  it("decodes an absent `messages` as an empty group, though no producer emits one", () => {
+    // NOT REAL WIRE. `messages` is omitempty, but MarshalEvent REFUSES a StepDone
+    // whose Messages is empty: validateStepDoneMessages returns
+    //   event: invalid StepDone: Messages is invalid
+    // (verified by marshalling StepDone{Header: ...} against harness v0.30.0).
+    // So "a step that decoded nothing usable emits no StepDone at all" is not
+    // merely a convention — the durable write boundary enforces it, which is
+    // why the turn terminals must commit any dangling live segment themselves.
+    // This case is defensive only: an empty group must not throw on the render
+    // path, and it must not be mistaken for a commit.
+    const decoded = decodeEnduring(envelope({ type: "StepDone", loopId: LOOP_A }));
+    expect(decoded.payload).toStrictEqual({ kind: "StepDone", messages: [] });
+  });
+
+  it("skips a null element rather than committing a blank row", () => {
+    // marshalMessages can legitimately emit a null element for a nil message in
+    // the slice; decodeMessages filters non-objects.
+    const decoded = decodeEnduring(
+      envelope({
+        type: "StepDone",
+        loopId: LOOP_A,
+        payload: { messages: [null, { role: "assistant", blocks: [textBlockWire("kept")] }] },
+      }),
+    );
+    if (decoded.payload.kind !== "StepDone") throw new Error("unreachable");
+    expect(decoded.payload.messages).toHaveLength(1);
+    expect(decoded.payload.messages[0]?.role).toBe("assistant");
+  });
+
+  it("reports a non-array `messages` as an empty group rather than throwing", () => {
+    // NOT REAL WIRE: content.AgenticMessages always marshals to an array.
+    const decoded = decodeEnduring(
+      envelope({ type: "StepDone", loopId: LOOP_A, payload: { messages: { role: "assistant" } } }),
+    );
+    expect(decoded.payload).toStrictEqual({ kind: "StepDone", messages: [] });
   });
 });
