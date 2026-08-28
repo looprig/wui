@@ -38,6 +38,14 @@ const TURN_STARTED_HANDBACK_WIRE =
 const TURN_STARTED_USER_WIRE =
   '{"cause":{"command_id":"ffffffff-ffff-4fff-8fff-ffffffffffff"},"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"user","blocks":[{"Text":"hello","type":"text"}]},"session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":3,"type":"TurnStarted","v":1}';
 
+/** A genuine folded tool-continuation input: queued text folded into a mandatory continuation. */
+const TURN_FOLDED_INTO_USER_WIRE =
+  '{"cause":{"command_id":"ffffffff-ffff-4fff-8fff-ffffffffffff"},"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"user","blocks":[{"Text":"also do this","type":"text"}]},"session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":5,"type":"TurnFoldedInto","v":1}';
+
+/** The same fold, but a hand-back: Cause.LoopID is the child loop. */
+const TURN_FOLDED_INTO_HANDBACK_WIRE =
+  '{"cause":{"loop_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","command_id":"ffffffff-ffff-4fff-8fff-ffffffffffff"},"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"user","blocks":[{"Text":"result","type":"text"}]},"session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":6,"type":"TurnFoldedInto","v":1}';
+
 function wireEnvelope(json: string): EventEnvelope {
   return JSON.parse(json) as EventEnvelope;
 }
@@ -169,5 +177,73 @@ describe("rows: subagent hand-back gating", () => {
       ),
     ]);
     expect(view.rows).toStrictEqual([]);
+  });
+});
+
+/**
+ * TurnFoldedInto is queued input folded into a mandatory tool-continuation. §3b
+ * treats it identically to TurnStarted — same payload shape from decodePayload,
+ * same cause gate — so the two share one fold case. It gets its own suite
+ * because the hand-back half of it is the case that would otherwise pass
+ * vacuously: before the fold case existed, "commits no row" was true of a
+ * TurnFoldedInto for the trivial reason that NOTHING was committed for one.
+ */
+describe("rows: TurnFoldedInto", () => {
+  it("commits a full user row for a REAL genuine folded tool-continuation input", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(TURN_FOLDED_INTO_USER_WIRE), 4)]);
+    expect(view.rows).toStrictEqual([
+      {
+        kind: "user",
+        ordinal: 0,
+        loopId: LOOP_ALPHA,
+        turnId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        journalSeq: 4,
+        live: false,
+        orphanedLoop: false,
+        blocks: [{ type: "text", text: "also do this" }],
+      },
+    ]);
+    expect(view.nextOrdinal).toBe(1);
+  });
+
+  it("commits NO user row for a REAL TurnFoldedInto hand-back", () => {
+    // Non-vacuous now that the fold case exists: the sibling case above proves
+    // a TurnFoldedInto CAN commit a row, so an empty rows array here is the
+    // gate's decision rather than an unhandled event type.
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(TURN_FOLDED_INTO_HANDBACK_WIRE), 5)]);
+    expect(view.rows).toStrictEqual([]);
+    expect(view.statusEvents).toHaveLength(1);
+    expect(view.statusEvents[0]?.type).toBe("TurnFoldedInto");
+    expect(view.nextOrdinal).toBe(0);
+  });
+
+  it("projects the same row shape as TurnStarted, differing only in what the events differ in", () => {
+    resetSeq();
+    const started = run(emptySessionView(), [history(wireEnvelope(TURN_STARTED_USER_WIRE), 9)]);
+    resetSeq();
+    const folded = run(emptySessionView(), [history(wireEnvelope(TURN_FOLDED_INTO_USER_WIRE), 9)]);
+    const startedRow = started.rows[0];
+    const foldedRow = folded.rows[0];
+    expect(startedRow).toBeDefined();
+    expect(foldedRow).toBeDefined();
+    expect(Object.keys(foldedRow ?? {}).sort()).toStrictEqual(Object.keys(startedRow ?? {}).sort());
+    // Identical apart from the blocks the two events actually carry: no field
+    // records which opener committed the row, because §3b draws no distinction.
+    expect({ ...foldedRow, blocks: [] }).toStrictEqual({ ...startedRow, blocks: [] });
+  });
+
+  it("shares one ordinal sequence with TurnStarted, in arrival order", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      history(wireEnvelope(TURN_STARTED_USER_WIRE), 1),
+      history(wireEnvelope(TURN_FOLDED_INTO_HANDBACK_WIRE), 2),
+      history(wireEnvelope(TURN_FOLDED_INTO_USER_WIRE), 3),
+      history(wireEnvelope(TURN_STARTED_HANDBACK_WIRE), 4),
+      history(wireEnvelope(TURN_FOLDED_INTO_USER_WIRE), 5),
+    ]);
+    expect(view.rows.map((r) => r.ordinal)).toStrictEqual([0, 1, 2]);
+    expect(view.rows.map((r) => r.journalSeq)).toStrictEqual([1, 3, 5]);
   });
 });

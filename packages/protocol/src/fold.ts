@@ -532,7 +532,12 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
   // reading statusEvents, so nothing regresses.
   const decoded = decodeEnduring(envelope);
   switch (decoded.payload.kind) {
-    case "TurnStarted": {
+    // One case for both openers: decodePayload already gives them the same
+    // TurnOpenerPayload shape, and §3b treats them identically — TurnFoldedInto
+    // is queued input folded into a mandatory tool-continuation, which is still
+    // the user's input and still subject to the same cause gate.
+    case "TurnStarted":
+    case "TurnFoldedInto": {
       // §3b rule 2: a user row ONLY when Header.Cause.LoopID is zero. A
       // NON-ZERO cause loop id is a subagent hand-back — handlers_events.go
       // subscribes LoopScope{All: true}, so a parent loop sees every child's
