@@ -360,3 +360,139 @@ describe("rows: TurnInterrupted commits the segment, then a tombstone", () => {
     expect(view.rows.filter((r) => r.kind === "tombstone")).toHaveLength(1);
   });
 });
+
+/**
+ * The five real `TurnFailed` shapes. Every one carries an `err` object: the
+ * struct field is tagged `json:"-"`, but `marshalTurnFailed` marshals
+ * `turnFailedWire`, which PROJECTS `Err` through `projectError` onto a
+ * `restoredErrorWire{Kind,Message}` whose two keys carry no `omitempty` — and
+ * `projectError(nil)` returns `{Kind: "unknown", Message: ""}` rather than nil,
+ * so the pointer's own `omitempty` never fires either. "TurnFailed carries no
+ * failure detail on the wire" is therefore false, and a failed turn that shows
+ * no reason is a bug in this layer, not a limit of the protocol.
+ */
+const TURN_FAILED_UNKNOWN_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","err":{"kind":"unknown","message":"provider exploded: upstream 500"},"event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":2,"type":"TurnFailed","v":1}';
+
+const TURN_FAILED_EMPTY_RESPONSE_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","err":{"kind":"empty_response","message":"the model returned no content"},"event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":3,"type":"TurnFailed","v":1}';
+
+const TURN_FAILED_TOOL_LIMIT_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","err":{"kind":"tool_limit","message":"tool limit reached: 12/12 iterations, 40/60 calls"},"event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":6,"type":"TurnFailed","v":1}';
+
+/** `&event.RestoredError{Kind: "turn_panic", Message: ""}` — a classified failure with no text. */
+const TURN_FAILED_KIND_ONLY_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","err":{"kind":"turn_panic","message":""},"event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":7,"type":"TurnFailed","v":1}';
+
+/** `event.TurnFailed{…}` with a NIL Err — still an `err` object, kind "unknown". */
+const TURN_FAILED_NIL_ERR_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","err":{"kind":"unknown","message":""},"event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":8,"type":"TurnFailed","v":1}';
+
+describe("rows: TurnFailed commits the segment, then an error notice", () => {
+  it("commits the truncated prefix FIRST, then the notice", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      textDelta("the model got this far", LOOP_A, TURN_1),
+      history(wireEnvelope(TURN_FAILED_UNKNOWN_WIRE), 12),
+    ]);
+    expect(view.rows.map((r) => [r.kind, r.ordinal])).toStrictEqual([
+      ["assistant", 0],
+      ["notice", 1],
+    ]);
+    expect(view.rows[0]).toMatchObject({ live: false, text: "the model got this far", journalSeq: 12 });
+    expect(view.rows[1]).toStrictEqual({
+      kind: "notice",
+      level: "error",
+      text: "the turn failed: provider exploded: upstream 500",
+      ordinal: 1,
+      loopId: LOOP_A,
+      turnId: TURN_1,
+      journalSeq: 12,
+      live: false,
+      orphanedLoop: false,
+    });
+  });
+
+  it("renders the failure reason the wire actually carries", () => {
+    // "TurnFailed.Err is json:\"-\", so no cause text reaches the wire" is a
+    // FALSE reading of the struct: marshalTurnFailed projects it. A failed turn
+    // rendering no reason at all is the bug this case exists to prevent.
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(TURN_FAILED_UNKNOWN_WIRE))]);
+    expect(view.rows[0]).toMatchObject({
+      kind: "notice",
+      level: "error",
+      text: "the turn failed: provider exploded: upstream 500",
+    });
+  });
+
+  it("names the CLASSIFIED kind alongside its message", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(TURN_FAILED_EMPTY_RESPONSE_WIRE))]);
+    expect(view.rows[0]).toMatchObject({
+      text: "the turn failed (empty_response): the model returned no content",
+    });
+  });
+
+  it("names the kind for tool_limit too, whose message carries the counters", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(TURN_FAILED_TOOL_LIMIT_WIRE))]);
+    expect(view.rows[0]).toMatchObject({
+      text: "the turn failed (tool_limit): tool limit reached: 12/12 iterations, 40/60 calls",
+    });
+  });
+
+  it("falls back to the kind alone when the message is empty", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(TURN_FAILED_KIND_ONLY_WIRE))]);
+    expect(view.rows[0]).toMatchObject({ text: "the turn failed (turn_panic)" });
+  });
+
+  it('suppresses the "unknown" kind, which is the ABSENCE of a classification', () => {
+    // ErrKind's catch-all. Printing "(unknown)" would present the lack of a
+    // classification as one, and it adds nothing beside the message.
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(TURN_FAILED_NIL_ERR_WIRE))]);
+    expect(view.rows[0]).toMatchObject({ kind: "notice", level: "error", text: "the turn failed" });
+  });
+
+  it("still commits a notice for an envelope carrying no err at all", () => {
+    // NOT REAL WIRE — every marshalled TurnFailed has an `err` object. Kept so
+    // a corrupted or truncated record degrades to a bare failure notice rather
+    // than rendering "undefined" or dropping the failure entirely.
+    resetSeq();
+    const view = run(emptySessionView(), [
+      history(envelope({ type: "TurnFailed", loopId: LOOP_A, turnId: TURN_1 })),
+    ]);
+    expect(view.rows).toHaveLength(1);
+    expect(view.rows[0]).toMatchObject({ kind: "notice", level: "error", text: "the turn failed" });
+  });
+
+  it("marks a still-running tool card as errored", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      toolStarted("te-1", "Bash", LOOP_A),
+      history(wireEnvelope(TURN_FAILED_UNKNOWN_WIRE), 15),
+    ]);
+    expect(view.rows[0]).toMatchObject({ kind: "tool", status: "error", live: false, journalSeq: 15 });
+  });
+
+  it("drops an EMPTY live prose row, so the notice stands alone", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      textDelta("", LOOP_A, TURN_1),
+      history(wireEnvelope(TURN_FAILED_UNKNOWN_WIRE)),
+    ]);
+    expect(view.rows.map((r) => r.kind)).toStrictEqual(["notice"]);
+  });
+
+  it("leaves another loop's live segment running", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      textDelta("child still going", LOOP_B, TURN_1),
+      history(wireEnvelope(TURN_FAILED_UNKNOWN_WIRE)),
+    ]);
+    expect(view.rows.find((r) => r.loopId === LOOP_B)).toMatchObject({ live: true });
+    expect(view.rows.filter((r) => r.kind === "notice")).toHaveLength(1);
+  });
+});

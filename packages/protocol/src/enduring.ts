@@ -614,6 +614,37 @@ function decodeUsage(raw: unknown): UsageValue {
 }
 
 /**
+ * ErrKind's catch-all: the durable string a failure carries when the event
+ * package — a leaf that deliberately does not enumerate provider or stream
+ * errors — could not classify it. It is the ABSENCE of a classification, not
+ * one, so `turnFailureText` never prints it as a label.
+ */
+export const ERROR_KIND_UNKNOWN = "unknown";
+
+/**
+ * The user-facing sentence for a TurnFailed, from the `{kind, message}` pair
+ * `marshalTurnFailed` always writes. Both parts are rendered, because both
+ * carry information the other does not: `errorKind` is a stable durable string
+ * that never renames ("empty_response", "tool_limit", "turn_panic"), while
+ * `errorMessage` is the arbitrary provider text that says what actually
+ * happened. A notice showing neither is the bug — a failed turn must never read
+ * as a turn that simply stopped.
+ *
+ * "unknown" is suppressed as a label (see ERROR_KIND_UNKNOWN); an empty message
+ * degrades to the kind alone, and an empty pair — which no marshalled event
+ * produces, but a corrupted record could — degrades to the bare statement.
+ *
+ * The message is UNTRUSTED display text. This returns a plain string and does
+ * no escaping: rendering it as text rather than as markup is the renderer's
+ * obligation, and is stated on TurnFailedPayload.errorMessage.
+ */
+export function turnFailureText(errorKind: string, errorMessage: string): string {
+  const labelled = errorKind !== "" && errorKind !== ERROR_KIND_UNKNOWN;
+  const head = labelled ? `the turn failed (${errorKind})` : "the turn failed";
+  return errorMessage === "" ? head : `${head}: ${errorMessage}`;
+}
+
+/**
  * event.RejectReason's constants, in declaration order: 0 RejectUnspecified (a
  * zero-value sentinel the loop NEVER produces), 1 RejectQueueFull,
  * 2 RejectShuttingDown, 3 RejectInternal. An unrecognized value — including a

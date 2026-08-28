@@ -82,7 +82,7 @@
  */
 import type { EphemeralFrame, EventEnvelope, EventHeader, StatusEvent } from "./types.js";
 import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "./sse.js";
-import { decodeEnduring, isZeroUUID } from "./enduring.js";
+import { decodeEnduring, isZeroUUID, turnFailureText } from "./enduring.js";
 import type { Gate } from "./gate.js";
 import type { AssistantRow, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft } from "./rows.js";
 import { narrationOf, refusalOf, splitStepGroup, thinkingOf, toolResultText, toolUsesOf } from "./rows.js";
@@ -865,6 +865,34 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
         ok: true,
         view: appendRow(committed, {
           kind: "tombstone",
+          loopId: decoded.loopId,
+          turnId: decoded.turnId,
+          journalSeq,
+          live: false,
+          orphanedLoop: false,
+        }),
+      };
+    }
+    case "TurnFailed": {
+      // A truncated step commits its safe prefix through its own StepDone — and
+      // that StepDone's notice is an ordinary TextBlock with no distinguishing
+      // tag, so it commits as plain narration. THIS event is what tells a
+      // truncated group from a clean one. A step that decoded nothing usable
+      // emitted no StepDone at all, so its live segment is committed here,
+      // before the notice, with a still-running card resolved to "error".
+      const committed = commitTerminalSegment(next, decoded.loopId, journalSeq, "error");
+      // The failure reason IS on the wire. TurnFailed.Err is tagged json:"-",
+      // but marshalTurnFailed marshals turnFailedWire, which projects Err
+      // through projectError onto {kind,message} — neither key omitempty, and
+      // projectError(nil) yields {"unknown",""} rather than nil. Rendering no
+      // reason would be this layer discarding what harness took care to keep.
+      const reason = turnFailureText(decoded.payload.errorKind, decoded.payload.errorMessage);
+      return {
+        ok: true,
+        view: appendRow(committed, {
+          kind: "notice",
+          level: "error",
+          text: reason,
           loopId: decoded.loopId,
           turnId: decoded.turnId,
           journalSeq,
