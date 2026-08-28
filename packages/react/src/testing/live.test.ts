@@ -72,6 +72,26 @@ test("counts opens and closes, and return() closes the open connection", async (
   expect(live.isOpen).toBe(false);
 });
 
+test("a late return() on a closed connection does not close the next one", async () => {
+  const live = new ControlledLiveSource();
+  const first = live.source()[Symbol.asyncIterator]();
+  await first.return?.();
+
+  const second = live.source()[Symbol.asyncIterator]();
+  const parked = second.next();
+
+  // joinSessionView's `finally` calls `liveIterator.return()` best-effort long
+  // after a store already cancelled, so this really happens on every session
+  // switch. With per-instance state the late close lands on the connection
+  // the NEXT store just opened, which autoReconnect then reopens.
+  await first.return?.();
+
+  expect([live.openCount, live.closedCount]).toStrictEqual([2, 1]);
+  expect(live.isOpen).toBe(true);
+  live.emit(toolCallStarted("t1", "Read"));
+  await expect(parked).resolves.toHaveProperty("done", false);
+});
+
 test("error() makes the consumer's next() reject", async () => {
   const live = new ControlledLiveSource();
   const iterator = live.source()[Symbol.asyncIterator]();

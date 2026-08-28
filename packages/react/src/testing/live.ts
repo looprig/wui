@@ -21,6 +21,14 @@
 import type { EventEnvelope, EventHeader, SseFrame } from "@looprig/protocol";
 import { SID } from "./fake-transport.js";
 
+interface Connection {
+  queue: SseFrame[];
+  waiting: ((result: IteratorResult<SseFrame, void>) => void) | undefined;
+  done: boolean;
+  failure: unknown;
+  closed: boolean;
+}
+
 /**
  * A `LiveFrameSource` whose frames you push by hand.
  *
@@ -31,15 +39,21 @@ import { SID } from "./fake-transport.js";
  * on the JOIN generator queues behind an in-flight `.next()` and never lands,
  * so a store that only does that leaves a live connection open for the rest of
  * the session.
+ *
+ * Every connection owns its own buffer, parked reader and closed flag.
+ * 04-react.md's version kept all of that on the INSTANCE, which is wrong the
+ * moment two connections overlap — and they do, on every session switch and
+ * every reconnect. Measured: switching `sessionId` gave 3 opens and 2 closes
+ * instead of 2 and 1, because `joinSessionView`'s `finally` calls
+ * `liveIterator.return()` best-effort AFTER the store already cancelled, and
+ * with shared state that second, late `return()` closed the NEXT store's
+ * connection — which `autoReconnect` then dutifully reopened.
  */
 export class ControlledLiveSource {
   openCount = 0;
   closedCount = 0;
 
-  #queue: SseFrame[] = [];
-  #waiting: ((result: IteratorResult<SseFrame, void>) => void) | undefined;
-  #done = false;
-  #failure: unknown;
+  #active: Connection | undefined;
 
   get isOpen(): boolean {
     return this.openCount > this.closedCount;
@@ -48,62 +62,82 @@ export class ControlledLiveSource {
   /** Pass this to `SessionViewStore` / `useSessionView`. */
   readonly source = (): AsyncIterable<SseFrame> => {
     this.openCount += 1;
-    this.#done = false;
+    const connection: Connection = {
+      queue: [],
+      waiting: undefined,
+      done: false,
+      failure: undefined,
+      closed: false,
+    };
+    this.#active = connection;
     return {
       [Symbol.asyncIterator]: (): AsyncIterator<SseFrame, void> => ({
         next: (): Promise<IteratorResult<SseFrame, void>> => {
-          if (this.#failure !== undefined) {
-            const failure = this.#failure;
-            this.#failure = undefined;
+          if (connection.failure !== undefined) {
+            const failure = connection.failure;
+            connection.failure = undefined;
             return Promise.reject(failure);
           }
-          const frame = this.#queue.shift();
+          const frame = connection.queue.shift();
           if (frame !== undefined) return Promise.resolve({ value: frame, done: false });
-          if (this.#done) return Promise.resolve({ value: undefined, done: true });
+          if (connection.done || connection.closed) return Promise.resolve({ value: undefined, done: true });
           return new Promise((resolve) => {
-            this.#waiting = resolve;
+            connection.waiting = resolve;
           });
         },
         return: (): Promise<IteratorResult<SseFrame, void>> => {
-          this.#close();
+          this.#close(connection);
           return Promise.resolve({ value: undefined, done: true });
         },
       }),
     };
   };
 
+  /** The connection `emit`/`end`/`error` act on: the most recently opened one. */
+  #current(): Connection {
+    const connection = this.#active;
+    if (connection === undefined) {
+      throw new Error("ControlledLiveSource: no connection has been opened yet");
+    }
+    return connection;
+  }
+
   emit(frame: SseFrame): void {
-    const waiting = this.#waiting;
+    const connection = this.#current();
+    const waiting = connection.waiting;
     if (waiting !== undefined) {
-      this.#waiting = undefined;
+      connection.waiting = undefined;
       waiting({ value: frame, done: false });
       return;
     }
-    this.#queue.push(frame);
+    connection.queue.push(frame);
   }
 
   /** Ends the stream cleanly, as a server closing the SSE response would. */
   end(): void {
-    this.#done = true;
-    this.#close();
+    const connection = this.#current();
+    connection.done = true;
+    this.#close(connection);
   }
 
   /** Ends the stream with an error, as a dropped connection would. */
   error(cause: unknown): void {
-    this.#failure = cause;
-    const waiting = this.#waiting;
+    const connection = this.#current();
+    connection.failure = cause;
+    const waiting = connection.waiting;
     if (waiting !== undefined) {
-      this.#waiting = undefined;
+      connection.waiting = undefined;
       waiting({ value: undefined, done: true });
     }
   }
 
-  #close(): void {
-    if (!this.isOpen) return;
+  #close(connection: Connection): void {
+    if (connection.closed) return;
+    connection.closed = true;
     this.closedCount += 1;
-    const waiting = this.#waiting;
+    const waiting = connection.waiting;
     if (waiting !== undefined) {
-      this.#waiting = undefined;
+      connection.waiting = undefined;
       waiting({ value: undefined, done: true });
     }
   }
