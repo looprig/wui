@@ -33,7 +33,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { decodeEnduring, isZeroUUID } from "../src/enduring.js";
+import { decodeEnduring, isZeroUUID, rejectReasonText } from "../src/enduring.js";
 import type { EventEnvelope } from "../src/types.js";
 import { LOOP_A, LOOP_B, ZERO_UUID, envelope, textBlockWire, userMessageWire } from "./helpers.js";
 
@@ -227,11 +227,6 @@ describe("decodeEnduring + isZeroUUID (the §3b user-row gate)", () => {
 // --- the long-tail fallback --------------------------------------------------
 
 describe("decodeEnduring: the untyped long tail", () => {
-  it("gives the fixture's REAL TurnDone the opaque `other` payload", () => {
-    // Nothing is decoded per-type yet; TurnDone gains a payload in a later task.
-    expect(decodeEnduring(asEnvelope(fixtureTurnDone())).payload).toEqual({ kind: "other" });
-  });
-
   it("falls back for ContextMeasured, design §3a's named long tail", () => {
     const decoded = decodeEnduring(envelope({ type: "ContextMeasured", loopId: LOOP_A }));
     expect(decoded.payload).toEqual({ kind: "other" });
@@ -499,5 +494,342 @@ describe("decodeEnduring: StepDone", () => {
       envelope({ type: "StepDone", loopId: LOOP_A, payload: { messages: { role: "assistant" } } }),
     );
     expect(decoded.payload).toStrictEqual({ kind: "StepDone", messages: [] });
+  });
+});
+
+// --- Task 3.7: the turn terminals, TurnRejected and InputCancelled -----------
+
+const TURN_DONE_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"assistant","blocks":[{"Text":"done","type":"text"}]},"session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":1,"type":"TurnDone","usage":{"InputTokens":10,"OutputTokens":4,"CacheReadTokens":0,"CacheCreationTokens":0,"ReasoningTokens":0},"v":1}';
+
+const TURN_DONE_ALL_USAGE_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"assistant","blocks":[{"Text":"accounted for","type":"text"}],"usage":{"InputTokens":1,"OutputTokens":2}},"session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":9,"type":"TurnDone","usage":{"InputTokens":11,"OutputTokens":22,"CacheReadTokens":33,"CacheCreationTokens":44,"ReasoningTokens":5},"v":1}';
+
+const TURN_DONE_ZERO_USAGE_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"assistant","blocks":[{"Text":"quiet","type":"text"}]},"session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":2,"type":"TurnDone","v":1}';
+
+const TURN_FAILED_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","err":{"kind":"unknown","message":"provider exploded: upstream 500"},"event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":2,"type":"TurnFailed","v":1}';
+
+const TURN_FAILED_TOOL_LIMIT_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","err":{"kind":"tool_limit","message":"tool limit reached: 12/12 iterations, 40/60 calls"},"event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":6,"type":"TurnFailed","v":1}';
+
+const TURN_FAILED_NIL_ERR_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","err":{"kind":"unknown","message":""},"event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":8,"type":"TurnFailed","v":1}';
+
+const TURN_INTERRUPTED_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":5,"type":"TurnInterrupted","v":1}';
+
+/** The four RejectReason values, each marshalled from the real Go constant. */
+const TURN_REJECTED_WIRE: ReadonlyArray<{
+  label: string;
+  json: string;
+  reason: number;
+  reasonText: string;
+}> = [
+  {
+    label: "RejectUnspecified (the zero sentinel, omitzero-dropped)",
+    reasonText: "an unspecified reason",
+    reason: 0,
+    json: '{"cause":{"command_id":"ffffffff-ffff-4fff-8fff-ffffffffffff"},"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","type":"TurnRejected","v":1}',
+  },
+  {
+    label: "RejectQueueFull",
+    reasonText: "the loop's queue is full",
+    reason: 1,
+    json: '{"cause":{"command_id":"ffffffff-ffff-4fff-8fff-ffffffffffff"},"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","reason":1,"session_id":"11111111-1111-4111-8111-111111111111","type":"TurnRejected","v":1}',
+  },
+  {
+    label: "RejectShuttingDown",
+    reasonText: "the loop is shutting down",
+    reason: 2,
+    json: '{"cause":{"command_id":"ffffffff-ffff-4fff-8fff-ffffffffffff"},"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","reason":2,"session_id":"11111111-1111-4111-8111-111111111111","type":"TurnRejected","v":1}',
+  },
+  {
+    label: "RejectInternal",
+    reasonText: "a transient internal failure",
+    reason: 3,
+    json: '{"cause":{"command_id":"ffffffff-ffff-4fff-8fff-ffffffffffff"},"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","reason":3,"session_id":"11111111-1111-4111-8111-111111111111","type":"TurnRejected","v":1}',
+  },
+];
+
+const INPUT_CANCELLED_RETRACTED_WIRE =
+  '{"cause":{"command_id":"ffffffff-ffff-4fff-8fff-ffffffffffff"},"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"user","blocks":[{"Text":"never ran","type":"text"}]},"session_id":"11111111-1111-4111-8111-111111111111","type":"InputCancelled","v":1}';
+
+const INPUT_CANCELLED_INTERRUPTED_WIRE =
+  '{"cause":{"command_id":"ffffffff-ffff-4fff-8fff-ffffffffffff"},"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"user","blocks":[{"Text":"returned to sender","type":"text"}]},"reason":1,"session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":7,"type":"InputCancelled","v":1}';
+
+describe("decodeEnduring: TurnDone", () => {
+  it("decodes a REAL TurnDone's complete AI message and its own five-counter usage", () => {
+    const decoded = decodeEnduring(wireEnvelope(TURN_DONE_WIRE));
+    expect(decoded.payload).toStrictEqual({
+      kind: "TurnDone",
+      turnIndex: 1,
+      message: {
+        role: "assistant",
+        blocks: [{ type: "text", text: "done" }],
+        toolUseId: "",
+        isError: false,
+      },
+      usage: {
+        inputTokens: 10,
+        outputTokens: 4,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+      },
+    });
+  });
+
+  it("carries all five counters, none of them collapsed into another", () => {
+    // Five distinct values, so a decoder that read one key for another (or
+    // dropped one) cannot pass. content.Usage has NO json tags and no codec, so
+    // TurnDone's field marshals as a bare Go-cased struct.
+    const decoded = decodeEnduring(wireEnvelope(TURN_DONE_ALL_USAGE_WIRE));
+    if (decoded.payload.kind !== "TurnDone") throw new Error("unreachable");
+    expect(decoded.payload.turnIndex).toBe(9);
+    expect(decoded.payload.usage).toStrictEqual({
+      inputTokens: 11,
+      outputTokens: 22,
+      cacheReadTokens: 33,
+      cacheCreationTokens: 44,
+      reasoningTokens: 5,
+    });
+  });
+
+  it("reads TURN accounting from TurnDone's own usage, never the AIMessage's", () => {
+    // The SAME bytes carry both usage shapes, and they disagree on purpose:
+    //   top-level  usage {"InputTokens":11,...,"ReasoningTokens":5}  — all five,
+    //              never dropped, because content.Usage is tag-free.
+    //   message's  usage {"InputTokens":1,"OutputTokens":2}          — usageJSON's
+    //              `json:",omitempty"` drops the three zeros.
+    // Two incompatible shapes under one key name: they must not share a type.
+    const raw = object(JSON.parse(TURN_DONE_ALL_USAGE_WIRE) as unknown);
+    const messageUsage = object(object(raw["message"])["usage"] ?? {});
+    expect(messageUsage).toEqual({ InputTokens: 1, OutputTokens: 2 });
+    expect(Object.hasOwn(messageUsage, "CacheReadTokens")).toBe(false);
+    expect(Object.keys(object(raw["usage"] ?? {}))).toHaveLength(5);
+
+    const decoded = decodeEnduring(asEnvelope(raw));
+    if (decoded.payload.kind !== "TurnDone") throw new Error("unreachable");
+    expect(decoded.payload.usage.inputTokens).toBe(11);
+    expect(decoded.payload.usage.outputTokens).toBe(22);
+    // The message's own usage stays undecoded, so there is only one source.
+    expect(Object.hasOwn(decoded.payload.message ?? {}, "usage")).toBe(false);
+  });
+
+  it("decodes a REAL wholly-zero usage from an ABSENT usage key (omitzero)", () => {
+    // TurnDone.Usage is `json:"usage,omitzero"` over a comparable struct, so an
+    // all-zero Usage drops the WHOLE key — verified by marshalling a real
+    // TurnDone{}. Every counter must still project to 0, never undefined.
+    const raw = object(JSON.parse(TURN_DONE_ZERO_USAGE_WIRE) as unknown);
+    expect(Object.hasOwn(raw, "usage")).toBe(false);
+    const decoded = decodeEnduring(asEnvelope(raw));
+    if (decoded.payload.kind !== "TurnDone") throw new Error("unreachable");
+    expect(decoded.payload.turnIndex).toBe(2);
+    expect(decoded.payload.usage).toStrictEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      reasoningTokens: 0,
+    });
+  });
+
+  it("decodes the REAL vendored fixture's TurnDone: turn_index only, no message", () => {
+    // journal_page.json carries the corpus's only TurnDone. It has turn_index 1
+    // and neither a message nor a usage key. Before this task it fell through to
+    // `other`.
+    const decoded = decodeEnduring(asEnvelope(fixtureTurnDone()));
+    expect(decoded.payload).toStrictEqual({
+      kind: "TurnDone",
+      turnIndex: 1,
+      message: undefined,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+      },
+    });
+  });
+
+  it("reports a snake_case usage key as zero, because content.Usage is Go-cased", () => {
+    // NOT REAL WIRE: content.Usage declares no json tags at all, so
+    // encoding/json emits the exported field names verbatim. A snake_case
+    // assumption would silently report a free turn.
+    const decoded = decodeEnduring(
+      envelope({
+        type: "TurnDone",
+        loopId: LOOP_A,
+        payload: { usage: { input_tokens: 10, output_tokens: 4 } },
+      }),
+    );
+    if (decoded.payload.kind !== "TurnDone") throw new Error("unreachable");
+    expect(decoded.payload.usage.inputTokens).toBe(0);
+    expect(decoded.payload.usage.outputTokens).toBe(0);
+  });
+});
+
+describe("decodeEnduring: TurnFailed and TurnInterrupted", () => {
+  it("decodes a REAL TurnFailed's projected error, which DOES reach the wire", () => {
+    // TurnFailed.Err is tagged `json:"-"`, but the struct tag is not the whole
+    // story: marshalTurnFailed encodes turnFailedWire, which PROJECTS Err onto a
+    // stable {kind,message} pair (projectError in harness/pkg/event/marshal.go).
+    // Verified by marshalling a real TurnFailed against harness v0.30.0 — the
+    // envelope carries an `err` object. A decoder that trusted the struct tag
+    // alone would render "the turn failed" over a message the journal has.
+    const decoded = decodeEnduring(wireEnvelope(TURN_FAILED_WIRE));
+    expect(decoded.payload).toStrictEqual({
+      kind: "TurnFailed",
+      turnIndex: 2,
+      errorKind: "unknown",
+      errorMessage: "provider exploded: upstream 500",
+    });
+  });
+
+  it("decodes a typed cause's stable kind string", () => {
+    // ErrKind projects the in-package causes to stable strings that are part of
+    // the durable contract: empty_response, tool_limit, turn_panic, unknown.
+    // Provider/stream errors are deliberately NOT enumerated (the event package
+    // is a leaf), so they arrive as "unknown" with their full text preserved.
+    const decoded = decodeEnduring(wireEnvelope(TURN_FAILED_TOOL_LIMIT_WIRE));
+    expect(decoded.payload).toStrictEqual({
+      kind: "TurnFailed",
+      turnIndex: 6,
+      errorKind: "tool_limit",
+      errorMessage: "tool limit reached: 12/12 iterations, 40/60 calls",
+    });
+  });
+
+  it("decodes an absent cause as kind unknown with an empty message", () => {
+    // projectError(nil) emits {"kind":"unknown","message":""} rather than
+    // omitting `err`, so the pointer's omitempty never actually fires. An empty
+    // message is the one case a renderer must fall back to generic wording.
+    const decoded = decodeEnduring(wireEnvelope(TURN_FAILED_NIL_ERR_WIRE));
+    expect(decoded.payload).toStrictEqual({
+      kind: "TurnFailed",
+      turnIndex: 8,
+      errorKind: "unknown",
+      errorMessage: "",
+    });
+  });
+
+  it("survives an entirely missing err object rather than throwing", () => {
+    // NOT REAL WIRE for v0.30.0 (projectError never returns nil), but `err` is
+    // `omitempty` on the wire struct, so a future or legacy record could omit it.
+    const decoded = decodeEnduring(envelope({ type: "TurnFailed", loopId: LOOP_A }));
+    expect(decoded.payload).toStrictEqual({
+      kind: "TurnFailed",
+      turnIndex: 0,
+      errorKind: "",
+      errorMessage: "",
+    });
+  });
+
+  it("decodes a REAL TurnInterrupted, which carries a turn_index and nothing else", () => {
+    const decoded = decodeEnduring(wireEnvelope(TURN_INTERRUPTED_WIRE));
+    expect(decoded.payload).toStrictEqual({ kind: "TurnInterrupted", turnIndex: 5 });
+  });
+
+  it("keeps the three terminals distinguishable, which §3b's commit rule needs", () => {
+    // TurnFailed and TurnInterrupted commit the in-flight live segment and then
+    // append a notice/tombstone; TurnDone closes normally. Collapsing them into
+    // one "terminal" kind would lose that, so the kinds are pinned here.
+    expect(decodeEnduring(wireEnvelope(TURN_DONE_WIRE)).payload.kind).toBe("TurnDone");
+    expect(decodeEnduring(wireEnvelope(TURN_FAILED_WIRE)).payload.kind).toBe("TurnFailed");
+    expect(decodeEnduring(wireEnvelope(TURN_INTERRUPTED_WIRE)).payload.kind).toBe("TurnInterrupted");
+  });
+});
+
+describe("decodeEnduring: TurnRejected", () => {
+  it.each(TURN_REJECTED_WIRE)("decodes $label off real wire", ({ json, reason, reasonText }) => {
+    const decoded = decodeEnduring(wireEnvelope(json));
+    if (decoded.payload.kind !== "TurnRejected") throw new Error("unreachable");
+    expect(decoded.payload.reason).toBe(reason);
+    // The expected wording is a LITERAL in the table above, not
+    // rejectReasonText(reason) — comparing the decoder's label to the very
+    // function that produced it would pass however wrong both were.
+    expect(decoded.payload.reasonText).toBe(reasonText);
+    // A rejected submit must never silently vanish: §3b drops the optimistic
+    // pending row (paired by Cause.CommandID) and commits an error notice.
+    expect(decoded.causeCommandId).toBe(CMD_1);
+    // TurnRejected rejects a turn-scoped header — TurnID must be zero.
+    expect(isZeroUUID(decoded.turnId)).toBe(true);
+  });
+
+  it("labels each RejectReason constant distinctly, in declaration order", () => {
+    expect(rejectReasonText(1)).toBe("the loop's queue is full");
+    expect(rejectReasonText(2)).toBe("the loop is shutting down");
+    expect(rejectReasonText(3)).toBe("a transient internal failure");
+    expect(new Set([1, 2, 3].map(rejectReasonText)).size).toBe(3);
+  });
+
+  it("labels an unknown or zero RejectReason without inventing one", () => {
+    // RejectUnspecified is the zero-value sentinel the loop NEVER produces, and
+    // `omitzero` drops it, so an absent key and an unrecognized future value
+    // both land here. Neither may borrow another reason's wording.
+    expect(rejectReasonText(0)).toBe("an unspecified reason");
+    expect(rejectReasonText(99)).toBe("an unspecified reason");
+    const decoded = decodeEnduring(envelope({ type: "TurnRejected", loopId: LOOP_A }));
+    expect(decoded.payload).toStrictEqual({
+      kind: "TurnRejected",
+      reason: 0,
+      reasonText: "an unspecified reason",
+    });
+  });
+});
+
+describe("decodeEnduring: InputCancelled", () => {
+  it("decodes a REAL client retraction: reason 0, omitzero-dropped, with its message", () => {
+    // CancelClientRetracted is 0 and IS a real reason — unlike RejectUnspecified,
+    // whose 0 is a sentinel. `omitzero` drops the key either way, so an absent
+    // `reason` here means "client retracted", not "unknown".
+    const raw = object(JSON.parse(INPUT_CANCELLED_RETRACTED_WIRE) as unknown);
+    expect(Object.hasOwn(raw, "reason")).toBe(false);
+    expect(Object.hasOwn(raw, "turn_index")).toBe(false);
+    const decoded = decodeEnduring(asEnvelope(raw));
+    expect(decoded.payload).toStrictEqual({
+      kind: "InputCancelled",
+      turnIndex: 0,
+      reason: 0,
+      message: {
+        role: "user",
+        blocks: [{ type: "text", text: "never ran" }],
+        toolUseId: "",
+        isError: false,
+      },
+    });
+    expect(decoded.causeCommandId).toBe(CMD_1);
+  });
+
+  it("decodes a REAL return after an interrupted turn: reason 1 and a turn_index", () => {
+    const decoded = decodeEnduring(wireEnvelope(INPUT_CANCELLED_INTERRUPTED_WIRE));
+    expect(decoded.payload).toStrictEqual({
+      kind: "InputCancelled",
+      turnIndex: 7,
+      reason: 1,
+      message: {
+        role: "user",
+        blocks: [{ type: "text", text: "returned to sender" }],
+        toolUseId: "",
+        isError: false,
+      },
+    });
+    expect(decoded.turnId).toBe(TURN_1);
+  });
+
+  it("survives an InputCancelled with no message", () => {
+    // NOT REAL WIRE from the loop (it always returns the message it dequeued),
+    // but Message is `*content.UserMessage` with omitzero, so the key can be
+    // absent in principle.
+    const decoded = decodeEnduring(envelope({ type: "InputCancelled", loopId: LOOP_A }));
+    expect(decoded.payload).toStrictEqual({
+      kind: "InputCancelled",
+      turnIndex: 0,
+      reason: 0,
+      message: undefined,
+    });
   });
 });

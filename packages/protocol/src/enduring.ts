@@ -104,8 +104,121 @@ export interface StepDonePayload {
   messages: ConversationMessage[];
 }
 
+/**
+ * TurnDone's own token accounting: the checked sum of every completed request
+ * in the turn.
+ *
+ * The wire names are the Go FIELD names. content.Usage declares no json tags
+ * and no codec at all, so `json:"usage,omitzero"` on TurnDone marshals it as a
+ * bare struct and ALL FIVE counters are always present — a zero one included.
+ * `omitzero` still drops the whole `usage` key when every counter is zero, so
+ * an absent key means "no tokens", which projects to five zeros here, never to
+ * undefined.
+ *
+ * This must NOT share a type with an AIMessage's own `usage`. That one goes
+ * through content.usageJSON, whose `json:",omitempty"` DROPS zero counters, so
+ * the two shapes disagree under the same key name in the same bytes (pinned in
+ * test/enduring.test.ts against one real TurnDone carrying both). blocks.ts
+ * therefore does not decode the message-level usage at all: turn accounting has
+ * exactly one source, which is this.
+ */
+export interface UsageValue {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  reasoningTokens: number;
+}
+
+/** The terminal SUCCESS event for a turn. §3b closes the turn normally on it. */
+export interface TurnDonePayload {
+  kind: "TurnDone";
+  turnIndex: number;
+  message: ConversationMessage | undefined;
+  usage: UsageValue;
+}
+
+/**
+ * The terminal event for non-cancellation LLM/provider errors.
+ *
+ * TurnFailed.Err is tagged `json:"-"`, and reading the struct alone would say
+ * no failure text reaches the wire. It does. marshalTurnFailed encodes
+ * turnFailedWire, which PROJECTS Err through projectError onto a stable
+ * {kind, message} pair, so a real TurnFailed envelope always carries an `err`
+ * object (projectError(nil) yields kind "unknown" with an empty message rather
+ * than nil, so the pointer's `omitempty` never fires). Verified by marshalling
+ * real TurnFailed values against harness v0.30.0.
+ *
+ * `errorKind` is one of ErrKind's stable durable strings — "empty_response",
+ * "tool_limit", "turn_panic", "unknown" — and never renames; provider/stream
+ * errors are deliberately not enumerated (the event package is a leaf) and
+ * arrive as "unknown" with their full text in `errorMessage`. Only an EMPTY
+ * message needs generic fallback wording from the renderer.
+ *
+ * `errorMessage` is UNTRUSTED display text: it can be an arbitrary provider
+ * error string. Render it as text, never as markup.
+ *
+ * The wire's `model_facing` / `model_facing_detail` pair is deliberately not
+ * projected. It marks an error as safe to hand back to the MODEL, which is a
+ * decision about a replay path wui does not have; it says nothing about
+ * display, and forwarding it to a browser would have no reader.
+ */
+export interface TurnFailedPayload {
+  kind: "TurnFailed";
+  turnIndex: number;
+  errorKind: string;
+  errorMessage: string;
+}
+
+/** The terminal event when the turn context is cancelled. */
+export interface TurnInterruptedPayload {
+  kind: "TurnInterrupted";
+  turnIndex: number;
+}
+
+/**
+ * The Enduring Reply event for a UserInput the loop refused. Enduring exactly
+ * because a rejected user message must never silently vanish: §3b drops the
+ * optimistic pending row (paired by Header.Cause.CommandID) and commits an
+ * error notice carrying this reason.
+ *
+ * event.RejectReason is a bare uint8 with no symbolic encoding, so `reason` is
+ * the raw number and `reasonText` is this module's rendering of it.
+ */
+export interface TurnRejectedPayload {
+  kind: "TurnRejected";
+  reason: number;
+  reasonText: string;
+}
+
+/**
+ * A queued input that left the loop queue without committing — a client
+ * retract, or a return after an abnormal turn end.
+ *
+ * event.CancelReason is likewise a bare uint8, but its zero is NOT a sentinel:
+ * 0 is CancelClientRetracted, a real reason the loop really produces (1 is
+ * CancelTurnInterrupted, 2 CancelTurnFailed). `omitzero` drops the key for 0
+ * just the same, so an absent `reason` here means "client retracted" — the
+ * opposite of what an absent TurnRejected reason means. Never label one with
+ * rejectReasonText.
+ */
+export interface InputCancelledPayload {
+  kind: "InputCancelled";
+  turnIndex: number;
+  reason: number;
+  message: ConversationMessage | undefined;
+}
+
 /** The type-specific half of a decoded enduring event. Extended per task. */
-export type EnduringPayload = TurnOpenerPayload | StepDonePayload | { kind: "other" };
+export type EnduringPayload =
+  | TurnOpenerPayload
+  | StepDonePayload
+  | TurnDonePayload
+  | TurnFailedPayload
+  | TurnInterruptedPayload
+  | TurnRejectedPayload
+  | InputCancelledPayload
+  | { kind: "other" };
 
 /**
  * A decoded enduring event: the shared header coordinates (promoted onto the
@@ -159,6 +272,36 @@ function decodePayload(type: string, raw: Record<string, unknown>): EnduringPayl
       };
     case "StepDone":
       return { kind: "StepDone", messages: decodeMessages(raw["messages"]) };
+    case "TurnDone":
+      return {
+        kind: "TurnDone",
+        turnIndex: num(raw["turn_index"]),
+        message: isRecord(raw["message"]) ? decodeMessage(raw["message"]) : undefined,
+        // TurnDone's OWN usage, never raw["message"]["usage"] — a different shape.
+        usage: decodeUsage(raw["usage"]),
+      };
+    case "TurnFailed": {
+      const err = isRecord(raw["err"]) ? raw["err"] : {};
+      return {
+        kind: "TurnFailed",
+        turnIndex: num(raw["turn_index"]),
+        errorKind: str(err["kind"]),
+        errorMessage: str(err["message"]),
+      };
+    }
+    case "TurnInterrupted":
+      return { kind: "TurnInterrupted", turnIndex: num(raw["turn_index"]) };
+    case "TurnRejected": {
+      const reason = num(raw["reason"]);
+      return { kind: "TurnRejected", reason, reasonText: rejectReasonText(reason) };
+    }
+    case "InputCancelled":
+      return {
+        kind: "InputCancelled",
+        turnIndex: num(raw["turn_index"]),
+        reason: num(raw["reason"]),
+        message: isRecord(raw["message"]) ? decodeMessage(raw["message"]) : undefined,
+      };
     default:
       // The long tail keeps the generic marker, per design §3a.
       return { kind: "other" };
@@ -172,4 +315,45 @@ function decodePayload(type: string, raw: Record<string, unknown>): EnduringPayl
  */
 function num(x: unknown): number {
   return typeof x === "number" ? x : 0;
+}
+
+/**
+ * content.Usage is tag-free, so every counter is read under its Go field name.
+ * An absent `usage` key (the `omitzero` all-zero case) yields five zeros rather
+ * than undefined, so a consumer never has to distinguish "no tokens" from
+ * "no key".
+ */
+function decodeUsage(raw: unknown): UsageValue {
+  const u = isRecord(raw) ? raw : {};
+  return {
+    inputTokens: num(u["InputTokens"]),
+    outputTokens: num(u["OutputTokens"]),
+    cacheReadTokens: num(u["CacheReadTokens"]),
+    cacheCreationTokens: num(u["CacheCreationTokens"]),
+    reasoningTokens: num(u["ReasoningTokens"]),
+  };
+}
+
+/**
+ * event.RejectReason's constants, in declaration order: 0 RejectUnspecified (a
+ * zero-value sentinel the loop NEVER produces), 1 RejectQueueFull,
+ * 2 RejectShuttingDown, 3 RejectInternal. An unrecognized value — including a
+ * reason a later harness adds — falls back to the unspecified wording rather
+ * than borrowing another reason's, because a wrong explanation is worse than
+ * none for a submit the user watched disappear.
+ *
+ * This is RejectReason ONLY. event.CancelReason shares the uint8 spelling and
+ * none of the meanings.
+ */
+export function rejectReasonText(reason: number): string {
+  switch (reason) {
+    case 1:
+      return "the loop's queue is full";
+    case 2:
+      return "the loop is shutting down";
+    case 3:
+      return "a transient internal failure";
+    default:
+      return "an unspecified reason";
+  }
 }
