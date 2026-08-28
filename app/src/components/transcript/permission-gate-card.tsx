@@ -54,6 +54,32 @@ export function PermissionGateCard({
 }: PermissionGateCardProps): React.JSX.Element {
   const answered = gate.alreadyAnswered;
 
+  function hotkey(event: React.KeyboardEvent): void {
+    // Scoped to this card's own subtree through React's synthetic bubbling —
+    // never a document listener, and never a `useEffect` that attaches one. A
+    // global handler would approve a permission gate because the user typed
+    // "y" into the composer (Capstan §7's gotcha, verbatim).
+    if (answered) return;
+    // A modified keystroke belongs to the browser: Cmd-A is select-all and
+    // Ctrl-N opens a window. Answering one would be answering a key the user
+    // never aimed here. Shift is not excluded — "Y" is still a y.
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    const action =
+      event.key === "y" || event.key === "Y"
+        ? GATE_APPROVAL_ACTIONS.approve
+        : event.key === "a" || event.key === "A"
+          ? GATE_APPROVAL_ACTIONS.approveAlwaysWorkspace
+          : event.key === "n" || event.key === "N"
+            ? GATE_APPROVAL_ACTIONS.deny
+            : null;
+    if (action === null) return;
+    // Same fail-secure rule as the buttons: Deny stays live while a response
+    // is in flight, the two approvals do not.
+    if (gate.responding && action !== GATE_APPROVAL_ACTIONS.deny) return;
+    event.preventDefault();
+    onRespond(action);
+  }
+
   return (
     <section
       data-testid="permission-gate-card"
@@ -62,6 +88,7 @@ export function PermissionGateCard({
       aria-label="Permission required"
       tabIndex={-1}
       autoFocus={autoFocus}
+      onKeyDown={hotkey}
       className="mx-4 my-3 rounded-md border border-rig/50 bg-rig/10 p-4 focus-visible:outline-2 focus-visible:outline-rig"
     >
       <p data-testid="gate-prompt-title" className="font-medium text-rig">
