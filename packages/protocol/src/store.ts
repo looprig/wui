@@ -44,7 +44,7 @@
  * A generation counter, bumped by every `start()`/`stop()`, guards every state
  * commit, so a superseded pump loop can never clobber a newer cycle's state.
  */
-import { emptySessionView, type SessionView } from "./fold.js";
+import { emptySessionView, type FoldInput, type SessionView } from "./fold.js";
 import {
   joinSessionView,
   type JoinEvent,
@@ -130,6 +130,10 @@ export class SessionViewStore {
    * and the number of reports stays logarithmic in the size of the gap.
    */
   private nextOverflowReport = 1;
+  /** True while an urgent microtask flush is already queued. */
+  private urgentFlush = false;
+  /** True once a publication reflects a completed run, so `start()` knows to reset it. */
+  private stalePublication = false;
 
   constructor(options: SessionViewStoreOptions) {
     this.options = options;
@@ -187,6 +191,17 @@ export class SessionViewStore {
     if (this.active) return;
     this.active = true;
     this.current = this.options.join?.initialView ?? emptySessionView();
+    if (this.stalePublication) {
+      // Publish the reset, do not merely stage it: snapshot() is what a
+      // useSyncExternalStore consumer renders, and leaving the PREVIOUS
+      // cycle's rows visible until the new join happens to produce its own
+      // first update is a stale transcript for an unbounded time. Skipped
+      // when nothing has ever been published, so a first start() neither
+      // notifies nor invalidates the initial snapshot reference.
+      this.dirty = true;
+      this.finalize();
+      this.stalePublication = false;
+    }
     this.nextOverflowReport = 1;
     const generation = ++this.generation;
 
@@ -259,6 +274,7 @@ export class SessionViewStore {
         this.current = event.view;
         if (!event.ok) this.emitError(event.error);
         this.publish();
+        if (isLatencyCritical(event.input)) this.flushSoon();
       }
     } catch (error) {
       if (generation !== this.generation) return;
@@ -291,8 +307,25 @@ export class SessionViewStore {
   private commit(): void {
     if (!this.dirty) return;
     this.dirty = false;
+    this.stalePublication = true;
     this.published = { version: this.published.version + 1, view: this.current };
     for (const listener of [...this.listeners]) listener();
+  }
+
+  /**
+   * Commits at the end of the current microtask checkpoint rather than on the
+   * next frame. Used for latency-critical input only (see `isLatencyCritical`),
+   * and coalesced with itself so a burst of them costs one commit.
+   */
+  private flushSoon(): void {
+    if (this.urgentFlush) return;
+    this.urgentFlush = true;
+    const generation = this.generation;
+    queueMicrotask(() => {
+      this.urgentFlush = false;
+      if (generation !== this.generation) return;
+      this.finalize();
+    });
   }
 
   /** Cancels any pending frame and commits immediately. */
@@ -331,6 +364,22 @@ function cancelableLiveSource(inner: LiveFrameSource): { source: LiveFrameSource
       activeIterator = undefined;
     },
   };
+}
+
+/**
+ * True for input that must not wait for a frame.
+ *
+ * A LIVE enduring frame is durable, low-rate and latency-critical: every gate
+ * transition is one, and a permission gate the user has to answer must not sit
+ * behind a scheduler hop (16 ms visible, 33 ms hidden, and unbounded if the
+ * frame is stranded by a visibility change). Ephemeral deltas are the
+ * high-frequency ones and stay coalesced, and so does the COLD history replay —
+ * that is thousands of enduring events on the open-a-finished-session path, and
+ * flushing per event there would defeat coalescing on exactly the path it
+ * exists for.
+ */
+function isLatencyCritical(input: FoldInput): boolean {
+  return input.segment === "live" && input.frame.type === "enduring";
 }
 
 /** Narrows a `catch`'s `unknown` without an `as`; every rejection here is already an Error. */
