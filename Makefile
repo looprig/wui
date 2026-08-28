@@ -7,7 +7,8 @@
 # directives, so `make check` needs nothing installed beyond Go itself.
 #
 # Everything runs under GOWORK=off. This module lives inside the parent
-# looprig/go.work workspace but is deliberately NOT a `use` entry: the harness
+# looprig/go.work workspace and IS a `use` entry there, per the workspace's own
+# synchronization rule. Targets set GOWORK=off anyway, because the harness
 # pin in go.mod is a version this module is asserted against, and a workspace
 # would silently resolve it to the sibling checkout instead.
 #

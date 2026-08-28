@@ -129,7 +129,7 @@ func TestFoo(t *testing.T) {
 
 Standalone verification is `GOWORK=off go test ./...`. Both it and `make check` must pass with **no Node toolchain installed**: `dist/index.html` is a committed placeholder precisely so `//go:embed all:dist` compiles without a build. Use `all:dist`, never a bare `dist` — without the prefix, entries whose names begin with `_` or `.` are silently skipped.
 
-This module is deliberately **not** a `use` entry in the parent `looprig/go.work`. A workspace would resolve `github.com/looprig/harness` to the sibling checkout, and the whole point of the pin is to assert against a published version. Every target in the Makefile therefore sets `GOWORK=off`.
+This module **is** a `use` entry in the parent `looprig/go.work`, as the workspace `AGENTS.md` requires ("Keep root `go.work`, `repositories.mk`, and this graph synchronized"). That does mean a workspace build resolves `github.com/looprig/harness` to the sibling checkout rather than the pinned published version — so the contract drift guard defeats the workspace explicitly, setting `GOWORK=off` on the `go list` it uses to locate the pinned module. `client/contract/contract_test.go` is the established precedent for exactly this. Every Makefile target sets `GOWORK=off` for the same reason: standalone verification must test what `go.mod` actually pins.
 
 ## Code Rules
 
