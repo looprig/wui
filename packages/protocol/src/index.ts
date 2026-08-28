@@ -21,6 +21,7 @@ export * from "./live.js";
 export * from "./content.js";
 export * from "./blocks.js";
 export * from "./gate-actions.js";
+export * from "./gate.js";
 export * from "./enduring.js";
 export {
   allSchemas,

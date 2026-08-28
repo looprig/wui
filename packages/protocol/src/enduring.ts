@@ -24,6 +24,7 @@
  */
 import type { EventEnvelope } from "./types.js";
 import { decodeMessage, decodeMessages, isRecord, str, type ConversationMessage } from "./blocks.js";
+import { decodeGate, type Gate } from "./gate.js";
 
 /** The canonical all-zeros uuid, as `uuid.UUID.String()` renders `[16]byte{}`. */
 const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
@@ -355,6 +356,48 @@ export interface LoopStartedPayload {
   initialMode: string;
 }
 
+/**
+ * GateOpened is the PUBLIC activation event: it carries the whole public gate
+ * envelope and no private payload, it fans out to SSE AND lands in the journal,
+ * and it is what makes a gate listable and answerable. Nothing polls for it —
+ * see gate.ts's module comment for why GET /status's waiting_gate_id is not an
+ * alternative.
+ */
+export interface GateOpenedPayload {
+  kind: "GateOpened";
+  gate: Gate;
+}
+
+/**
+ * The single atomic close-with-answer record.
+ *
+ * `action` stays in the clear (for a permission gate it is one of the three
+ * exact gate.ApprovalAction strings); a non-answer close — abandoned, owner
+ * closed, restore unavailable — sets `reason` with `action` empty. `source`
+ * names who produced the answer: "user", "policy", "model" or "classifier",
+ * with an optional free-text reason, which is what lets a resolved card say
+ * "denied by policy" rather than implying the human did it.
+ *
+ * `audit` IS on the wire and is deliberately not projected. The struct tags
+ * `Audit json:"-"`, but so does TurnFailed.Err, and reading the tag as "not on
+ * the wire" is exactly the mistake that dropped the reason from every failed
+ * turn: marshalGateResolved projects the sealed gate.ResponseAudit through
+ * gate.MarshalResponseAudit into a sibling {kind,data} key (pinned in
+ * test/gate.test.ts). It is skipped because a browser has no use for it, not
+ * because it is absent — for a permission gate it restates requirement and
+ * candidate descriptions the open gate already carried, and for a form gate it
+ * is FormAudit's verbatim user answers, which wui does not render. The verbatim
+ * bytes stay on DecodedEnduring.envelope either way.
+ */
+export interface GateResolvedPayload {
+  kind: "GateResolved";
+  gateId: string;
+  resolver: string;
+  reason: string;
+  action: string;
+  source: { kind: string; reason: string };
+}
+
 /** The type-specific half of a decoded enduring event. Extended per task. */
 export type EnduringPayload =
   | TurnOpenerPayload
@@ -367,6 +410,8 @@ export type EnduringPayload =
   | PermissionRequestedPayload
   | PermissionDecidedPayload
   | LoopStartedPayload
+  | GateOpenedPayload
+  | GateResolvedPayload
   | { kind: "other" };
 
 /**
@@ -451,6 +496,19 @@ function decodePayload(type: string, raw: Record<string, unknown>): EnduringPayl
         reason: num(raw["reason"]),
         message: isRecord(raw["message"]) ? decodeMessage(raw["message"]) : undefined,
       };
+    case "GateOpened":
+      return { kind: "GateOpened", gate: decodeGate(raw["gate"]) };
+    case "GateResolved": {
+      const source = isRecord(raw["source"]) ? raw["source"] : {};
+      return {
+        kind: "GateResolved",
+        gateId: str(raw["gate_id"]),
+        resolver: str(raw["resolver"]),
+        reason: str(raw["reason"]),
+        action: str(raw["action"]),
+        source: { kind: str(source["kind"]), reason: str(source["reason"]) },
+      };
+    }
     case "LoopStarted":
       return {
         kind: "LoopStarted",
