@@ -120,3 +120,48 @@ export function decodeBlocks(raw: unknown): ContentBlock[] {
   if (!Array.isArray(raw)) return [];
   return raw.map(decodeBlock);
 }
+
+/**
+ * One decoded conversation message. `toolUseId`/`isError` are meaningful only
+ * for role "tool" (content.ToolResultMessage) and are "" / false otherwise —
+ * a flat shape rather than a discriminated union, because every consumer here
+ * switches on `role` anyway and the union buys nothing but casts.
+ *
+ * `role` is kept as a plain string. harness's unmarshalMessage fails closed on
+ * an unknown role at the DURABLE boundary; this is a display path, where
+ * dropping a message the journal accepted would be worse than rendering it.
+ *
+ * An AIMessage's own `usage` key (aiMessageJSON) is deliberately not decoded:
+ * turn accounting is read from event.TurnDone's top-level `usage` field, so
+ * decoding it here would offer a second, easily double-counted source.
+ */
+export interface ConversationMessage {
+  role: string;
+  blocks: ContentBlock[];
+  toolUseId: string;
+  isError: boolean;
+}
+
+export function decodeMessage(raw: unknown): ConversationMessage {
+  if (!isRecord(raw)) return { role: "", blocks: [], toolUseId: "", isError: false };
+  // Snake_case, unlike the Go-cased blocks nested inside: message.go declares
+  // tagged wire structs (messageJSON, aiMessageJSON, toolResultMessageJSON).
+  return {
+    role: str(raw["role"]),
+    blocks: decodeBlocks(raw["blocks"]),
+    toolUseId: str(raw["tool_use_id"]),
+    isError: raw["is_error"] === true,
+  };
+}
+
+/**
+ * Decodes a content.AgenticMessages array. Note that AgenticMessages has NO
+ * codec in core/content at all: the discriminated-union slice dispatch lives
+ * in harness/pkg/event/marshal.go (marshalMessages/unmarshalMessages), which
+ * emits a plain JSON array of role-tagged messages and can legitimately emit
+ * a null element. A null is skipped rather than yielding an empty row.
+ */
+export function decodeMessages(raw: unknown): ConversationMessage[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(isRecord).map(decodeMessage);
+}
