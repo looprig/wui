@@ -1,4 +1,4 @@
-.PHONY: check check-staticcheck check-gosec check-vuln fmt fmt-check vet test build
+.PHONY: check check-staticcheck check-gosec check-vuln fmt fmt-check vet test build contract
 
 # --- standardized check surface -------------------------------------------
 # One target, the same set of checks, in every module. CI calls exactly this,
@@ -57,3 +57,32 @@ build:
 	GOWORK=off go build ./...
 
 check: fmt-check vet check-staticcheck check-gosec check-vuln test build
+
+# --- vendored harness wire contract ----------------------------------------
+# The pinned harness version contract/ is vendored from. Keep in sync with the
+# go.mod require; the drift guard (contract/contract_test.go) fails if they part,
+# both on file bytes and on contract/VERSION.
+HARNESS_VERSION := v0.30.0
+# Deferred (=), not immediate (:=): an immediate assignment runs `go list` on
+# EVERY make invocation, so `make fmt` on a machine with a cold module cache
+# would trigger a harness download. Deferred, it runs only inside this recipe.
+#
+# GNU Make does NOT propagate a recipe-level env var into $(shell ...) either
+# way -- make expands $(shell) itself, using make's own environment, before the
+# recipe line reaches a shell -- so GOWORK=off is prefixed directly here.
+# Without it, `go` resolves harness via the parent looprig/go.work checkout
+# instead of the version go.mod pins -- silently wrong, not an error.
+HARNESS_DIR = $(shell GOWORK=off go list -m -f '{{.Dir}}' github.com/looprig/harness)
+
+contract:
+	rm -rf contract/schema contract/fixtures
+	mkdir -p contract/schema contract/fixtures
+	cp $(HARNESS_DIR)/pkg/serve/testdata/schema/*.json contract/schema/
+	cp $(HARNESS_DIR)/pkg/serve/testdata/fixtures/* contract/fixtures/
+	@# The Go module cache is read-only, so the copies land mode 0444. `rm -rf`
+	@# tolerates that (the parent directory is writable), but git records only
+	@# the executable bit, so a fresh clone would check these out 0644 while a
+	@# `make contract` tree kept them read-only. Normalize so the two agree and
+	@# the files stay editable for a review diff.
+	chmod -R u+w contract/schema contract/fixtures
+	@echo "$(HARNESS_VERSION)" > contract/VERSION

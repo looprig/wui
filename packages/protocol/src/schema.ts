@@ -209,6 +209,7 @@ export const errorResponseSchema = {
           "description": "Stable machine-readable code a client can switch on.",
           "enum": [
             "internal",
+            "unauthorized",
             "invalid_body",
             "invalid_parameter",
             "session_not_found",
@@ -278,6 +279,7 @@ export const bffErrorResponseSchema = {
           "description": "Stable machine-readable code a client can switch on. Every code serve's own error_response.schema.json enumerates, plus the two BFF-local codes csrf_invalid and origin_not_allowed.",
           "enum": [
             "internal",
+            "unauthorized",
             "invalid_body",
             "invalid_parameter",
             "session_not_found",
@@ -520,15 +522,19 @@ export const restoreResponseSchema = {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://looprig.dev/serve/v1/restore_response.schema.json",
   "title": "RestoreResponse",
-  "description": "200 body for POST /v1/sessions/{sid}/restore: the id of the rebuilt-and-reattached session.",
+  "description": "200 body for POST /v1/sessions/{sid}/restore, which is attach-or-restore: the id of the session now live in the registry, and whether the rig actually rebuilt it. restored is true when the session was rebuilt from durable history and false when an already-live session was reused (attach). Both are 200; the field is never omitted, so a client can distinguish them without inspecting server internals.",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "session_id"
+    "session_id",
+    "restored"
   ],
   "properties": {
     "session_id": {
       "$ref": "uuid.schema.json"
+    },
+    "restored": {
+      "type": "boolean"
     }
   }
 } as const satisfies JSONSchema;

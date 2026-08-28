@@ -39,8 +39,8 @@ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aN
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/invopop/jsonschema v0.14.0 h1:MHQqLhvpNUZfw+hM3AZDYK7jxO8FZoQeQM77g8iyZjg=
 github.com/invopop/jsonschema v0.14.0/go.mod h1:ygm6C2EaVNMBDPpaPlnOA2pFAxBnxGjFlMZABxm9n2I=
-github.com/looprig/harness v0.29.0 h1:NAgRy1rNDyFwmhn5k8tgmj2xTEKMImln0+XmLIDdQWc=
-github.com/looprig/harness v0.29.0/go.mod h1:vOuobi1HxEbQcrieNi1QovKY+ge3Qq9nAXvA/wihUK8=
+github.com/looprig/harness v0.30.0 h1:+8HYrJ55KckiCQ+J94QC7BgYPx2XSwU798Fm1krXUFE=
+github.com/looprig/harness v0.30.0/go.mod h1:vOuobi1HxEbQcrieNi1QovKY+ge3Qq9nAXvA/wihUK8=
 github.com/openai/openai-go/v3 v3.52.0 h1:VDSjIvI5Sr2/AzGJI6219sM2Il+zBWuopvluMy6KdjE=
 github.com/openai/openai-go/v3 v3.52.0/go.mod h1:Vy3y2/I2H/MbqvJGXEK8VbN5+avZV6zxux4I3eBdvaA=
 github.com/pb33f/ordered-map/v2 v2.3.1 h1:5319HDO0aw4DA4gzi+zv4FXU9UlSs3xGZ40wcP1nBjY=

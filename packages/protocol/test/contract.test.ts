@@ -21,7 +21,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { allSchemas } from "../src/schema.js";
+import { allSchemas, bffErrorResponseSchema, errorResponseSchema } from "../src/schema.js";
 import { ContractValidationError, validate, type SchemaName } from "../src/validate.js";
 
 const schemaDir = fileURLToPath(new URL("../../../contract/schema/", import.meta.url));
@@ -57,6 +57,44 @@ describe("schema mirrors match the vendored contract", () => {
   }
 });
 
+// --- 1b. The BFF error superset ----------------------------------------------
+//
+// bffErrorResponseSchema is deliberately absent from `allSchemas`, so §1 above
+// cannot see it: it has no vendored counterpart to be identical to. But it is
+// still DEFINED relative to the vendored one — its doc promises "every code
+// serve's own error_response.schema.json enumerates, plus the two BFF-local
+// codes" — and nothing was checking that promise. Vendoring harness v0.30.0
+// proved the cost: serve had added `unauthorized`, both enums silently lacked
+// it, and only the mirror (which §1 does cover) failed. Had `unauthorized`
+// arrived in a release that changed nothing else, BFFTransport would have
+// rejected a legitimate 401 envelope as invalid at runtime with §1 still green.
+
+describe("the BFF error superset tracks the vendored error codes", () => {
+  const serveCodes = errorResponseSchema.properties.error.properties.code.enum;
+  const bffCodes: readonly string[] = bffErrorResponseSchema.properties.error.properties.code.enum;
+  const bffLocalCodes = ["csrf_invalid", "origin_not_allowed"];
+
+  it("covers every code serve's own error_response schema enumerates", () => {
+    expect(bffCodes).toEqual(expect.arrayContaining([...serveCodes]));
+  });
+
+  it("adds exactly the two BFF-local codes and nothing else", () => {
+    const extra = bffCodes.filter((code) => !(serveCodes as readonly string[]).includes(code));
+    expect(extra.sort()).toEqual([...bffLocalCodes].sort());
+  });
+
+  it("uses the same two literals errors.go declares", () => {
+    // Pins the TypeScript enum to the Go source that produces these two bodies,
+    // so renaming a code on one side alone fails here rather than at runtime.
+    // This is a source-text pin on the declarations, not a proof that the two
+    // guards still emit them -- guard_test.go and csrf_test.go own that.
+    const errorsGo = readFileSync(fileURLToPath(new URL("../../../errors.go", import.meta.url)), "utf8");
+    for (const code of bffLocalCodes) {
+      expect(errorsGo, `errors.go no longer declares "${code}"`).toContain(`= "${code}"`);
+    }
+  });
+});
+
 // --- 2. Fixture conformance --------------------------------------------------
 //
 // Maps every fixture filename to the schema it should validate against. Not a
@@ -79,6 +117,10 @@ const fixtureSchema: Record<string, SchemaName> = {
   "interrupt.json": "interrupt_response",
   "journal_page.json": "event_journal_page",
   "restore.json": "restore_response",
+  // Both restore fixtures share one schema: restore.json is the rebuilt-from-
+  // history case (restored: true) and restore_attached.json the reuse-an-
+  // already-live-session case (restored: false). Same 200 body, one bit apart.
+  "restore_attached.json": "restore_response",
   "session_list.json": "session_list",
   "status_running.json": "session_status",
 };

@@ -27,3 +27,24 @@ jobs:
       # AGENTS.md mandates an explicit standalone run with no workspace masking.
       - name: Standalone verification
         run: GOWORK=off go test ./...
+
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # The npm workspaces carry the OTHER half of the wire-contract drift
+      # guard: contract/contract_test.go proves contract/ matches the pinned
+      # harness bytes, and packages/protocol validates those same bytes against
+      # the schemas with ajv (harness is stdlib-only and cannot). Without this
+      # job that half never runs in CI -- and a suite CI never runs is
+      # indistinguishable from a passing one, which is the exact failure the
+      # deferred-ports tripwire existed to prevent.
+      - run: npm run typecheck --workspaces --if-present
+      - run: npm test --workspaces --if-present
