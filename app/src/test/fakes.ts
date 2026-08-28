@@ -27,6 +27,14 @@ export class FakeTransport implements LooprigTransport {
   createSessionResult: Promise<CreateResponse> = new Promise(() => {});
   submitResult: Promise<InputResponse> = new Promise(() => {});
   respondGateResult: Promise<GateAcceptedResponse> = Promise.resolve({ status: "accepted" });
+  restoreSessionResult: Promise<RestoreResponse> = Promise.resolve({ session_id: "", restored: false });
+  /**
+   * A FACTORY, not a stored promise: a test arms a probe to fail by swapping
+   * this, and a stored rejected promise nobody has awaited yet is an unhandled
+   * rejection the moment it is assigned.
+   */
+  readStatusResponder: () => Promise<SessionStatus> = () =>
+    Promise.resolve({ session_id: "", last_journal_seq: 0 });
   interruptResult: Promise<InterruptResponse> = Promise.resolve({ interrupted: true });
 
   readonly listSessionsCalls: Array<ListSessionsOptions | undefined> = [];
@@ -41,8 +49,10 @@ export class FakeTransport implements LooprigTransport {
     this.listSessionsCalls.push(options);
     return this.listSessionsResult;
   }
+  readStatusCalls = 0;
   readStatus(): Promise<SessionStatus> {
-    throw new Error("readStatus is not used by this route");
+    this.readStatusCalls += 1;
+    return this.readStatusResponder();
   }
   readHistory(): Promise<EventJournalPage> {
     return Promise.resolve({ events: [], next_journal_seq: 0, done: true });
@@ -52,8 +62,10 @@ export class FakeTransport implements LooprigTransport {
     this.createOptions.push(options);
     return this.createSessionResult;
   }
-  restoreSession(): Promise<RestoreResponse> {
-    throw new Error("restoreSession is not used by this route");
+  readonly restoreCalls: string[] = [];
+  restoreSession(sessionId: string): Promise<RestoreResponse> {
+    this.restoreCalls.push(sessionId);
+    return this.restoreSessionResult;
   }
   submit(sessionId: string, request: CreateRequest): Promise<InputResponse> {
     this.submitCalls.push({ sessionId, request });
