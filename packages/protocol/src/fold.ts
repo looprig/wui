@@ -848,6 +848,31 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
         ok: true,
         view: commitTerminalSegment(next, decoded.loopId, journalSeq, "ok"),
       };
+    case "TurnInterrupted": {
+      // Order: the partial work stays VISIBLE and the tombstone marks where it
+      // stopped. A still-running card is CANCELLED, not ok — the interrupt is
+      // exactly what stopped it.
+      //
+      // Swapping these two STATEMENTS is currently an equivalent mutation, and
+      // deliberately so: commitLiveRows REPLACES each live row in place, so the
+      // segment's positions and ordinals are already fixed before the tombstone
+      // is appended. The order is written and asserted anyway because it stops
+      // being equivalent the moment anyone commits by re-appending instead of
+      // replacing, which is the implementation the transcript would actually
+      // render wrong (tombstone above the work it terminates).
+      const committed = commitTerminalSegment(next, decoded.loopId, journalSeq, "cancelled");
+      return {
+        ok: true,
+        view: appendRow(committed, {
+          kind: "tombstone",
+          loopId: decoded.loopId,
+          turnId: decoded.turnId,
+          journalSeq,
+          live: false,
+          orphanedLoop: false,
+        }),
+      };
+    }
     case "GateOpened": {
       // Copy-on-write, like every other branch here: fold() must never mutate
       // the view it was handed (test/fold-immutability.test.ts pins that, and

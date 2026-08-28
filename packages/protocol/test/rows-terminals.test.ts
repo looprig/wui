@@ -272,3 +272,91 @@ function withRefusal(view: SessionView, refusal: string): SessionView {
   );
   return { ...view, rows };
 }
+
+/** `event.TurnInterrupted{Header: …, TurnIndex: 5}`. */
+const TURN_INTERRUPTED_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":5,"type":"TurnInterrupted","v":1}';
+
+describe("rows: TurnInterrupted commits the segment, then a tombstone", () => {
+  it("commits the partial work FIRST, then the tombstone", () => {
+    // Order is the whole point. A tombstone appended before the partial work
+    // would read as work produced AFTER the interrupt landed.
+    resetSeq();
+    const view = run(emptySessionView(), [
+      textDelta("half an ans", LOOP_A, TURN_1),
+      history(envelope({ type: "TurnInterrupted", loopId: LOOP_A, turnId: TURN_1 }), 8),
+    ]);
+    expect(view.rows.map((r) => [r.kind, r.ordinal])).toStrictEqual([
+      ["assistant", 0],
+      ["tombstone", 1],
+    ]);
+    expect(view.rows[0]).toMatchObject({ live: false, text: "half an ans", journalSeq: 8 });
+    expect(view.rows[1]).toStrictEqual({
+      kind: "tombstone",
+      ordinal: 1,
+      loopId: LOOP_A,
+      turnId: TURN_1,
+      journalSeq: 8,
+      live: false,
+      orphanedLoop: false,
+    });
+  });
+
+  it("commits the tombstone off real TurnInterrupted wire", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      textDelta("mid-thought", LOOP_A, TURN_1),
+      history(wireEnvelope(TURN_INTERRUPTED_WIRE), 14),
+    ]);
+    expect(view.rows.map((r) => r.kind)).toStrictEqual(["assistant", "tombstone"]);
+    expect(view.rows[1]).toMatchObject({ loopId: LOOP_A, turnId: TURN_1, journalSeq: 14 });
+  });
+
+  it("marks a still-running tool card CANCELLED, not ok", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      toolStarted("te-1", "Bash", LOOP_A),
+      history(envelope({ type: "TurnInterrupted", loopId: LOOP_A, turnId: TURN_1 }), 6),
+    ]);
+    expect(view.rows[0]).toMatchObject({ kind: "tool", status: "cancelled", live: false, journalSeq: 6 });
+  });
+
+  it("leaves an already-completed card alone — it finished before the interrupt", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      toolStarted("te-1", "Read", LOOP_A),
+      liveEphemeral("tool_call_completed", { tool_execution_id: "te-1" }, LOOP_A, TURN_1),
+      history(envelope({ type: "TurnInterrupted", loopId: LOOP_A, turnId: TURN_1 })),
+    ]);
+    expect(view.rows[0]).toMatchObject({ kind: "tool", status: "ok" });
+  });
+
+  it("commits a tombstone even with nothing in flight", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      history(envelope({ type: "TurnInterrupted", loopId: LOOP_A, turnId: TURN_1 })),
+    ]);
+    expect(view.rows.map((r) => r.kind)).toStrictEqual(["tombstone"]);
+  });
+
+  it("drops an EMPTY live prose row, so the tombstone stands alone", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      textDelta("", LOOP_A, TURN_1),
+      history(envelope({ type: "TurnInterrupted", loopId: LOOP_A, turnId: TURN_1 })),
+    ]);
+    expect(view.rows.map((r) => r.kind)).toStrictEqual(["tombstone"]);
+  });
+
+  it("leaves another loop's live segment running", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      textDelta("child still going", LOOP_B, TURN_1),
+      textDelta("parent", LOOP_A, TURN_1),
+      history(envelope({ type: "TurnInterrupted", loopId: LOOP_A, turnId: TURN_1 })),
+    ]);
+    expect(view.rows.filter((r) => r.loopId === LOOP_B)).toHaveLength(1);
+    expect(view.rows.find((r) => r.loopId === LOOP_B)).toMatchObject({ live: true });
+    expect(view.rows.filter((r) => r.kind === "tombstone")).toHaveLength(1);
+  });
+});
