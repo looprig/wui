@@ -23,6 +23,7 @@ export * from "./blocks.js";
 export * from "./gate-actions.js";
 export * from "./gate.js";
 export * from "./enduring.js";
+export * from "./rows.js";
 export {
   allSchemas,
   capabilitiesSchema,

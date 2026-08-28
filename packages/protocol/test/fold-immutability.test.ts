@@ -29,6 +29,7 @@ import {
   textBlockWire,
   textDelta,
   thinkingDelta,
+  userMessageWire,
 } from "./helpers.js";
 
 /** A structural deep clone that survives Map/Set/undefined (JSON does not). */
@@ -47,6 +48,10 @@ const SEEDED_ARRAYS = [
   "queuedInputs",
   "compactions",
   "statusEvents",
+  // rows must be seeded too, or "did not mutate rows" would be a claim about an
+  // empty array. The seed's TurnStarted therefore carries a message: a turn
+  // opener with no message commits no row at all.
+  "rows",
 ] as const satisfies readonly (keyof SessionView)[];
 
 /**
@@ -91,7 +96,7 @@ function seededView(): SessionView {
   resetSeq();
   let view = emptySessionView();
   const seeds: FoldInput[] = [
-    history(envelope({ type: "TurnStarted", loopId: LOOP_A })),
+    history(envelope({ type: "TurnStarted", loopId: LOOP_A, payload: { message: userMessageWire([textBlockWire("seed")]) } })),
     textDelta("seed", LOOP_A),
     liveEphemeral("tool_call_started", { tool_execution_id: "seed", tool_name: "Bash" }, LOOP_A),
     liveEphemeral("input_queued", undefined, LOOP_A),
@@ -118,6 +123,9 @@ function inputs(): FoldInput[] {
   resetSeq();
   return [
     history(envelope({ type: "TurnStarted", loopId: LOOP_A })),
+    // Commits a row onto the already-seeded rows array: the append path, not
+    // just the no-op path.
+    history(envelope({ type: "TurnStarted", loopId: LOOP_B, payload: { message: userMessageWire([textBlockWire("input")]) } })),
     history(
       envelope({
         type: "StepDone",

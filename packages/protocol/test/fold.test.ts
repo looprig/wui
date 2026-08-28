@@ -383,7 +383,17 @@ describe("emptySessionView", () => {
       compactions: [],
       statusEvents: [],
       gates: new Map(),
+      rows: [],
+      nextOrdinal: 0,
     });
+  });
+
+  it("gives every call its OWN rows array, not a shared one", () => {
+    // Same hazard as the gate map below: a module-level `[]` would let one
+    // session's transcript leak into every other view in the process.
+    const first = emptySessionView();
+    first.rows.push({ kind: "tombstone", ordinal: 0, loopId: "", turnId: "", journalSeq: undefined, live: false, orphanedLoop: false });
+    expect(emptySessionView().rows).toHaveLength(0);
   });
 
   it("gives every call its OWN gate map, not a shared one", () => {

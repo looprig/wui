@@ -82,8 +82,9 @@
  */
 import type { EphemeralFrame, EventEnvelope, EventHeader, StatusEvent } from "./types.js";
 import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "./sse.js";
-import { decodeEnduring } from "./enduring.js";
+import { decodeEnduring, isZeroUUID } from "./enduring.js";
 import type { Gate } from "./gate.js";
+import type { TranscriptRow, TranscriptRowDraft } from "./rows.js";
 
 // --- Session view -----------------------------------------------------------
 
@@ -229,6 +230,14 @@ export interface SessionView {
    * the TUI" card.
    */
   gates: Map<string, Gate>;
+  /**
+   * The append-only transcript row projection: ONE array preserving the
+   * cross-bucket arrival order `content` and `toolCalls` cannot express. See
+   * rows.ts for the shape, the copy-on-write rule and the ordering rule.
+   */
+  rows: TranscriptRow[];
+  /** The next ordinal to allocate. Monotonic; never reused, never reset. */
+  nextOrdinal: number;
 }
 
 export function emptySessionView(): SessionView {
@@ -239,6 +248,8 @@ export function emptySessionView(): SessionView {
     compactions: [],
     statusEvents: [],
     gates: new Map(),
+    rows: [],
+    nextOrdinal: 0,
   };
 }
 
@@ -521,6 +532,34 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
   // reading statusEvents, so nothing regresses.
   const decoded = decodeEnduring(envelope);
   switch (decoded.payload.kind) {
+    case "TurnStarted": {
+      // §3b rule 2: a user row ONLY when Header.Cause.LoopID is zero. A
+      // NON-ZERO cause loop id is a subagent hand-back — handlers_events.go
+      // subscribes LoopScope{All: true}, so a parent loop sees every child's
+      // frames, and a hand-back arrives as a turn opener on the PARENT loop
+      // whose cause loop id is the CHILD's. Committing a row for it renders a
+      // phantom user message on every hand-back.
+      //
+      // isZeroUUID, never `cause?.loop_id === undefined`: production OMITS a
+      // zero id, but harness's fixture normaliser REPLACES ids, so the
+      // all-zeros spelling is equally real wire. Both must gate identically.
+      const message = decoded.payload.message;
+      if (!isZeroUUID(decoded.causeLoopId) || message === undefined) {
+        return { ok: true, view: next };
+      }
+      return {
+        ok: true,
+        view: appendRow(next, {
+          kind: "user",
+          loopId: decoded.loopId,
+          turnId: decoded.turnId,
+          journalSeq,
+          live: false,
+          orphanedLoop: false,
+          blocks: message.blocks,
+        }),
+      };
+    }
     case "GateOpened": {
       // Copy-on-write, like every other branch here: fold() must never mutate
       // the view it was handed (test/fold-immutability.test.ts pins that, and
@@ -540,6 +579,20 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
     default:
       return { ok: true, view: next };
   }
+}
+
+/**
+ * Appends `draft` to a COPY of `view.rows`, allocating its ordinal here so no
+ * caller can pick one. Copy-on-write in both directions: the input view's array
+ * is never appended to, and the rows already in it are carried over BY
+ * REFERENCE, which is what keeps a per-row `Object.is` selector from re-rendering
+ * every card on every event. Task 3.25 replaces the array copy with an in-place
+ * append and adds the compensating assertion; the row objects stay
+ * copy-on-write regardless.
+ */
+function appendRow(view: SessionView, draft: TranscriptRowDraft): SessionView {
+  const committed = { ...draft, ordinal: view.nextOrdinal };
+  return { ...view, rows: [...view.rows, committed], nextOrdinal: view.nextOrdinal + 1 };
 }
 
 function foldStatusEvent(view: SessionView, event: StatusEvent): FoldResult {
