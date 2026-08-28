@@ -376,13 +376,23 @@ describe("foldEphemeral: malformed delta payloads (no schema backs the interior 
 
 describe("emptySessionView", () => {
   it("returns a fresh, fully-empty SessionView", () => {
-    expect(emptySessionView()).toEqual({
+    expect(emptySessionView()).toStrictEqual({
       content: [],
       toolCalls: [],
       queuedInputs: [],
       compactions: [],
       statusEvents: [],
+      gates: new Map(),
     });
+  });
+
+  it("gives every call its OWN gate map, not a shared one", () => {
+    // A module-level `new Map()` would be shared by every view in the process:
+    // opening a gate in one session would open it in all of them, and this is
+    // the only mutable-by-identity field on the view.
+    const first = emptySessionView();
+    first.gates.set("g", { id: "g" } as never);
+    expect(emptySessionView().gates.size).toBe(0);
   });
 
   it("returns a distinct object each call (fold() never mutates its input, so callers must not assume a shared reference either)", () => {

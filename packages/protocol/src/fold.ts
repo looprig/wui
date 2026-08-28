@@ -57,29 +57,33 @@
  * `SseFrameError`, extended one layer further into the payload sse.ts itself
  * does not (and per its own docs, deliberately does not) interpret.
  *
- * ## Gates are NOT folded here
+ * ## Gates ARE folded here — the map, not the marker
  *
- * harness's Go event union (`pkg/event/validate.go`'s `classify`) includes
- * `GatePrepared`/`GateOpened`/`GateResolved` concrete types, so gate-shaped
- * events are real wire traffic in principle. But `event_journal_page.schema.json`
- * documents "GatePrepared never appears" in a journal page, and — more
- * fundamentally — `event_envelope.schema.json` types `event.type` as a bare
- * `string` (confirmed: not an enum) and documents the per-type payload as
- * wholly "open" (unconstrained). There is no vendored schema this SDK could
- * validate a gate payload against, and no TS shape `FromSchema` derives for
- * one — building kind-specific gate-folding logic here would mean inventing
- * a payload shape from nothing this contract actually pins down. So
- * `foldStatusEvent`/`foldEnduringEnvelope` below fold every enduring
- * `EventEnvelope` (gate-shaped or not) into the SAME generic
- * `StatusEventMarker` — `type` plus the envelope's identity fields plus the
- * envelope verbatim — rather than a `Gate`-specific case that doesn't exist
- * anywhere in this contract yet. When gate payloads get a real vendored
- * schema, `StatusEventMarker` is the natural extension point (a
- * `kind`-specific case alongside the generic fallback, mirroring how
- * `foldEphemeral` is structured), not a redesign.
+ * This module used to say gates could not be folded, because
+ * `event_envelope.schema.json` leaves the per-type payload wholly open and
+ * there was no vendored schema to validate one against. That was a statement
+ * about SCHEMAS, and it does not survive: `MarshalEvent` merges the full
+ * type-specific payload into the envelope as sibling keys and the journal
+ * replays those bytes verbatim, so the payload is a real durable contract with
+ * or without a schema document. enduring.ts decodes it against bytes harness's
+ * own codec produced, and gate.ts decodes the gate envelope those bytes carry.
+ *
+ * So `foldEnduringEnvelope` now does both: it appends the generic
+ * `StatusEventMarker` exactly as before (nothing that reads `statusEvents`
+ * regresses, and the long tail is still covered by it) AND routes the two
+ * public gate events into `SessionView.gates`. That is the "kind-specific case
+ * alongside the generic fallback, mirroring how `foldEphemeral` is structured"
+ * this comment always named as the extension point — a widening, not a
+ * redesign.
+ *
+ * `GatePrepared` is not handled and never needs to be: it is the private
+ * prepared record, the replayer filters it out of journal pages, and it never
+ * fans out to SSE.
  */
 import type { EphemeralFrame, EventEnvelope, EventHeader, StatusEvent } from "./types.js";
 import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "./sse.js";
+import { decodeEnduring } from "./enduring.js";
+import type { Gate } from "./gate.js";
 
 // --- Session view -----------------------------------------------------------
 
@@ -195,17 +199,47 @@ export interface StatusEventMarker {
   envelope: EventEnvelope;
 }
 
-/** The single accumulated session shape both history and live segments fold into. Append-only: fold() never removes an entry, only appends or (for `ToolCallCard`) updates one in place. */
+/**
+ * The single accumulated session shape both history and live segments fold
+ * into. The arrays are append-only: fold() never removes an entry, only appends
+ * or (for `ToolCallCard`) updates one in place. `gates` is the exception, and
+ * deliberately so — a gate's whole lifecycle is open-then-close.
+ */
 export interface SessionView {
   content: ContentDelta[];
   toolCalls: ToolCallCard[];
   queuedInputs: QueuedInputMarker[];
   compactions: CompactionMarker[];
   statusEvents: StatusEventMarker[];
+  /**
+   * The OPEN gates, keyed by gate id. Opened on `GateOpened`, removed on
+   * `GateResolved`. This is the map the UI answers from; gates are never
+   * polled — see gate.ts's module comment for why `GET /status`'s
+   * `waiting_gate_id` is not an alternative.
+   *
+   * A Map rather than an array because the resolve is a keyed removal, and the
+   * key is the GATE id rather than the loop id or the subject's tool execution
+   * id: two gates can be open in one loop, and two can be open over one tool
+   * call, so either of those keys would silently drop a gate a human still has
+   * to answer.
+   *
+   * Non-answerable kinds (ask-user, form, open-url) are kept here too. They
+   * still block progress, so a renderer must show them — with
+   * `isAnswerableGate` deciding whether to offer controls or an "answer this in
+   * the TUI" card.
+   */
+  gates: Map<string, Gate>;
 }
 
 export function emptySessionView(): SessionView {
-  return { content: [], toolCalls: [], queuedInputs: [], compactions: [], statusEvents: [] };
+  return {
+    content: [],
+    toolCalls: [],
+    queuedInputs: [],
+    compactions: [],
+    statusEvents: [],
+    gates: new Map(),
+  };
 }
 
 // --- Fold input / result -----------------------------------------------------
@@ -478,7 +512,34 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
     createdAt: envelope.created_at,
     envelope,
   };
-  return { ok: true, view: { ...view, statusEvents: [...view.statusEvents, marker] } };
+  const next: SessionView = { ...view, statusEvents: [...view.statusEvents, marker] };
+
+  // Kind-specific cases alongside the generic fallback — this module's own
+  // documented extension point (see the "Gates are NOT folded here" section
+  // above, which this supersedes now that enduring.ts decodes the payloads).
+  // The marker above is RETAINED for the long tail and for any consumer already
+  // reading statusEvents, so nothing regresses.
+  const decoded = decodeEnduring(envelope);
+  switch (decoded.payload.kind) {
+    case "GateOpened": {
+      // Copy-on-write, like every other branch here: fold() must never mutate
+      // the view it was handed (test/fold-immutability.test.ts pins that, and
+      // join.ts yields the prior view on a failed fold).
+      const gates = new Map(view.gates);
+      gates.set(decoded.payload.gate.id, decoded.payload.gate);
+      return { ok: true, view: { ...next, gates } };
+    }
+    case "GateResolved": {
+      // A close for a gate this view never opened (a mid-stream join) removes
+      // nothing and copies nothing — it is not an error.
+      if (!view.gates.has(decoded.payload.gateId)) return { ok: true, view: next };
+      const gates = new Map(view.gates);
+      gates.delete(decoded.payload.gateId);
+      return { ok: true, view: { ...next, gates } };
+    }
+    default:
+      return { ok: true, view: next };
+  }
 }
 
 function foldStatusEvent(view: SessionView, event: StatusEvent): FoldResult {

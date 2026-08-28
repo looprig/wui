@@ -19,6 +19,7 @@ import { describe, expect, it } from "vitest";
 import { emptySessionView, fold, type FoldInput, type SessionView } from "../src/fold.js";
 import {
   LOOP_A,
+  LOOP_B,
   aiMessageWire,
   envelope,
   history,
@@ -49,12 +50,36 @@ const SEEDED_ARRAYS = [
 ] as const satisfies readonly (keyof SessionView)[];
 
 /**
+ * The gate this file's seeded view holds open. `gates` is the first non-array
+ * field on `SessionView` and the FIRST one fold may remove from, so an in-place
+ * `Map.delete` is a real risk an empty seed could not catch — the seed opens a
+ * gate and `inputs()` below resolves it.
+ */
+const SEEDED_GATE_ID = "9e2f0000-0000-4000-8000-0000000000ff";
+
+function gateOpenedWire(gateId: string): Record<string, unknown> {
+  return { gate: { id: gateId, kind: "harness.permission", prompt: { title: "Allow?" } } };
+}
+
+/**
+ * The subset of `SessionView`'s keys whose value is an array. Now that `gates`
+ * exists this is a real subset, and the narrowing is what keeps `.length`
+ * type-safe below rather than a cast.
+ */
+type ArrayKey = {
+  [K in keyof SessionView]: SessionView[K] extends readonly unknown[] ? K : never;
+}[keyof SessionView];
+
+/**
  * Returns the view's array-valued keys. Derived rather than hardcoded so that
  * an array added to `SessionView` later is checked without editing this file;
- * a non-array field (a Map, say) is skipped rather than crashing on `.length`.
+ * a non-array field (the `gates` Map) is skipped here and asserted separately
+ * rather than crashing on `.length`.
  */
-function arrayKeys(view: SessionView): Array<keyof SessionView> {
-  return (Object.keys(view) as Array<keyof SessionView>).filter((k) => Array.isArray(view[k]));
+function arrayKeys(view: SessionView): ArrayKey[] {
+  return (Object.keys(view) as Array<keyof SessionView>).filter(
+    (k): k is ArrayKey => Array.isArray(view[k]),
+  );
 }
 
 /**
@@ -75,6 +100,7 @@ function seededView(): SessionView {
       { attempt_id: "seed", reason: 1, basis: { revision: 1, through_event_id: "e0" } },
       LOOP_A,
     ),
+    history(envelope({ type: "GateOpened", loopId: LOOP_A, payload: gateOpenedWire(SEEDED_GATE_ID) })),
   ];
   for (const seed of seeds) {
     const seeded = fold(view, seed);
@@ -84,6 +110,7 @@ function seededView(): SessionView {
   for (const key of SEEDED_ARRAYS) {
     expect(view[key].length, `seeded view leaves ${key} empty`).toBeGreaterThan(0);
   }
+  expect(view.gates.size, "seeded view leaves gates empty").toBeGreaterThan(0);
   return view;
 }
 
@@ -100,6 +127,10 @@ function inputs(): FoldInput[] {
     ),
     history(envelope({ type: "TurnDone", loopId: LOOP_A })),
     liveEnduring(envelope({ type: "GateOpened", loopId: LOOP_A })),
+    // Opens a second gate, then removes the seeded one: the two branches that
+    // copy `gates`, one of which DELETES from it.
+    history(envelope({ type: "GateOpened", loopId: LOOP_B, payload: gateOpenedWire("9e2f0000-0000-4000-8000-0000000000ee") })),
+    history(envelope({ type: "GateResolved", loopId: LOOP_A, payload: { gate_id: SEEDED_GATE_ID, action: "Approve" } })),
     textDelta("tok", LOOP_A),
     thinkingDelta("think", LOOP_A),
     liveEphemeral("tool_call_started", { tool_execution_id: "t1", tool_name: "Read" }, LOOP_A),
@@ -162,6 +193,12 @@ describe("fold immutability contract", () => {
             view[key],
           );
         }
+      }
+      // Same rule for the gate map, which can SHRINK as well as grow.
+      if (result.view.gates.size !== view.gates.size) {
+        expect(result.view.gates, "gates changed but reuses the input's Map object").not.toBe(
+          view.gates,
+        );
       }
     }
   });
