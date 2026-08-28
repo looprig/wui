@@ -40,3 +40,20 @@ test("unmount runs the effect cleanup", async () => {
   // One from the StrictMode remount, one from the real unmount.
   expect(cleanups).toBe(2);
 });
+
+test("rerender re-runs the hook, so a closed-over argument is picked up", async () => {
+  let sessionId = "first";
+  const seen: string[] = [];
+  const { rerender } = await renderHookStrict(() => {
+    seen.push(sessionId);
+  });
+
+  sessionId = "second";
+  await rerender();
+
+  // React bails out BEFORE calling the component when it is handed the
+  // identical element reference, so a helper that reused one would report only
+  // "first" here — silently, and only in whichever test happened to depend on
+  // it.
+  expect(seen.at(-1)).toBe("second");
+});

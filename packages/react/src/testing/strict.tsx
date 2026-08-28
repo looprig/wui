@@ -59,15 +59,19 @@ export async function renderHookStrict<T>(hook: () => T): Promise<StrictHookResu
     return null;
   }
 
-  const tree = (
+  // A FRESH element per render pass. Re-rendering the identical element
+  // reference makes React bail out before it calls the component at all, so a
+  // `rerender()` that reused one would never re-run `hook` — and a hook whose
+  // arguments live in the test's closure would silently keep its old ones.
+  const tree = (): React.ReactElement => (
     <StrictMode>
       <Harness />
     </StrictMode>
   );
-  const rendered = await render(tree);
+  const rendered = await render(tree());
   return {
     result,
-    rerender: () => rendered.rerender(tree),
+    rerender: () => rendered.rerender(tree()),
     unmount: () => rendered.unmount(),
   };
 }
