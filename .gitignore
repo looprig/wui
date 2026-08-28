@@ -1,0 +1,50 @@
+# Built SPA. dist/ is the //go:embed target, so index.html must stay committed:
+# //go:embed requires the path to exist at compile time, and that placeholder is
+# what makes `GOWORK=off go build ./...` and `GOWORK=off go test ./...` work with
+# no Node toolchain installed. The real `npm run build -w app` overwrites
+# everything under dist/ EXCEPT this file.
+dist/*
+!dist/index.html
+
+# npm workspaces
+node_modules/
+packages/*/dist/
+packages/*/node_modules/
+app/dist/
+app/node_modules/
+
+# Binaries
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go build artifacts
+*.test
+*.out
+
+# Environment & secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Git worktrees
+.worktrees/
+
+# Claude Code project settings
+.claude/
+
+# This module does not vendor. go.mod pins exact versions and go.sum verifies
+# their content hashes; a vendor tree would add only offline builds and
+# source-level dependency diffs, at the cost of masking which version a
+# GOWORK=off build actually resolves. Ignored so a stray `go mod vendor` cannot
+# be committed by accident.
+/vendor/
