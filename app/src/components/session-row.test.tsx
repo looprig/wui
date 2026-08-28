@@ -63,7 +63,28 @@ describe("SessionRow", () => {
 
     // A meta/ctrl-click means "open in a new tab" and must reach the browser
     // untouched: intercepting it would silently break that gesture.
-    await userEvent.click(link, { modifiers: ["Meta"] });
+    //
+    // Assert that on the EVENT, never by letting the navigation happen. The
+    // modifier that means "new tab" is platform-specific — Meta on macOS, Ctrl
+    // on Linux — so on a Linux runner Chromium treats a Meta-click as an
+    // ordinary navigation, follows the real href, and destroys vitest's test
+    // iframe ("Cannot connect to the iframe. Did you change the location?").
+    // That is a CI-only failure the local macOS run cannot reproduce. So we
+    // capture the click ourselves, record whether the component prevented it,
+    // and prevent it here to keep the frame alive.
+    let modifiedClickWasPrevented: boolean | undefined;
+    const capture = (event: MouseEvent) => {
+      modifiedClickWasPrevented = event.defaultPrevented;
+      event.preventDefault();
+    };
+    document.addEventListener("click", capture);
+    try {
+      await userEvent.click(link, { modifiers: ["Meta"] });
+    } finally {
+      document.removeEventListener("click", capture);
+    }
+
+    expect(modifiedClickWasPrevented).toBe(false);
     expect(onActivate).toHaveBeenCalledTimes(1);
   });
 
