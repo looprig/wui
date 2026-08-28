@@ -84,7 +84,7 @@ import type { EphemeralFrame, EventEnvelope, EventHeader, StatusEvent } from "./
 import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "./sse.js";
 import { decodeEnduring, isZeroUUID } from "./enduring.js";
 import type { Gate } from "./gate.js";
-import type { AssistantRow, TranscriptRow, TranscriptRowDraft } from "./rows.js";
+import type { AssistantRow, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft } from "./rows.js";
 
 // --- Session view -----------------------------------------------------------
 
@@ -387,12 +387,86 @@ function findToolCallCardIndex(view: SessionView, toolExecutionId: string | unde
   return view.toolCalls.findIndex((c) => c.toolExecutionId === toolExecutionId);
 }
 
+// --- The legacy toolCalls bucket ------------------------------------------------
+
+/**
+ * Folds a `tool_call_started` frame into the legacy `toolCalls` bucket. Lifted
+ * verbatim out of `foldEphemeral` so the case can drive both the bucket and the
+ * row; nothing about the bucket's behaviour changed (test/fold.test.ts pins it).
+ */
+function foldToolCallStartedCard(
+  view: SessionView,
+  header: EventHeader | undefined,
+  toolExecutionId: string | undefined,
+  toolName: string | undefined,
+  summary: string | undefined,
+): SessionView {
+  const matchIndex = findToolCallCardIndex(view, toolExecutionId);
+  if (matchIndex === -1) {
+    const card: ToolCallCard = {
+      toolExecutionId,
+      status: "started",
+      toolName,
+      summary,
+      isError: undefined,
+      resultPreview: undefined,
+      startedHeader: header,
+      completedHeader: undefined,
+    };
+    return { ...view, toolCalls: [...view.toolCalls, card] };
+  }
+
+  // A card for this id already exists (see the ToolCallCard doc comment for why
+  // this branch exists at all): merge the started-only fields rather than
+  // appending a second card. `status` is intentionally NOT reset to "started" —
+  // if the existing card is already "completed" (the completed frame arrived
+  // first), that is the more advanced state and must not regress.
+  const toolCalls = [...view.toolCalls];
+  const prior = toolCalls[matchIndex]!;
+  toolCalls[matchIndex] = { ...prior, toolName, summary, startedHeader: header };
+  return { ...view, toolCalls };
+}
+
+/** Folds a `tool_call_completed` frame into the legacy `toolCalls` bucket. */
+function foldToolCallCompletedCard(
+  view: SessionView,
+  header: EventHeader | undefined,
+  toolExecutionId: string | undefined,
+  isError: boolean | undefined,
+  resultPreview: string | undefined,
+): SessionView {
+  const matchIndex = findToolCallCardIndex(view, toolExecutionId);
+  if (matchIndex === -1) {
+    const card: ToolCallCard = {
+      toolExecutionId,
+      status: "completed",
+      toolName: undefined,
+      summary: undefined,
+      isError,
+      resultPreview,
+      startedHeader: undefined,
+      completedHeader: header,
+    };
+    return { ...view, toolCalls: [...view.toolCalls, card] };
+  }
+
+  const toolCalls = [...view.toolCalls];
+  const prior = toolCalls[matchIndex]!;
+  toolCalls[matchIndex] = { ...prior, status: "completed", isError, resultPreview, completedHeader: header };
+  return { ...view, toolCalls };
+}
+
 // --- The live segment (design §3b rule 3) ---------------------------------------
 
 /**
  * The loop's live assistant row: the in-flight turn's provisional prose. There
  * is at most ONE per loop, and it is DISCARDED WHOLESALE at that loop's
  * StepDone (the snap) or committed at a turn terminal.
+ *
+ * The row is only EXTENDABLE while it is the loop's LAST row. Once a tool row
+ * lands after it the prose row is closed, and the next delta opens a new one —
+ * which is exactly the "text -> tool call -> text within a turn" interleaving
+ * that the separate `content`/`toolCalls` buckets cannot express (§3c).
  *
  * That wholesale replacement is what makes the absent `step_id` irrelevant.
  * harness's `stampStepID` stamps `StepID` on exactly five event types and
@@ -404,7 +478,31 @@ function findToolCallCardIndex(view: SessionView, toolExecutionId: string | unde
  * shared key at all.
  */
 function liveAssistantIndex(view: SessionView, loopId: string): number {
-  return view.rows.findIndex((r) => r.live && r.loopId === loopId && r.kind === "assistant");
+  for (let i = view.rows.length - 1; i >= 0; i--) {
+    const row = view.rows[i]!;
+    if (row.loopId !== loopId) continue;
+    return row.live && row.kind === "assistant" ? i : -1;
+  }
+  return -1;
+}
+
+/**
+ * The live tool row for `toolExecutionId` within `loopId`, whatever its current
+ * status — matching is symmetric and id-based, so a completed frame arriving
+ * BEFORE its started counterpart still merges rather than orphaning a second
+ * card (fold.ts's ToolCallCard doc records both real orders). An absent id never
+ * matches: two id-less frames are unrelated calls, and collapsing them into one
+ * card is worse than showing two.
+ *
+ * The loop is part of the key: two loops running the same tool are two cards,
+ * and `handlers_events.go` subscribes `LoopScope{All: true}` so both streams
+ * arrive here interleaved.
+ */
+function liveToolIndex(view: SessionView, loopId: string, toolExecutionId: string): number {
+  if (toolExecutionId === "") return -1;
+  return view.rows.findIndex(
+    (r) => r.live && r.kind === "tool" && r.loopId === loopId && r.toolExecutionId === toolExecutionId,
+  );
 }
 
 /**
@@ -500,60 +598,80 @@ function foldEphemeral(view: SessionView, frame: EphemeralFrame): FoldResult {
       const toolExecutionId = optionalString(delta?.["tool_execution_id"]);
       const toolName = optionalString(delta?.["tool_name"]);
       const summary = optionalString(delta?.["summary"]);
+      const withCard = foldToolCallStartedCard(view, header, toolExecutionId, toolName, summary);
 
-      const matchIndex = findToolCallCardIndex(view, toolExecutionId);
-
-      if (matchIndex === -1) {
-        const card: ToolCallCard = {
-          toolExecutionId,
-          status: "started",
-          toolName,
-          summary,
-          isError: undefined,
-          resultPreview: undefined,
-          startedHeader: header,
-          completedHeader: undefined,
+      const loopId = frameLoopId(header);
+      const index = liveToolIndex(withCard, loopId, toolExecutionId ?? "");
+      if (index === -1) {
+        return {
+          ok: true,
+          view: appendRow(withCard, {
+            kind: "tool",
+            loopId,
+            turnId: frameTurnId(header),
+            journalSeq: undefined,
+            live: true,
+            orphanedLoop: false,
+            toolUseId: "",
+            toolExecutionId: toolExecutionId ?? "",
+            toolName: toolName ?? "",
+            summary: summary ?? "",
+            status: "running",
+            result: "",
+            spawnedLoopId: "",
+          }),
         };
-        return { ok: true, view: { ...view, toolCalls: [...view.toolCalls, card] } };
       }
-
-      // A card for this id already exists (see the ToolCallCard doc comment
-      // for why this branch exists at all): merge the started-only fields in
-      // place rather than appending a second card. `status` is intentionally
-      // NOT reset to "started" here — if the existing card is already
-      // "completed" (the completed frame arrived first), that is the more
-      // advanced state and must not regress.
-      const toolCalls = [...view.toolCalls];
-      const prior = toolCalls[matchIndex]!;
-      toolCalls[matchIndex] = { ...prior, toolName, summary, startedHeader: header };
-      return { ok: true, view: { ...view, toolCalls } };
+      // Merge the started-only fields. `status` is deliberately NOT reset:
+      // completion is the more advanced state and must not regress, and a
+      // duplicate start that omits a field must not blank it.
+      const prior = withCard.rows[index] as ToolRow;
+      return {
+        ok: true,
+        view: replaceRow(withCard, index, {
+          ...prior,
+          toolName: toolName ?? prior.toolName,
+          summary: summary ?? prior.summary,
+        }),
+      };
     }
 
     case "tool_call_completed": {
       const toolExecutionId = optionalString(delta?.["tool_execution_id"]);
       const isError = optionalBoolean(delta?.["is_error"]);
       const resultPreview = optionalString(delta?.["result_preview"]);
+      const withCard = foldToolCallCompletedCard(view, header, toolExecutionId, isError, resultPreview);
 
-      const matchIndex = findToolCallCardIndex(view, toolExecutionId);
-
-      if (matchIndex === -1) {
-        const card: ToolCallCard = {
-          toolExecutionId,
-          status: "completed",
-          toolName: undefined,
-          summary: undefined,
-          isError,
-          resultPreview,
-          startedHeader: undefined,
-          completedHeader: header,
+      const loopId = frameLoopId(header);
+      // `is_error` is `omitzero` on the wire, so a SUCCESSFUL completion carries
+      // no flag at all: "ok" is the absence of the key, never `false`.
+      const status: ToolRowStatus = isError === true ? "error" : "ok";
+      const index = liveToolIndex(withCard, loopId, toolExecutionId ?? "");
+      if (index === -1) {
+        return {
+          ok: true,
+          view: appendRow(withCard, {
+            kind: "tool",
+            loopId,
+            turnId: frameTurnId(header),
+            journalSeq: undefined,
+            live: true,
+            orphanedLoop: false,
+            toolUseId: "",
+            toolExecutionId: toolExecutionId ?? "",
+            toolName: "",
+            summary: "",
+            status,
+            result: resultPreview ?? "",
+            spawnedLoopId: "",
+          }),
         };
-        return { ok: true, view: { ...view, toolCalls: [...view.toolCalls, card] } };
       }
-
-      const toolCalls = [...view.toolCalls];
-      const prior = toolCalls[matchIndex]!;
-      toolCalls[matchIndex] = { ...prior, status: "completed", isError, resultPreview, completedHeader: header };
-      return { ok: true, view: { ...view, toolCalls } };
+      const prior = withCard.rows[index] as ToolRow;
+      return {
+        ok: true,
+        view: replaceRow(withCard, index, { ...prior, status, result: resultPreview ?? prior.result }),
+      };
     }
 
     case "input_queued": {
