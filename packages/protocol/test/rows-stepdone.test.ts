@@ -58,6 +58,7 @@ import {
   envelope,
   history,
   liveEphemeral,
+  loopStarted,
   resetSeq,
   textBlockWire,
   textDelta,
@@ -194,6 +195,7 @@ describe("rows: the StepDone snap", () => {
   it("discards the provisional live segment and commits from StepDone.Messages", () => {
     resetSeq();
     const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
       thinkingDelta("half a th", LOOP_A, TURN_1),
       textDelta("partial answ", LOOP_A, TURN_1),
       history(wireEnvelope(STEP_DONE_PROSE_ONLY_WIRE), 11),
@@ -236,7 +238,10 @@ describe("rows: the StepDone snap", () => {
 
   it("commits a refusal as its own field, never merged into narration", () => {
     resetSeq();
-    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_REFUSAL_WIRE), 3)]);
+    const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
+      history(wireEnvelope(STEP_DONE_REFUSAL_WIRE), 3),
+    ]);
     expect(view.rows).toStrictEqual([
       {
         kind: "assistant",
@@ -367,7 +372,10 @@ describe("rows: StepDone tool expansion", () => {
     // The results arrive REVERSED on the wire (toolu_2 before toolu_1), so a
     // positional pairing produces the right count and the wrong contents.
     resetSeq();
-    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_PROSE_AND_TOOLS_WIRE), 20)]);
+    const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
+      history(wireEnvelope(STEP_DONE_PROSE_AND_TOOLS_WIRE), 20),
+    ]);
     expect(view.rows.map((r) => r.kind)).toStrictEqual(["assistant", "tool", "tool"]);
     expect(view.rows[1]).toStrictEqual({
       kind: "tool",

@@ -383,6 +383,7 @@ describe("emptySessionView", () => {
       compactions: [],
       statusEvents: [],
       gates: new Map(),
+      loops: new Map(),
       rows: [],
       nextOrdinal: 0,
       pending: new Map(),

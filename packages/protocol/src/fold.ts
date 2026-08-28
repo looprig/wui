@@ -85,7 +85,7 @@ import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "./sse.js";
 import { decodeEnduring, isZeroUUID, turnFailureText } from "./enduring.js";
 import type { Gate } from "./gate.js";
 import type { ContentBlock } from "./blocks.js";
-import type { AssistantRow, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft } from "./rows.js";
+import type { AssistantRow, LoopInfo, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft } from "./rows.js";
 import { narrationOf, refusalOf, splitStepGroup, thinkingOf, toolResultText, toolUsesOf } from "./rows.js";
 
 // --- Session view -----------------------------------------------------------
@@ -206,7 +206,8 @@ export interface StatusEventMarker {
  * The single accumulated session shape both history and live segments fold
  * into. The arrays are append-only: fold() never removes an entry, only appends
  * or (for `ToolCallCard`) updates one in place. `gates` is the exception, and
- * deliberately so — a gate's whole lifecycle is open-then-close.
+ * deliberately so — a gate's whole lifecycle is open-then-close. `loops` grows
+ * only, but an entry is REPLACED when the loop's `LoopStarted` finally turns up.
  */
 export interface SessionView {
   content: ContentDelta[];
@@ -232,6 +233,22 @@ export interface SessionView {
    * the TUI" card.
    */
   gates: Map<string, Gate>;
+  /**
+   * The session's loop tree, keyed by loop id: who spawned each loop, which
+   * tool call anchors it, and whether its `LoopStarted` was actually observed.
+   * See rows.ts's `LoopInfo` for the field contract and `anchorOf` for the
+   * lookup a renderer nests through.
+   *
+   * A loop is registered the first time ANY event or frame names it, so a loop
+   * whose `LoopStarted` fell off the journal page is present-but-unobserved
+   * rather than absent — which is what keeps its rows in the transcript with an
+   * "orphaned subagent" marker instead of dropping them (§3b).
+   *
+   * The session-scoped loop id "" is never registered: it is the id an
+   * optimistic pending row and a session-scoped frame both carry, and it names
+   * no loop.
+   */
+  loops: Map<string, LoopInfo>;
   /**
    * The append-only transcript row projection: ONE array preserving the
    * cross-bucket arrival order `content` and `toolCalls` cannot express. See
@@ -288,6 +305,7 @@ export function emptySessionView(): SessionView {
     compactions: [],
     statusEvents: [],
     gates: new Map(),
+    loops: new Map(),
     rows: [],
     nextOrdinal: 0,
     pending: new Map(),
@@ -601,7 +619,7 @@ function applyLiveChunk(view: SessionView, header: EventHeader | undefined, chun
       turnId: frameTurnId(header),
       journalSeq: undefined,
       live: true,
-      orphanedLoop: false,
+      orphanedLoop: isOrphanLoop(view, loopId),
       thinking: chunk.chunkType === "thinking" ? chunk.thinking : "",
       text: chunk.chunkType === "text" ? chunk.text : "",
       refusal: "",
@@ -623,9 +641,13 @@ function applyLiveChunk(view: SessionView, header: EventHeader | undefined, chun
  * split: `frame.kind`'s switch is compile-time guarded (a `never`-typed
  * default case); the shape checks inside each case are runtime-only.
  */
-function foldEphemeral(view: SessionView, frame: EphemeralFrame): FoldResult {
+function foldEphemeral(input: SessionView, frame: EphemeralFrame): FoldResult {
   const header = frame.header;
   const delta = frame.delta;
+  // Register the producing loop BEFORE any case can append a row for it, so an
+  // unobserved loop's live rows are tagged orphaned rather than dropped. This
+  // is copy-on-write and only ever fires once per loop.
+  const view = ensureLoop(input, frameLoopId(header));
 
   switch (frame.kind) {
     case "token_delta": {
@@ -653,7 +675,7 @@ function foldEphemeral(view: SessionView, frame: EphemeralFrame): FoldResult {
             turnId: frameTurnId(header),
             journalSeq: undefined,
             live: true,
-            orphanedLoop: false,
+            orphanedLoop: isOrphanLoop(withCard, loopId),
             toolUseId: "",
             toolExecutionId: toolExecutionId ?? "",
             toolName: toolName ?? "",
@@ -698,7 +720,7 @@ function foldEphemeral(view: SessionView, frame: EphemeralFrame): FoldResult {
             turnId: frameTurnId(header),
             journalSeq: undefined,
             live: true,
-            orphanedLoop: false,
+            orphanedLoop: isOrphanLoop(withCard, loopId),
             toolUseId: "",
             toolExecutionId: toolExecutionId ?? "",
             toolName: "",
@@ -772,7 +794,13 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
     createdAt: envelope.created_at,
     envelope,
   };
-  const next: SessionView = { ...view, statusEvents: [...view.statusEvents, marker] };
+  // Register the producing loop next to the marker: a loop first seen through
+  // an ordinary event is recorded UNOBSERVED, which is what keeps its rows and
+  // tags them rather than dropping them when its LoopStarted never arrives.
+  const next: SessionView = ensureLoop(
+    { ...view, statusEvents: [...view.statusEvents, marker] },
+    envelope.loop_id ?? "",
+  );
 
   // Kind-specific cases alongside the generic fallback — this module's own
   // documented extension point (see the "Gates are NOT folded here" section
@@ -815,7 +843,7 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           turnId: decoded.turnId,
           journalSeq,
           live: false,
-          orphanedLoop: false,
+          orphanedLoop: isOrphanLoop(resolved, decoded.loopId),
           blocks: message.blocks,
         }),
       };
@@ -851,7 +879,7 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           turnId: decoded.turnId,
           journalSeq,
           live: false,
-          orphanedLoop: false,
+          orphanedLoop: isOrphanLoop(out, decoded.loopId),
           thinking,
           text,
           refusal,
@@ -872,7 +900,7 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           turnId: decoded.turnId,
           journalSeq,
           live: false,
-          orphanedLoop: false,
+          orphanedLoop: isOrphanLoop(out, decoded.loopId),
           toolUseId: use.id,
           toolExecutionId: "",
           toolName: use.name,
@@ -881,7 +909,11 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           // "ok" matches tui's storedStepToolCard rather than inventing an error.
           status: result?.isError === true ? "error" : "ok",
           result: toolResultText(result),
-          spawnedLoopId: "",
+          // The child normally announced itself BEFORE this step was finalized —
+          // a subagent runs to completion inside the call that spawned it — so
+          // the anchor is usually known here. The reverse order (a LoopStarted
+          // arriving after the parent's step) is stamped by the LoopStarted case.
+          spawnedLoopId: childLoopFor(out, decoded.loopId, use.id),
         });
       }
       return { ok: true, view: out };
@@ -916,7 +948,7 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           turnId: decoded.turnId,
           journalSeq,
           live: false,
-          orphanedLoop: false,
+          orphanedLoop: isOrphanLoop(committed, decoded.loopId),
         }),
       };
     }
@@ -942,7 +974,7 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           turnId: decoded.turnId,
           journalSeq,
           live: false,
-          orphanedLoop: false,
+          orphanedLoop: isOrphanLoop(resolved, decoded.loopId),
         }),
       };
     }
@@ -976,9 +1008,34 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           turnId: decoded.turnId,
           journalSeq,
           live: false,
-          orphanedLoop: false,
+          orphanedLoop: isOrphanLoop(committed, decoded.loopId),
         }),
       };
+    }
+    case "LoopStarted": {
+      // The durable loop-tree record, and the ONLY place `observed` becomes
+      // true. The parent is read from `cause`, never from the promoted
+      // `loop_id` (which is the NEW loop) — LoopStarted's identity profile
+      // forbids a promoted turn or step for exactly that reason. A zero cause
+      // loop id means ROOT, and it is normalised to "" through isZeroUUID
+      // rather than compared to undefined: harness's fixture normaliser spells
+      // the zero out, and reading "000…0" as a parent would root the tree at a
+      // loop that never existed.
+      const loops = new Map(next.loops);
+      loops.set(decoded.loopId, {
+        loopId: decoded.loopId,
+        parentLoopId: isZeroUUID(decoded.causeLoopId) ? "" : decoded.causeLoopId,
+        parentToolUseId: decoded.payload.parentToolUseId,
+        // DisplayName when non-empty, else the header's AgentName — the same
+        // fallback tui's loopStartedLabel applies for older journals.
+        label: decoded.payload.displayName !== "" ? decoded.payload.displayName : decoded.agentName,
+        observed: true,
+      });
+      const rows = relinkLoop(next.rows, decoded.loopId, {
+        parentLoopId: isZeroUUID(decoded.causeLoopId) ? "" : decoded.causeLoopId,
+        parentToolUseId: decoded.payload.parentToolUseId,
+      });
+      return { ok: true, view: { ...next, loops, rows } };
     }
     case "GateOpened": {
       // Copy-on-write, like every other branch here: fold() must never mutate
@@ -1123,6 +1180,94 @@ function commitTerminalSegment(
   return commitLiveRows(dropEmptyLiveProse(view, loopId), loopId, journalSeq, resolveRunning);
 }
 
+/**
+ * Registers `loopId` in the loop tree if it is not there yet, as UNOBSERVED —
+ * "this loop exists and we have no LoopStarted for it". Called before anything
+ * that could append a row for a loop, so `isOrphanLoop` below has an entry to
+ * read and an orphan's rows are kept and TAGGED rather than dropped.
+ *
+ * A ZERO loop id is never registered — neither the absent spelling "" nor the
+ * all-zeros one harness's fixture normaliser produces. Both mean "no loop": ""
+ * is what a session-scoped frame and an optimistic pending row carry, and
+ * registering "000…0" would invent a loop that never ran. isZeroUUID, not
+ * `=== ""`, for the same reason §3b's cause gate uses it.
+ *
+ * Copy-on-write, and a loop already known returns the very same view, so this
+ * costs one Map copy per loop for the whole session.
+ */
+function ensureLoop(view: SessionView, loopId: string): SessionView {
+  if (isZeroUUID(loopId) || view.loops.has(loopId)) return view;
+  const loops = new Map(view.loops);
+  loops.set(loopId, { loopId, parentLoopId: "", parentToolUseId: "", label: "", observed: false });
+  return { ...view, loops };
+}
+
+/**
+ * True when `loopId` names a loop whose `LoopStarted` has not been seen — the
+ * value every row appended for that loop carries as `orphanedLoop`. "" (a
+ * session-scoped row) is never orphaned: it belongs to no loop, so there is no
+ * missing record.
+ */
+function isOrphanLoop(view: SessionView, loopId: string): boolean {
+  return view.loops.get(loopId)?.observed === false;
+}
+
+/**
+ * The child loop `toolUseId` spawned from `parentLoopId`, or "" if none is
+ * known yet. Read at StepDone-commit time so a tool row lands with its
+ * `spawnedLoopId` already set — the ordinary order, because a subagent runs to
+ * completion (and so announces itself) before the parent step containing its
+ * call is finalized. The reverse order is handled by the LoopStarted case,
+ * which stamps the anchor onto an already-committed row.
+ */
+function childLoopFor(view: SessionView, parentLoopId: string, toolUseId: string): string {
+  if (toolUseId === "") return "";
+  for (const info of view.loops.values()) {
+    if (info.observed && info.parentLoopId === parentLoopId && info.parentToolUseId === toolUseId) {
+      return info.loopId;
+    }
+  }
+  return "";
+}
+
+/**
+ * Applies a newly-observed `LoopStarted` to rows that were already committed
+ * before it arrived — the trimmed-page order, where the child's work is on the
+ * page but the record naming its parent is not.
+ *
+ * Two edits, one pass:
+ *  - every row of `loopId` loses its `orphanedLoop` marker, because the loop is
+ *    no longer missing a record;
+ *  - the parent's tool row carrying `parentToolUseId` gains `spawnedLoopId`, so
+ *    a renderer can nest the child's block under the card that spawned it.
+ *
+ * Rows that need neither are carried over BY REFERENCE and the array itself is
+ * handed straight back when nothing changed, so a per-row `Object.is` selector
+ * does not re-render the whole transcript on every loop announcement.
+ */
+function relinkLoop(
+  rows: TranscriptRow[],
+  loopId: string,
+  parent: { parentLoopId: string; parentToolUseId: string },
+): TranscriptRow[] {
+  const unOrphans = (row: TranscriptRow): boolean => row.loopId === loopId && row.orphanedLoop;
+  const anchors = (row: TranscriptRow): boolean =>
+    row.kind === "tool" &&
+    parent.parentToolUseId !== "" &&
+    row.loopId === parent.parentLoopId &&
+    row.toolUseId === parent.parentToolUseId &&
+    row.spawnedLoopId !== loopId;
+  if (!rows.some((row) => unOrphans(row) || anchors(row))) return rows;
+  return rows.map((row): TranscriptRow => {
+    // An anchor row belongs to the PARENT loop and an un-orphaned row to the
+    // child, so the two never describe the same row; they are still applied in
+    // one pass so a row is rebuilt at most once.
+    if (row.kind === "tool" && anchors(row)) return { ...row, spawnedLoopId: loopId };
+    if (unOrphans(row)) return { ...row, orphanedLoop: false };
+    return row;
+  });
+}
+
 function appendRow(view: SessionView, draft: TranscriptRowDraft): SessionView {
   const committed = { ...draft, ordinal: view.nextOrdinal };
   return { ...view, rows: [...view.rows, committed], nextOrdinal: view.nextOrdinal + 1 };
@@ -1153,6 +1298,8 @@ export function addPendingRow(
     turnId: "",
     journalSeq: undefined,
     live: true,
+    // Never orphaned: the row belongs to no loop at all (loopId ""), so there
+    // is no missing LoopStarted for it to be missing.
     orphanedLoop: false,
     blocks,
   });

@@ -37,6 +37,7 @@ import {
   history,
   liveEnduring,
   liveEphemeral,
+  loopStarted,
   resetSeq,
   textBlockWire,
   textDelta,
@@ -66,6 +67,7 @@ describe("rows: TurnDone commits any dangling live segment", () => {
   it("commits the dangling prose in full, stamped with the terminal's journalSeq", () => {
     resetSeq();
     const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
       thinkingDelta("weighing it up", LOOP_A, TURN_1),
       textDelta("streamed but never StepDone'd", LOOP_A, TURN_1),
       history(envelope({ type: "TurnDone", loopId: LOOP_A, turnId: TURN_1 }), 5),
@@ -144,6 +146,7 @@ describe("rows: TurnDone commits any dangling live segment", () => {
   it("resolves a still-RUNNING live tool card as ok — the step finalized", () => {
     resetSeq();
     const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
       toolStarted("te-1", "Read", LOOP_A),
       history(envelope({ type: "TurnDone", loopId: LOOP_A, turnId: TURN_1 }), 7),
     ]);
@@ -283,6 +286,7 @@ describe("rows: TurnInterrupted commits the segment, then a tombstone", () => {
     // would read as work produced AFTER the interrupt landed.
     resetSeq();
     const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
       textDelta("half an ans", LOOP_A, TURN_1),
       history(envelope({ type: "TurnInterrupted", loopId: LOOP_A, turnId: TURN_1 }), 8),
     ]);
@@ -392,6 +396,7 @@ describe("rows: TurnFailed commits the segment, then an error notice", () => {
   it("commits the truncated prefix FIRST, then the notice", () => {
     resetSeq();
     const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
       textDelta("the model got this far", LOOP_A, TURN_1),
       history(wireEnvelope(TURN_FAILED_UNKNOWN_WIRE), 12),
     ]);

@@ -128,3 +128,25 @@ export function aiMessageWire(blocks: Array<Record<string, unknown>>): Record<st
 export function userMessageWire(blocks: Array<Record<string, unknown>>): Record<string, unknown> {
   return { role: "user", blocks };
 }
+
+/**
+ * A ROOT `LoopStarted` for `loopId` — the record harness emits once per loop at
+ * creation, including for the session's primary loop (`findRootLoopStarted`
+ * locates it by "zero Cause", and restore fails closed without it).
+ *
+ * A fixture that omits it describes a loop the client has no loop-tree record
+ * for, which `fold` marks `orphanedLoop`. Prepending this is what makes a
+ * fixture a full replay rather than a trimmed page.
+ *
+ * It deliberately does NOT advance the shared `nextSeq` counter: it exists to be
+ * prepended to an EXISTING fixture, and renumbering that fixture's events would
+ * change what the test around it is asserting. A LoopStarted commits no
+ * transcript row, so its own journal_seq is never observable.
+ */
+export function loopStarted(loopId: string, agentName = "primer"): FoldInput {
+  const event: StatusEvent = {
+    journal_seq: 0,
+    event: envelope({ type: "LoopStarted", loopId, agentName }),
+  } as StatusEvent;
+  return { segment: "history", event };
+}

@@ -33,6 +33,7 @@ import {
   envelope,
   history,
   liveEphemeral,
+  loopStarted,
   resetSeq,
   textBlockWire,
   textDelta,
@@ -45,6 +46,7 @@ describe("rows: the live segment", () => {
   it("appends one live assistant row per loop and accumulates deltas into it", () => {
     resetSeq();
     const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
       textDelta("Hel", LOOP_A, TURN_1),
       textDelta("lo", LOOP_A, TURN_1),
       thinkingDelta("planning", LOOP_A, TURN_1),

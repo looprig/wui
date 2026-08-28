@@ -231,8 +231,9 @@ describe("fold immutability contract", () => {
           );
         }
       }
-      // Same rule for the three Maps, each of which can SHRINK as well as grow.
-      const maps = ["gates", "pending", "commandOutcomes"] as const;
+      // Same rule for the Maps, each of which can shrink as well as grow —
+      // `loops` only ever grows, but it is copy-on-write for the same reason.
+      const maps = ["gates", "pending", "commandOutcomes", "loops"] as const;
       for (const key of maps) {
         if (result.view[key].size !== view[key].size) {
           expect(result.view[key], `${key} changed but reuses the input's Map object`).not.toBe(

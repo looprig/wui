@@ -36,7 +36,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { emptySessionView } from "../src/fold.js";
-import { LOOP_A, LOOP_B, TURN_1, liveEphemeral, resetSeq, textDelta } from "./helpers.js";
+import { LOOP_A, LOOP_B, TURN_1, liveEphemeral, loopStarted, resetSeq, textDelta } from "./helpers.js";
 import { run } from "./run.js";
 
 const TE_1 = "f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1";
@@ -71,7 +71,10 @@ function succeeded(id: string, preview: string | undefined, loopId?: string) {
 describe("rows: live tool cards", () => {
   it("appends a fully-specified running tool row on tool_call_started", () => {
     resetSeq();
-    const view = run(emptySessionView(), [started(TE_1, "Read", LOOP_A)]);
+    const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
+      started(TE_1, "Read", LOOP_A),
+    ]);
     expect(view.rows).toStrictEqual([
       {
         kind: "tool",
@@ -206,7 +209,10 @@ describe("rows: live tool cards", () => {
 
   it("a completion for an id no card ever opened stands alone rather than being dropped", () => {
     resetSeq();
-    const view = run(emptySessionView(), [succeeded(TE_2, "orphan result", LOOP_A)]);
+    const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
+      succeeded(TE_2, "orphan result", LOOP_A),
+    ]);
     expect(view.rows).toStrictEqual([
       {
         kind: "tool",

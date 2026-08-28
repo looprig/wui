@@ -39,7 +39,7 @@
 import { describe, expect, it } from "vitest";
 import { emptySessionView, fold } from "../src/fold.js";
 import type { EventEnvelope } from "../src/types.js";
-import { LOOP_A, envelope, history, liveEnduring, resetSeq, textBlockWire, userMessageWire } from "./helpers.js";
+import { LOOP_A, envelope, history, liveEnduring, loopStarted, resetSeq, textBlockWire, userMessageWire } from "./helpers.js";
 import { run } from "./run.js";
 
 const LOOP_ALPHA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -82,7 +82,10 @@ describe("rows: the shape and the ordinal", () => {
 
   it("commits one fully-specified user row from a REAL TurnStarted whose cause loop id is zero", () => {
     resetSeq();
-    const view = run(emptySessionView(), [history(wireEnvelope(TURN_STARTED_USER_WIRE), 7)]);
+    const view = run(emptySessionView(), [
+      loopStarted(LOOP_ALPHA),
+      history(wireEnvelope(TURN_STARTED_USER_WIRE), 7),
+    ]);
     // toStrictEqual, not toMatchObject: every projected field is pinned here,
     // and an extra field nobody meant to add fails rather than passing quietly.
     expect(view.rows).toStrictEqual([

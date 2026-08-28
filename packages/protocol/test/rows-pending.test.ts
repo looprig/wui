@@ -32,7 +32,7 @@
 import { describe, expect, it } from "vitest";
 import { addPendingRow, emptySessionView, type SessionView } from "../src/fold.js";
 import type { EventEnvelope } from "../src/types.js";
-import { LOOP_A, TURN_1, envelope, history, resetSeq, textBlockWire, textDelta, userMessageWire } from "./helpers.js";
+import { LOOP_A, TURN_1, envelope, history, loopStarted, resetSeq, textBlockWire, textDelta, userMessageWire } from "./helpers.js";
 import { run } from "./run.js";
 
 const CMD_1 = "ffffffff-ffff-4fff-8fff-ffffffffffff";
@@ -201,6 +201,7 @@ describe("rows: TurnRejected", () => {
     // A rejected submit must never silently vanish: the composer's optimistic
     // row disappears, so something has to say why.
     const view = run(pendingView(CMD_1, "too much"), [
+      loopStarted(LOOP_A),
       history(wireEnvelope(TURN_REJECTED_WIRE[1]!.json), 4),
     ]);
     expect(view.rows.map((r) => r.kind)).toStrictEqual(["notice"]);

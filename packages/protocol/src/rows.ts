@@ -20,8 +20,8 @@
  *
  * ## Ordering
  *
- * Rows are partitioned by `loopId` and are NEVER sorted globally by
- * `journalSeq` — that is what makes "a subagent's TurnDone has a lower seq than
+ * Rows are partitioned by `loopId` (see `rowsForLoop`) and are NEVER sorted
+ * globally by `journalSeq` — that is what makes "a subagent's TurnDone has a lower seq than
  * the parent turn containing it" harmless. Within a loop, committed rows order
  * by the `journalSeq` of the COMMITTING event. `ordinal` is the append order
  * and the stable React key; `journalSeq` is the ordering key within a loop.
@@ -64,8 +64,12 @@ export interface TranscriptRowCommon {
   /**
    * True when this row's loop never had an observed `LoopStarted`, so it has no
    * parent anchor. Such a loop renders top-level with an "orphaned subagent"
-   * marker rather than being dropped. Nothing computes it yet — every committed
-   * row sets it false until the task that tracks observed loops lands.
+   * marker rather than being dropped.
+   *
+   * It is cleared retroactively: a `LoopStarted` that arrives AFTER rows this
+   * loop already produced un-orphans them (a trimmed page can deliver them in
+   * that order). `LoopInfo.observed` is the state this is projected from, and
+   * `anchorOf` is what a renderer nests through.
    */
   orphanedLoop: boolean;
 }
@@ -288,4 +292,69 @@ export function loopIdsInOrder(source: RowSource): string[] {
     if (!seen.includes(row.loopId)) seen.push(row.loopId);
   }
   return seen;
+}
+
+/**
+ * One loop's place in the session's loop tree, learned from its `LoopStarted`.
+ *
+ * harness emits exactly one `LoopStarted` per loop, at creation, INCLUDING the
+ * session's primary loop — its own `findRootLoopStarted` locates the root by
+ * "Cause.Coordinates is zero" and restore fails closed without it — so in a
+ * full replay every loop here is `observed`.
+ */
+export interface LoopInfo {
+  loopId: string;
+  /**
+   * The SPAWNING loop, read from `Header.Cause.LoopID`. "" for the root and for
+   * a loop whose `LoopStarted` was never observed.
+   *
+   * Never the promoted `loop_id`, which is the NEW loop: `LoopStarted`'s
+   * identity profile forbids a promoted turn or step precisely because the
+   * spawning coordinates belong under `cause`.
+   */
+  parentLoopId: string;
+  /**
+   * `content.ToolUseBlock.ID` of the agent tool call that spawned this loop —
+   * the anchor a child's block hangs from. "" for a root, for an unobserved
+   * loop, and for a NON-tool spawn (a foreign or programmatic loop), which has
+   * a real parent but no card to nest under.
+   */
+  parentToolUseId: string;
+  /** `DisplayName` when non-empty, else `Header.AgentName` (older journals). */
+  label: string;
+  /**
+   * False when this loop produced rows or frames but no `LoopStarted` for it
+   * was ever seen. That is reachable rather than defensive: `GET /journal`
+   * defaults to 100 events and caps at 1000, so a consumer that does not replay
+   * from `from_journal_seq=0` starts after the record. Such a loop renders
+   * top-level with an "orphaned subagent" marker rather than being dropped, and
+   * every row it has produced carries `orphanedLoop: true` until the
+   * `LoopStarted` turns up.
+   */
+  observed: boolean;
+}
+
+/** The read surface `anchorOf` needs: the rows, plus the loop tree over them. */
+export interface LoopSource extends RowSource {
+  loops: Map<string, LoopInfo>;
+}
+
+/**
+ * The parent tool row a child loop's block hangs from, or `undefined` when the
+ * loop has none — because it is the root, because its `LoopStarted` was never
+ * observed (an orphan), because it was not spawned by a tool call at all, or
+ * because the anchoring step has not been committed yet.
+ *
+ * Every one of those renders top-level; only the orphan gets a marker, and
+ * `TranscriptRow.orphanedLoop` is what distinguishes it.
+ */
+export function anchorOf(source: LoopSource, loopId: string): TranscriptRow | undefined {
+  const info = source.loops.get(loopId);
+  if (info === undefined || !info.observed || info.parentToolUseId === "") return undefined;
+  return source.rows.find(
+    (row) =>
+      row.kind === "tool" &&
+      row.loopId === info.parentLoopId &&
+      row.toolUseId === info.parentToolUseId,
+  );
 }

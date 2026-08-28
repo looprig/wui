@@ -24,7 +24,7 @@
 import { describe, expect, it } from "vitest";
 import { emptySessionView } from "../src/fold.js";
 import type { EventEnvelope } from "../src/types.js";
-import { LOOP_A, envelope, history, resetSeq, textBlockWire, userMessageWire } from "./helpers.js";
+import { LOOP_A, envelope, history, loopStarted, resetSeq, textBlockWire, userMessageWire } from "./helpers.js";
 import { run } from "./run.js";
 
 const LOOP_ALPHA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -70,6 +70,7 @@ describe("rows: subagent hand-back gating", () => {
   it("still commits the genuine user row that follows on the same loop, at ordinal 0", () => {
     resetSeq();
     const view = run(emptySessionView(), [
+      loopStarted(LOOP_ALPHA),
       history(wireEnvelope(TURN_STARTED_HANDBACK_WIRE), 3),
       history(wireEnvelope(TURN_STARTED_USER_WIRE), 4),
     ]);
@@ -85,7 +86,10 @@ describe("rows: subagent hand-back gating", () => {
         blocks: [{ type: "text", text: "hello" }],
       },
     ]);
-    expect(view.statusEvents, "both events must still reach the generic marker").toHaveLength(2);
+    expect(
+      view.statusEvents.map((m) => m.type),
+      "both turn events must still reach the generic marker, alongside the LoopStarted prelude",
+    ).toStrictEqual(["LoopStarted", "TurnStarted", "TurnStarted"]);
   });
 
   it("does not let a hand-back between two genuine inputs burn an ordinal", () => {
@@ -191,7 +195,10 @@ describe("rows: subagent hand-back gating", () => {
 describe("rows: TurnFoldedInto", () => {
   it("commits a full user row for a REAL genuine folded tool-continuation input", () => {
     resetSeq();
-    const view = run(emptySessionView(), [history(wireEnvelope(TURN_FOLDED_INTO_USER_WIRE), 4)]);
+    const view = run(emptySessionView(), [
+      loopStarted(LOOP_ALPHA),
+      history(wireEnvelope(TURN_FOLDED_INTO_USER_WIRE), 4),
+    ]);
     expect(view.rows).toStrictEqual([
       {
         kind: "user",
