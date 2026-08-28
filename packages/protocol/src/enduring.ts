@@ -49,9 +49,16 @@ const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
  * §3b's "commit a user row only when Header.Cause.LoopID is zero" rule is
  * exactly this predicate. Writing `cause?.loop_id === undefined` instead would
  * render a phantom user message on any hand-back whose producer spelled the
- * zero out. Anything else — including a malformed non-string, which reaches
- * here as neither "" nor a zero uuid — reads as NON-zero, which suppresses the
- * user row rather than inventing one: the fail-secure direction for this gate.
+ * zero out. Any other STRING — a real loop id, or a near-miss like a zero uuid
+ * with one digit flipped — reads as NON-zero and suppresses the user row.
+ *
+ * A non-string value never reaches this predicate at all: decodeEnduring
+ * projects every id through `str()`, so a corrupted `"loop_id": 42` arrives as
+ * "" and reads as ZERO, committing the row. That is the decoder's uniform
+ * malformed-reads-as-the-zero-value rule (the same one that projects a
+ * non-numeric `turn_index` onto 0), not a special case for this gate, and it is
+ * pinned in test/rows-handback.test.ts. Only a corrupted journal record can
+ * produce it — `uuid.UUID` always marshals to a string.
  */
 export function isZeroUUID(id: string | undefined): boolean {
   return id === undefined || id === "" || id === ZERO_UUID;
