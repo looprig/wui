@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { createHostTransport, type LooprigTransport } from "@looprig/protocol";
 import { useSessionList } from "@looprig/react";
+import { NewSessionButton } from "../components/new-session-button";
 import { SessionRow } from "../components/session-row";
 import { SessionsFilterBar, type StatusFilter } from "../components/sessions-filter-bar";
 import { filterSessions } from "../lib/filter-sessions";
@@ -18,8 +19,19 @@ export interface SessionsPageProps {
    * every control route would 403.
    */
   transport?: LooprigTransport;
-  /** Client-side navigation for a row click; the rows are real links without it. */
-  onOpenSession?: ((sessionId: string) => void) | undefined;
+  /**
+   * Opens a session: a row click, and the session `NewSessionButton` just
+   * created.
+   *
+   * REQUIRED, and deliberately not defaulted to a `window.location` assignment.
+   * A row is a real `<a href>` and needs no callback to be followable, but a
+   * freshly created session has no anchor to click, so "the page navigates by
+   * itself when nobody told it how" would be the one navigation path in this
+   * app that no test can observe — `window.location.assign` is non-configurable
+   * in Chromium and cannot be spied (measured). A caller that genuinely has
+   * nowhere to go passes a no-op and says so.
+   */
+  onOpenSession: (sessionId: string) => void;
 }
 
 /**
@@ -32,7 +44,7 @@ export interface SessionsPageProps {
  * DOM — including the case no rendering test can observe, the pre-fetch
  * snapshot that would otherwise flash "No sessions yet" at every visitor.
  */
-export function SessionsPage({ transport, onOpenSession }: SessionsPageProps = {}): React.JSX.Element {
+export function SessionsPage({ transport, onOpenSession }: SessionsPageProps): React.JSX.Element {
   // NOT a default parameter value. `useSessionList` keys its store — and
   // therefore its fetch effect — on the transport's IDENTITY, so
   // `transport = createHostTransport()` in the signature would mint a fresh
@@ -49,7 +61,13 @@ export function SessionsPage({ transport, onOpenSession }: SessionsPageProps = {
 
   return (
     <main data-testid="sessions-page" data-state={state} className="mx-auto max-w-4xl p-6">
-      <h1 className="mb-4 text-2xl font-semibold tracking-tight">Sessions</h1>
+      {/* Above the four-way branch, so creation is reachable while the list is
+          still loading, after it failed, and — most importantly — when the host
+          has no sessions at all. */}
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <h1 className="text-2xl font-semibold tracking-tight">Sessions</h1>
+        <NewSessionButton transport={host} onCreated={onOpenSession} />
+      </div>
 
       {state === "loading" ? (
         <div role="status" data-testid="sessions-loading" className="flex items-center gap-2 py-8 text-muted">
@@ -106,7 +124,7 @@ export function SessionsPage({ transport, onOpenSession }: SessionsPageProps = {
                   key={session.session_id}
                   session={session}
                   href={`/sessions/${session.session_id}`}
-                  onActivate={onOpenSession ? () => onOpenSession(session.session_id) : undefined}
+                  onActivate={() => onOpenSession(session.session_id)}
                 />
               ))}
             </div>

@@ -1,6 +1,7 @@
 import type {
   CreateRequest,
   CreateResponse,
+  CreateSessionOptions,
   EventJournalPage,
   GateAcceptedResponse,
   GateResponseRequest,
@@ -30,6 +31,8 @@ export class FakeTransport implements LooprigTransport {
 
   readonly listSessionsCalls: Array<ListSessionsOptions | undefined> = [];
   readonly createCalls: CreateRequest[] = [];
+  /** Positionally paired with `createCalls`; `idempotencyKey` is asserted on. */
+  readonly createOptions: Array<CreateSessionOptions | undefined> = [];
   readonly submitCalls: Array<{ sessionId: string; request: CreateRequest }> = [];
   readonly respondGateCalls: Array<{ sessionId: string; gateId: string; request: GateResponseRequest }> = [];
   readonly interruptCalls: string[] = [];
@@ -44,8 +47,9 @@ export class FakeTransport implements LooprigTransport {
   readHistory(): Promise<EventJournalPage> {
     return Promise.resolve({ events: [], next_journal_seq: 0, done: true });
   }
-  createSession(request?: CreateRequest): Promise<CreateResponse> {
+  createSession(request?: CreateRequest, options?: CreateSessionOptions): Promise<CreateResponse> {
     this.createCalls.push(request ?? {});
+    this.createOptions.push(options);
     return this.createSessionResult;
   }
   restoreSession(): Promise<RestoreResponse> {

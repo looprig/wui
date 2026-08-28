@@ -5,6 +5,13 @@ import { NetworkError } from "@looprig/protocol";
 import { FakeTransport, emptySessionList } from "../test/fakes";
 import { SessionsPage } from "./sessions-page";
 
+/**
+ * `onOpenSession` is required (see SessionsPageProps): a list page has to be
+ * told how to open a session, because a freshly created one has no anchor to
+ * follow. These cases are not about navigation, so they say so explicitly.
+ */
+const noop = (): void => {};
+
 const BRANCHES = [
   "sessions-loading",
   "sessions-error",
@@ -21,7 +28,7 @@ function renderedBranches(): string[] {
 describe("SessionsPage states", () => {
   it("renders only the loading indicator while the list call is in flight", async () => {
     const transport = new FakeTransport(); // listSessions never settles
-    render(<SessionsPage transport={transport} />);
+    render(<SessionsPage transport={transport} onOpenSession={noop} />);
     await expect.element(page.getByTestId("sessions-loading")).toBeInTheDocument();
     expect(renderedBranches()).toEqual(["sessions-loading"]);
   });
@@ -33,7 +40,7 @@ describe("SessionsPage states", () => {
     // diagnostic the user has.
     const failure = new NetworkError("/v1/sessions");
     transport.listSessionsResult = Promise.reject(failure);
-    render(<SessionsPage transport={transport} />);
+    render(<SessionsPage transport={transport} onOpenSession={noop} />);
 
     const alert = page.getByTestId("sessions-error");
     await expect.element(alert).toBeInTheDocument();
@@ -46,7 +53,7 @@ describe("SessionsPage states", () => {
   it("renders the empty state, not an empty list, for a loaded zero-row catalog", async () => {
     const transport = new FakeTransport();
     transport.listSessionsResult = Promise.resolve(emptySessionList);
-    render(<SessionsPage transport={transport} />);
+    render(<SessionsPage transport={transport} onOpenSession={noop} />);
 
     const empty = page.getByTestId("sessions-empty");
     await expect.element(empty).toBeInTheDocument();
@@ -79,7 +86,7 @@ describe("SessionsPage states", () => {
     });
     observer.observe(document.body, { childList: true, subtree: true });
     try {
-      render(<SessionsPage transport={transport} />);
+      render(<SessionsPage transport={transport} onOpenSession={noop} />);
       for (const id of renderedBranches()) seen.add(id);
       await expect.element(page.getByTestId("sessions-list")).toBeInTheDocument();
       for (const id of renderedBranches()) seen.add(id);
@@ -122,7 +129,7 @@ describe("SessionsPage states", () => {
       );
     };
     try {
-      render(<SessionsPage />);
+      render(<SessionsPage onOpenSession={noop} />);
       await fetched;
       // Settle: give a runaway render loop several frames to make itself
       // obvious before asserting, rather than asserting inside the stub.

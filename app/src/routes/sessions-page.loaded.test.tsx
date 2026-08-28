@@ -5,6 +5,13 @@ import type { SessionList } from "@looprig/protocol";
 import { FakeTransport } from "../test/fakes";
 import { SessionsPage } from "./sessions-page";
 
+/**
+ * `onOpenSession` is required (see SessionsPageProps): a list page has to be
+ * told how to open a session, because a freshly created one has no anchor to
+ * follow. These cases are not about navigation, so they say so explicitly.
+ */
+const noop = (): void => {};
+
 const populated: SessionList = {
   sessions: [
     {
@@ -40,7 +47,7 @@ function cells(testId: string): (string | null)[] {
 
 describe("SessionsPage loaded list", () => {
   it("renders one row per session with its own link and status", async () => {
-    render(<SessionsPage transport={loaded()} />);
+    render(<SessionsPage transport={loaded()} onOpenSession={noop} />);
     await expect.element(page.getByTestId("sessions-list")).toBeInTheDocument();
 
     const links = [...document.querySelectorAll("[data-testid=session-row-link]")];
@@ -57,13 +64,13 @@ describe("SessionsPage loaded list", () => {
   it("preserves the order the server returned", async () => {
     // The list is a catalogue page with a paging cursor; re-sorting it in the
     // client would silently disagree with `skip`/`next_skip`.
-    render(<SessionsPage transport={loaded()} />);
+    render(<SessionsPage transport={loaded()} onOpenSession={noop} />);
     await expect.element(page.getByTestId("sessions-list")).toBeInTheDocument();
     expect(cells("session-id")).toEqual(["11111111", "22222222"]);
   });
 
   it("shows the duration derived from created_at and last_active_at", async () => {
-    render(<SessionsPage transport={loaded()} />);
+    render(<SessionsPage transport={loaded()} onOpenSession={noop} />);
     await expect.element(page.getByTestId("sessions-list")).toBeInTheDocument();
     expect(cells("session-duration")).toEqual(["42s", "30m"]);
   });
@@ -83,7 +90,7 @@ describe("SessionsPage loaded list", () => {
     // A refetch loop is invisible against a fake that always resolves the same
     // page, and expensive against a real host.
     const transport = loaded();
-    render(<SessionsPage transport={transport} />);
+    render(<SessionsPage transport={transport} onOpenSession={noop} />);
     await expect.element(page.getByTestId("sessions-list")).toBeInTheDocument();
     for (let i = 0; i < 5; i += 1) {
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));

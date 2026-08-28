@@ -5,6 +5,13 @@ import type { SessionList } from "@looprig/protocol";
 import { FakeTransport } from "../test/fakes";
 import { SessionsPage } from "./sessions-page";
 
+/**
+ * `onOpenSession` is required (see SessionsPageProps): a list page has to be
+ * told how to open a session, because a freshly created one has no anchor to
+ * follow. These cases are not about navigation, so they say so explicitly.
+ */
+const noop = (): void => {};
+
 const list: SessionList = {
   sessions: [
     { session_id: "aaaaaaaa-0000-0000-0000-000000000000", state: "running", title: "Fix the parser" },
@@ -32,7 +39,7 @@ function pageState(): string | null | undefined {
 
 describe("SessionsPage filtering", () => {
   it("narrows the list by status", async () => {
-    render(<SessionsPage transport={loaded()} />);
+    render(<SessionsPage transport={loaded()} onOpenSession={noop} />);
     await expect.element(page.getByTestId("sessions-list")).toBeInTheDocument();
 
     await userEvent.selectOptions(page.getByTestId("sessions-status-filter"), "failed");
@@ -41,7 +48,7 @@ describe("SessionsPage filtering", () => {
   });
 
   it("searches over both the session id and the title", async () => {
-    render(<SessionsPage transport={loaded()} />);
+    render(<SessionsPage transport={loaded()} onOpenSession={noop} />);
     await expect.element(page.getByTestId("sessions-list")).toBeInTheDocument();
     const search = page.getByTestId("sessions-search");
 
@@ -58,7 +65,7 @@ describe("SessionsPage filtering", () => {
     // "Your filter is too narrow, widen it" and "you have never started a
     // session" are different problems with different fixes. Rendering one for
     // the other sends the user to the wrong control.
-    render(<SessionsPage transport={loaded()} />);
+    render(<SessionsPage transport={loaded()} onOpenSession={noop} />);
     await expect.element(page.getByTestId("sessions-list")).toBeInTheDocument();
 
     await userEvent.fill(page.getByTestId("sessions-search"), "zzz");
@@ -69,7 +76,7 @@ describe("SessionsPage filtering", () => {
 
   it("keeps the filter controls reachable while nothing matches", async () => {
     // A no-match state that hides the search box is a dead end.
-    render(<SessionsPage transport={loaded()} />);
+    render(<SessionsPage transport={loaded()} onOpenSession={noop} />);
     await expect.element(page.getByTestId("sessions-list")).toBeInTheDocument();
 
     await userEvent.fill(page.getByTestId("sessions-search"), "zzz");
@@ -86,7 +93,7 @@ describe("SessionsPage filtering", () => {
     // produce the no-match state from the empty one.
     const transport = new FakeTransport();
     transport.listSessionsResult = Promise.resolve({ ...list, sessions: [], next_skip: 0 });
-    render(<SessionsPage transport={transport} />);
+    render(<SessionsPage transport={transport} onOpenSession={noop} />);
     await expect.element(page.getByTestId("sessions-empty")).toBeInTheDocument();
     expect(document.querySelector("[data-testid=sessions-filter-bar]")).toBeNull();
   });
@@ -95,7 +102,7 @@ describe("SessionsPage filtering", () => {
     // Filtering is client-side over the page already held. A refetch per
     // keystroke would be both slower and wrong, since the server has no filter.
     const transport = loaded();
-    render(<SessionsPage transport={transport} />);
+    render(<SessionsPage transport={transport} onOpenSession={noop} />);
     await expect.element(page.getByTestId("sessions-list")).toBeInTheDocument();
 
     await userEvent.fill(page.getByTestId("sessions-search"), "parser");
