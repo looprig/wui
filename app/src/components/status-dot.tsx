@@ -41,15 +41,34 @@ const toneClass: Record<StatusTone, string> = {
   idle: "bg-muted",
 };
 
-export function StatusDot({ state }: { state: string | undefined }): React.JSX.Element {
-  const tone = toneFor(state);
+/**
+ * The dot itself, given a tone directly.
+ *
+ * Split out because a TOOL call's status vocabulary is not a session's:
+ * `ToolRow.status` is running/ok/error/cancelled, and feeding those through
+ * `toneFor` would paint a failed tool call the neutral gray of an idle session,
+ * which is the same class of silent mis-colouring `toneFor`'s own comment
+ * records. A caller with its own vocabulary maps it to a tone and renders this;
+ * `StatusDot` is that mapping for `SessionSummary.state`.
+ *
+ * `label` is required rather than derived: the tone is a colour bucket and
+ * several distinct states share one, so only the caller knows what the dot
+ * actually means.
+ */
+export function ToneDot({ tone, label }: { tone: StatusTone; label: string }): React.JSX.Element {
   return (
     <span
       data-testid="status-dot"
       data-status={tone}
       role="img"
-      aria-label={state === undefined || state === "" ? "unknown" : state}
+      aria-label={label}
       className={cn("inline-block h-2 w-2 shrink-0 rounded-full", toneClass[tone])}
     />
+  );
+}
+
+export function StatusDot({ state }: { state: string | undefined }): React.JSX.Element {
+  return (
+    <ToneDot tone={toneFor(state)} label={state === undefined || state === "" ? "unknown" : state} />
   );
 }
