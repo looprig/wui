@@ -39,6 +39,12 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # @looprig/react runs in Vitest BROWSER mode, so it needs the real
+      # Chromium binary, which the npm package does not carry. Without this the
+      # whole react suite fails to start -- and `--if-present` would not save
+      # it, because the script IS present. `--with-deps` installs the shared
+      # libraries a bare ubuntu-latest runner lacks.
+      - run: npx playwright install --with-deps chromium
       # The npm workspaces carry the OTHER half of the wire-contract drift
       # guard: contract/contract_test.go proves contract/ matches the pinned
       # harness bytes, and packages/protocol validates those same bytes against
