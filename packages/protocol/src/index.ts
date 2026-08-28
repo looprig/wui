@@ -19,6 +19,7 @@ export * from "./fold.js";
 export * from "./join.js";
 export * from "./live.js";
 export * from "./content.js";
+export * from "./blocks.js";
 export * from "./gate-actions.js";
 export {
   allSchemas,
