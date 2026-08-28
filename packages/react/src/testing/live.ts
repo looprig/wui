@@ -184,6 +184,18 @@ export function textDelta(text: string, h?: EventHeader): SseFrame {
   return ephemeral("token_delta", { chunk_type: "text", text }, h);
 }
 
+/**
+ * A `token_delta` whose `chunk_type` the fold does not recognise, which yields
+ * a typed `FoldError` (`reason: "unknown_chunk_type"`) rather than throwing.
+ *
+ * This is the fixture for the NON-FATAL half of the error channel: fold.ts's
+ * contract is that the join keeps going past one bad input, so a renderer must
+ * be able to tell this from a join failure that actually ended the stream.
+ */
+export function badTokenDelta(h?: EventHeader): SseFrame {
+  return ephemeral("token_delta", { chunk_type: "not-a-real-chunk-type" }, h);
+}
+
 export interface EnvelopeOptions {
   type: string;
   loopId?: string;
