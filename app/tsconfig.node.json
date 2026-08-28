@@ -3,7 +3,6 @@
   // node, not in the browser, so they are the only files that may see node's
   // globals and `node:*` builtins.
   "compilerOptions": {
-    "composite": true,
     "target": "ES2022",
     "lib": ["ES2023"],
     "module": "ESNext",

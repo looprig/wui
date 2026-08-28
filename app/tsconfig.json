@@ -1,8 +1,13 @@
 {
-  // One config for both `tsc --noEmit` and the editor. Unlike the packages,
-  // this project emits nothing, so there is no `rootDir`/`declaration`
-  // constraint forcing a second file: `paths` may point straight at the
-  // sibling workspace sources.
+  // The browser half of the project: everything under `src`. It emits nothing,
+  // so unlike the packages there is no `rootDir`/`declaration` constraint and
+  // `paths` may point straight at the sibling workspace sources.
+  //
+  // `vite.config.ts` and its test are NOT here. They run in node, and the only
+  // way to give them node's globals without also handing them to browser code
+  // is a second program — see tsconfig.node.json. Project `references` cannot
+  // do it: a referenced project may not set `noEmit`, and this app has nothing
+  // to emit.
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
@@ -30,6 +35,5 @@
       "@looprig/protocol": ["../packages/protocol/src/index.ts"]
     }
   },
-  "include": ["src", "vite.config.ts", "vite.config.test.ts"],
-  "references": [{ "path": "./tsconfig.node.json" }]
+  "include": ["src"]
 }
