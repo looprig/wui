@@ -1057,3 +1057,122 @@ describe("decodeEnduring: permission events", () => {
     expect(decodeEnduring(wireEnvelope(PERMISSION_DECIDED_DENY_WIRE)).payload.kind).toBe("PermissionDecided");
   });
 });
+
+/**
+ * ## Provenance of the LoopStarted wire strings
+ *
+ * Same producer, same harness@v0.30.0: real `event.LoopStarted` values through
+ * `event.MarshalEvent`. LoopStarted's identity profile is `loopProfile()` —
+ * SessionID+LoopID required, TurnID/StepID FORBIDDEN on the header — while the
+ * SPAWNING loop/turn/step ride on `Header.Cause.Coordinates`, which is why the
+ * child constant below carries a full quartet under `cause` and none of it at
+ * the top level. MarshalEvent would have refused the other arrangement.
+ */
+const LOOP_STARTED_CHILD_WIRE =
+  '{"agent_name":"researcher","cause":{"session_id":"11111111-1111-4111-8111-111111111111","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","step_id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","command_id":"ffffffff-ffff-4fff-8fff-ffffffffffff"},"created_at":"2026-08-27T10:00:00Z","description":"reads the docs","display_name":"Research","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","initial_mode":"plan","loop_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","parent_tool_use_id":"toolu_sub_1","runtime":{"key":{"Provider":"anthropic","Model":"claude-opus-4"},"limits":{"WindowTokens":200000,"MaxInputTokens":180000,"MaxOutputTokens":64000},"effort":"high"},"session_id":"11111111-1111-4111-8111-111111111111","type":"LoopStarted","v":1}';
+
+const LOOP_STARTED_ROOT_WIRE =
+  '{"agent_name":"primer","created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","type":"LoopStarted","v":1}';
+
+const LOOP_STARTED_FOREIGN_WIRE =
+  '{"agent_name":"claude","agent_runtime":{"harness":"claude-code","profile":"default","credential_mode":"native-auth","source":"native","selection_kind":"harness-managed","model_alias":""},"cause":{"session_id":"11111111-1111-4111-8111-111111111111","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","step_id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd"},"created_at":"2026-08-27T10:00:00Z","display_name":"Claude","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","foreign_sid":"sess_abc123","initial_request_id":"ffffffff-ffff-4fff-8fff-ffffffffffff","loop_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","parent_tool_use_id":"toolu_sub_2","session_id":"11111111-1111-4111-8111-111111111111","type":"LoopStarted","v":1}';
+
+describe("decodeEnduring: LoopStarted", () => {
+  it("decodes a REAL child loop's anchor and presentation labels", () => {
+    const decoded = decodeEnduring(wireEnvelope(LOOP_STARTED_CHILD_WIRE));
+    expect(decoded.payload).toStrictEqual({
+      kind: "LoopStarted",
+      parentToolUseId: "toolu_sub_1",
+      displayName: "Research",
+      description: "reads the docs",
+      foreignSid: "",
+      initialMode: "plan",
+    });
+    // Header.Coordinates is the NEW loop; Header.Cause.Coordinates is the
+    // SPAWNING one. Swapping them would parent every subagent to itself.
+    expect(decoded.loopId).toBe(LOOP_B);
+    expect(decoded.causeLoopId).toBe(LOOP_A);
+    expect(decoded.agentName).toBe("researcher");
+    // loopProfile() forbids TurnID/StepID on the header — the spawn's turn and
+    // step are reachable only through `cause`.
+    expect(decoded.turnId).toBe("");
+    expect(decoded.stepId).toBe("");
+  });
+
+  it("keeps the spawning turn/step out of the header and inside `cause`", () => {
+    const raw = object(JSON.parse(LOOP_STARTED_CHILD_WIRE) as unknown);
+    expect(Object.hasOwn(raw, "turn_id")).toBe(false);
+    expect(Object.hasOwn(raw, "step_id")).toBe(false);
+    expect(object(raw["cause"])["turn_id"]).toBe(TURN_1);
+    expect(object(raw["cause"])["step_id"]).toBe(STEP_1);
+  });
+
+  it("decodes a REAL foreign loop's session handle and its own display name", () => {
+    const decoded = decodeEnduring(wireEnvelope(LOOP_STARTED_FOREIGN_WIRE));
+    expect(decoded.payload).toStrictEqual({
+      kind: "LoopStarted",
+      parentToolUseId: "toolu_sub_2",
+      displayName: "Claude",
+      description: "",
+      foreignSid: "sess_abc123",
+      initialMode: "",
+    });
+  });
+
+  it("decodes a REAL primary/root loop, which has no parent tool use and no cause loop", () => {
+    const raw = object(JSON.parse(LOOP_STARTED_ROOT_WIRE) as unknown);
+    // Every one of the payload's five fields is omitzero, so a root's envelope
+    // carries none of them at all — not empty strings.
+    for (const key of ["parent_tool_use_id", "display_name", "description", "foreign_sid", "initial_mode", "cause"]) {
+      expect(Object.hasOwn(raw, key)).toBe(false);
+    }
+    const decoded = decodeEnduring(asEnvelope(raw));
+    expect(decoded.causeLoopId).toBe("");
+    expect(decoded.agentName).toBe("primer");
+    expect(decoded.payload).toStrictEqual({
+      kind: "LoopStarted",
+      parentToolUseId: "",
+      displayName: "",
+      description: "",
+      foreignSid: "",
+      initialMode: "",
+    });
+  });
+
+  it("carries a `runtime` whose WRAPPERS are snake_case and whose CONTENTS are Go-cased", () => {
+    // ModelRuntime tags key/limits/effort/api_format/base_url, but model.ModelKey
+    // and model.ContextLimits declare NO json tags at all, so encoding/json emits
+    // Provider/Model/WindowTokens/MaxInputTokens/MaxOutputTokens verbatim. The
+    // same casing split blocks.ts pins for content blocks, one level deeper.
+    //
+    // It is DELIBERATELY not projected onto LoopStartedPayload: §3b's loop tree
+    // needs the parent anchor and the labels, not the model identity, and a
+    // field nothing reads is a field nothing keeps correct. This assertion
+    // exists so the omission stays a decision — and so the casing is recorded
+    // for whoever does need it.
+    const runtime = object(object(JSON.parse(LOOP_STARTED_CHILD_WIRE) as unknown)["runtime"]);
+    expect(Object.keys(runtime).sort()).toStrictEqual(["effort", "key", "limits"]);
+    expect(object(runtime["key"])).toStrictEqual({ Provider: "anthropic", Model: "claude-opus-4" });
+    expect(object(runtime["limits"])).toStrictEqual({
+      WindowTokens: 200000,
+      MaxInputTokens: 180000,
+      MaxOutputTokens: 64000,
+    });
+  });
+
+  it("leaves `agent_runtime` and `initial_request_id` on the envelope, unprojected", () => {
+    // Both are real wire on a delegated loop. Neither is projected, for the same
+    // reason as `runtime`; DecodedEnduring.envelope keeps the verbatim bytes, so
+    // nothing is lost, only undecoded.
+    const raw = object(JSON.parse(LOOP_STARTED_FOREIGN_WIRE) as unknown);
+    expect(object(raw["agent_runtime"])["harness"]).toBe("claude-code");
+    expect(raw["initial_request_id"]).toBe(CMD_1);
+    const decoded = decodeEnduring(asEnvelope(raw));
+    expect(decoded.envelope).toBe(raw);
+  });
+
+  it("distinguishes LoopStarted from the turn events sharing its header shape", () => {
+    expect(decodeEnduring(wireEnvelope(LOOP_STARTED_ROOT_WIRE)).payload.kind).toBe("LoopStarted");
+    expect(decodeEnduring(wireEnvelope(TURN_INTERRUPTED_WIRE)).payload.kind).toBe("TurnInterrupted");
+  });
+});

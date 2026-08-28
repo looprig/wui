@@ -318,6 +318,43 @@ export interface PermissionDecidedPayload {
   audit: string;
 }
 
+/**
+ * LoopStarted is the durable loop-tree record. Header.Coordinates is the NEW
+ * loop; Header.Cause.Coordinates is the SPAWNING loop/turn/step (zero for the
+ * primary/root). The header itself carries NO turn or step — LoopStarted's
+ * identity profile (loopProfile) forbids them — so a consumer that wants the
+ * spawning step reads `cause`, never the promoted coordinates.
+ *
+ * ParentToolUseID is the durable provider tool-use id
+ * (content.ToolUseBlock.ID) of the agent tool call that spawned this loop —
+ * the join key that anchors a child loop's transcript block at the parent's
+ * subagent tool card (§3b rule 1). It is empty for a root.
+ *
+ * The presentation label is DisplayName when non-empty, else the header's
+ * AgentName (older journals carry no DisplayName) — the same fallback tui's
+ * loopStartedLabel applies. That fallback is NOT applied here: AgentName lives
+ * on the shared header, not in this payload, so it belongs to a consumer that
+ * has the whole DecodedEnduring.
+ *
+ * Three real wire fields are deliberately left undecoded: `runtime` (the
+ * resolved model identity), `agent_runtime` (a delegated foreign runtime's
+ * secret-free identity) and `initial_request_id`. None of them is loop-tree or
+ * label data, and DecodedEnduring.envelope keeps the verbatim bytes for any
+ * consumer that later needs one. `runtime`'s shape is recorded in
+ * test/enduring.test.ts because it is a casing trap: the `key`/`limits`
+ * wrappers are snake_case while their CONTENTS are Go-cased
+ * (`Provider`/`Model`/`WindowTokens`/...), since model.ModelKey and
+ * model.ContextLimits declare no json tags.
+ */
+export interface LoopStartedPayload {
+  kind: "LoopStarted";
+  parentToolUseId: string;
+  displayName: string;
+  description: string;
+  foreignSid: string;
+  initialMode: string;
+}
+
 /** The type-specific half of a decoded enduring event. Extended per task. */
 export type EnduringPayload =
   | TurnOpenerPayload
@@ -329,6 +366,7 @@ export type EnduringPayload =
   | InputCancelledPayload
   | PermissionRequestedPayload
   | PermissionDecidedPayload
+  | LoopStartedPayload
   | { kind: "other" };
 
 /**
@@ -412,6 +450,15 @@ function decodePayload(type: string, raw: Record<string, unknown>): EnduringPayl
         turnIndex: num(raw["turn_index"]),
         reason: num(raw["reason"]),
         message: isRecord(raw["message"]) ? decodeMessage(raw["message"]) : undefined,
+      };
+    case "LoopStarted":
+      return {
+        kind: "LoopStarted",
+        parentToolUseId: str(raw["parent_tool_use_id"]),
+        displayName: str(raw["display_name"]),
+        description: str(raw["description"]),
+        foreignSid: str(raw["foreign_sid"]),
+        initialMode: str(raw["initial_mode"]),
       };
     case "PermissionRequested":
       return {
