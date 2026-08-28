@@ -16,19 +16,42 @@ import (
 func pinnedHarness(t *testing.T) (dir, version string) {
 	t.Helper()
 	const sep = "\t"
-	cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}"+sep+"{{.Version}}", "github.com/looprig/harness")
+	const modulePath = "github.com/looprig/harness"
 	// This module lives inside the parent looprig/go.work workspace. Without
 	// GOWORK=off, `go` auto-detects go.work by walking up from this directory and
 	// resolves the harness module via the workspace's own checkout instead of the
 	// version this module's go.mod pins -- silently wrong, not an error. The
 	// checkout would also report an empty version, so contract/VERSION could
 	// never be asserted at all.
-	cmd.Env = append(os.Environ(), "GOWORK=off")
-	out, err := cmd.Output()
+	run := func(args ...string) (string, error) {
+		cmd := exec.Command("go", args...) // #nosec G204 -- fixed argv, no external input
+		cmd.Env = append(os.Environ(), "GOWORK=off")
+		out, err := cmd.Output()
+		return strings.TrimSpace(string(out)), err
+	}
+
+	out, err := run("list", "-m", "-f", "{{.Dir}}"+sep+"{{.Version}}", modulePath)
 	if err != nil {
 		t.Fatalf("locate harness module: %v", err)
 	}
-	dir, version, ok := strings.Cut(strings.TrimSpace(string(out)), sep)
+	dir, version, ok := strings.Cut(out, sep)
+
+	// `go list -m` reports the pinned VERSION without downloading, but leaves Dir
+	// EMPTY until the module is actually in the cache. Every local run has a warm
+	// cache from `go get`, so this only ever bites on a clean machine -- it is what
+	// turned CI red on the first push of this guard. Download and retry rather than
+	// skipping: a skipped drift guard is indistinguishable from a passing one, which
+	// is the whole failure mode this file exists to prevent.
+	if ok && dir == "" && version != "" {
+		if _, err := run("mod", "download", modulePath); err != nil {
+			t.Fatalf("go mod download %s: %v", modulePath, err)
+		}
+		if out, err = run("list", "-m", "-f", "{{.Dir}}"+sep+"{{.Version}}", modulePath); err != nil {
+			t.Fatalf("go list -m %s after download: %v", modulePath, err)
+		}
+		dir, version, ok = strings.Cut(out, sep)
+	}
+
 	if !ok || dir == "" || version == "" {
 		t.Fatalf("`go list -m` gave no dir/version pair: %q", out)
 	}
