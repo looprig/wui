@@ -84,6 +84,9 @@ describe("rows: TurnDone commits any dangling live segment", () => {
         thinking: "weighing it up",
         text: "streamed but never StepDone'd",
         refusal: "",
+        // A terminal COMMITS the live row in place, so it keeps the live
+        // path's false: the terminal carries no blocks to learn otherwise from.
+        redactedThinking: false,
       },
     ]);
   });

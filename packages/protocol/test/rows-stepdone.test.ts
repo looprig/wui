@@ -47,7 +47,15 @@
  */
 import { describe, expect, it } from "vitest";
 import { emptySessionView } from "../src/fold.js";
-import { narrationOf, refusalOf, splitStepGroup, thinkingOf, toolResultText, toolUsesOf } from "../src/rows.js";
+import {
+  narrationOf,
+  redactedThinkingOf,
+  refusalOf,
+  splitStepGroup,
+  thinkingOf,
+  toolResultText,
+  toolUsesOf,
+} from "../src/rows.js";
 import { decodeMessages, type ContentBlock } from "../src/blocks.js";
 import type { EventEnvelope } from "../src/types.js";
 import {
@@ -92,6 +100,18 @@ const STEP_DONE_MULTI_TEXT_WIRE =
 const STEP_DONE_REDACTED_THINKING_WIRE =
   '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"ProviderState":"opaque","ProviderStateFormat":"anthropic","Signature":"","Thinking":"","type":"thinking"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
 
+/** A plain EMPTY thinking block: no reasoning, and no provider state either. */
+const STEP_DONE_EMPTY_THINKING_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"Signature":"","Thinking":"","type":"thinking"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+/** VISIBLE reasoning and a redacted block in one step — the two coexist. */
+const STEP_DONE_VISIBLE_PLUS_REDACTED_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"Signature":"sig","SignatureFormat":"anthropic","Thinking":"visible reasoning","type":"thinking"},{"ProviderState":"opaque","ProviderStateFormat":"anthropic","Signature":"","Thinking":"","type":"thinking"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+/** Redacted reasoning alongside a tool call: the tool row always committed. */
+const STEP_DONE_REDACTED_PLUS_TOOL_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"ProviderState":"opaque","ProviderStateFormat":"anthropic","Signature":"","Thinking":"","type":"thinking"},{"ID":"toolu_9","Input":{"path":"/a"},"Name":"Read","type":"tool_use"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
 /** Reasoning, narration and TWO tool calls, whose results arrive in the REVERSE order. */
 const STEP_DONE_PROSE_AND_TOOLS_WIRE =
   '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"Signature":"sig","SignatureFormat":"anthropic","Thinking":"half a thought","type":"thinking"},{"Text":"reading both","type":"text"},{"ID":"toolu_1","Input":{"path":"/a"},"Name":"Read","type":"tool_use"},{"ID":"toolu_2","Input":{"path":"/b"},"Name":"Read","type":"tool_use"}]},{"role":"tool","blocks":[{"Text":"B body","type":"text"}],"tool_use_id":"toolu_2"},{"role":"tool","blocks":[{"Text":"no such file","type":"text"}],"tool_use_id":"toolu_1","is_error":true}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
@@ -131,7 +151,7 @@ function stepDone(loopId: string, blocks: Array<Record<string, unknown>>, seq?: 
 }
 
 const TEXT: ContentBlock = { type: "text", text: "narration" };
-const THINK: ContentBlock = { type: "thinking", thinking: "reasoning", signature: "sig" };
+const THINK: ContentBlock = { type: "thinking", thinking: "reasoning", signature: "sig", redacted: false };
 const REFUSE: ContentBlock = { type: "refusal", text: "declined" };
 const USE: ContentBlock = { type: "tool_use", id: "toolu_1", name: "Read", input: {} };
 
@@ -174,10 +194,29 @@ describe("rows: the step-group helpers", () => {
   });
 
   it("thinkingOf joins ONLY the thinking blocks, and reads a redacted one as empty", () => {
-    expect(thinkingOf([THINK, TEXT, { type: "thinking", thinking: "more", signature: "" }])).toBe("reasoning\nmore");
+    expect(thinkingOf([THINK, TEXT, { type: "thinking", thinking: "more", signature: "", redacted: false }])).toBe("reasoning\nmore");
     // A redacted block carries its content in provider-private bytes blocks.ts
     // deliberately drops, so it projects to "" — see rows.ts's module comment.
-    expect(thinkingOf([{ type: "thinking", thinking: "", signature: "" }])).toBe("");
+    expect(thinkingOf([{ type: "thinking", thinking: "", signature: "", redacted: false }])).toBe("");
+  });
+
+  it("redactedThinkingOf reports whether ANY thinking block withheld its content", () => {
+    const REDACTED: ContentBlock = { type: "thinking", thinking: "", signature: "", redacted: true };
+    expect(redactedThinkingOf([REDACTED])).toBe(true);
+    // Any, not all: a step that reasoned visibly AND withheld part of it did
+    // withhold part of it.
+    expect(redactedThinkingOf([THINK, REDACTED])).toBe(true);
+    // And within ONE block: core@v0.6.0 marshals a block carrying visible
+    // Thinking AND ProviderState (blocks.test.ts pins the bytes), so this is
+    // not the same shape as the two-block case above.
+    expect(redactedThinkingOf([{ type: "thinking", thinking: "visible", signature: "", redacted: true }])).toBe(
+      true,
+    );
+    expect(redactedThinkingOf([THINK, TEXT, USE])).toBe(false);
+    // An empty thinking block is NOT a redacted one — that is the whole
+    // distinction the derived flag exists to carry.
+    expect(redactedThinkingOf([{ type: "thinking", thinking: "", signature: "", redacted: false }])).toBe(false);
+    expect(redactedThinkingOf([])).toBe(false);
   });
 
   it("refusalOf is separate from narration, so a declined turn is never reported as an answer", () => {
@@ -222,6 +261,7 @@ describe("rows: the StepDone snap", () => {
         thinking: "half a thought",
         text: "partial answer, finished",
         refusal: "",
+        redactedThinking: false,
       },
     ]);
   });
@@ -262,6 +302,7 @@ describe("rows: the StepDone snap", () => {
         thinking: "",
         text: "",
         refusal: "I won't do that",
+        redactedThinking: false,
       },
     ]);
   });
@@ -297,17 +338,89 @@ describe("rows: the StepDone snap", () => {
     expect(view.rows[0]).toMatchObject({ text: "first\nsecond" });
   });
 
-  it("commits NO row for a step whose only content is REDACTED reasoning", () => {
-    // A documented consequence, not an oversight: blocks.ts drops
-    // ProviderState/ProviderStateFormat (provider-private continuation bytes
-    // with no reader in a browser), so this layer cannot see that the block
-    // held anything. rows.ts's module comment records where a redaction flag
-    // would belong if the transcript should mark it — on ThinkingBlockValue,
-    // in the task that first RENDERS reasoning, not here.
+  it("commits a row for a step whose ONLY content is redacted reasoning", () => {
+    // THE VANISHING-STEP FIX. This test used to pin the opposite. blocks.ts
+    // drops ProviderState/ProviderStateFormat (provider-private continuation
+    // bytes with no reader in a browser), and that also destroyed the only
+    // evidence that the block held anything — so the projection saw
+    // thinking === "" and committed nothing, and a step whose only content was
+    // redacted reasoning disappeared from the transcript entirely. The derived
+    // `redacted` boolean on ThinkingBlockValue restores the fact without the
+    // bytes, and the commit condition now reads it.
+    resetSeq();
+    const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
+      history(wireEnvelope(STEP_DONE_REDACTED_THINKING_WIRE), 8),
+    ]);
+    expect(view.rows).toStrictEqual([
+      {
+        kind: "assistant",
+        ordinal: 0,
+        loopId: LOOP_A,
+        turnId: TURN_1,
+        journalSeq: 8,
+        live: false,
+        orphanedLoop: false,
+        thinking: "",
+        text: "",
+        refusal: "",
+        redactedThinking: true,
+      },
+    ]);
+    expect(view.nextOrdinal).toBe(1);
+  });
+
+  it("still forwards no provider bytes for the step it now commits", () => {
+    // The decision that provider-private replay state never reaches the browser
+    // stands; only the FACT of redaction crosses. Serialising the whole view
+    // must not contain the payload or its dialect label.
     resetSeq();
     const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_REDACTED_THINKING_WIRE), 8)]);
+    const serialized = JSON.stringify(view.rows);
+    expect(serialized).not.toContain("opaque");
+    expect(serialized).not.toContain("ProviderState");
+    expect(serialized).not.toContain("anthropic");
+  });
+
+  it("commits NOTHING for a plain EMPTY thinking block, which withheld nothing", () => {
+    // The other half of the distinction, and the reason the flag had to be
+    // derived from ProviderState rather than from an empty Thinking: these two
+    // steps are identical in every visible field.
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_EMPTY_THINKING_WIRE), 8)]);
     expect(view.rows).toStrictEqual([]);
     expect(view.nextOrdinal).toBe(0);
+  });
+
+  it("keeps the visible reasoning AND marks the redaction when a step has both", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_VISIBLE_PLUS_REDACTED_WIRE), 8)]);
+    expect(view.rows).toHaveLength(1);
+    expect(view.rows[0]).toMatchObject({
+      kind: "assistant",
+      // The trailing newline is thinkingOf's block-order join meeting the
+      // redacted block's "" — pre-existing and unchanged by this fix, asserted
+      // rather than papered over.
+      thinking: "visible reasoning\n",
+      redactedThinking: true,
+    });
+  });
+
+  it("marks the assistant row a redacted step ALSO has tool calls in", () => {
+    // Tool rows always committed, so only PURE-redacted steps ever vanished.
+    // The assistant row is committed here too, and it is the one that carries
+    // the mark.
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_REDACTED_PLUS_TOOL_WIRE), 8)]);
+    expect(view.rows.map((r) => r.kind)).toStrictEqual(["assistant", "tool"]);
+    expect(view.rows[0]).toMatchObject({ thinking: "", text: "", refusal: "", redactedThinking: true });
+    expect(view.rows[1]).toMatchObject({ toolUseId: "toolu_9", summary: "/a" });
+  });
+
+  it("leaves an ordinary committed row unmarked", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_PROSE_ONLY_WIRE), 8)]);
+    expect(view.rows[0]).toMatchObject({ thinking: "half a thought", redactedThinking: false });
   });
 
   it("snaps only the committing loop, leaving another loop's live segment alone", () => {

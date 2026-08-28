@@ -68,6 +68,10 @@ describe("rows: the live segment", () => {
         thinking: "planning",
         text: "Hello",
         refusal: "",
+        // Never true on a live row: harness's ephemeral thinkingChunkDTO is
+        // {chunk_type, thinking}, so provider state is not on the streaming
+        // wire and redaction is only ever learned at the enduring commit.
+        redactedThinking: false,
       },
     ]);
     expect(view.nextOrdinal).toBe(1);
@@ -191,6 +195,27 @@ describe("rows: the live segment", () => {
     expect(after.rows[0]).toMatchObject({ text: "hi" });
   });
 
+  it("never marks a live row redacted, whatever the streamed thinking chunk carries", () => {
+    // Not a placeholder. harness's ephemeral thinkingChunkDTO is
+    // {chunk_type, thinking} — ProviderState is not on the streaming wire at
+    // all, so a live row has nothing to learn redaction FROM, and the StepDone
+    // snap replaces the row with one committed from the durable blocks anyway.
+    // A delta that smuggles the key in must not change that.
+    resetSeq();
+    const view = run(emptySessionView(), [
+      thinkingDelta("planning", LOOP_A, TURN_1),
+      liveEphemeral(
+        "token_delta",
+        { chunk_type: "thinking", thinking: "", ProviderState: "opaque", ProviderStateFormat: "anthropic" },
+        LOOP_A,
+        TURN_1,
+      ),
+    ]);
+    expect(view.rows).toHaveLength(1);
+    expect(view.rows[0]).toMatchObject({ live: true, redactedThinking: false });
+    expect(JSON.stringify(view.rows)).not.toContain("opaque");
+  });
+
   it("still appends every folded chunk to the legacy content bucket", () => {
     resetSeq();
     const view = run(emptySessionView(), [textDelta("a", LOOP_A), thinkingDelta("b", LOOP_A)]);
@@ -232,6 +257,7 @@ describe("rows: the live segment", () => {
         thinking: "",
         text: "",
         refusal: "I can't",
+        redactedThinking: false,
       },
     ]);
   });

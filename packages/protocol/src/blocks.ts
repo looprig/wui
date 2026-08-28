@@ -35,6 +35,16 @@
  * wui renders; it never replays. Forwarding opaque provider bytes into a
  * browser has no reader and is a leak.
  *
+ * One bit survives that drop: `ThinkingBlockValue.redacted`. Dropping the
+ * bytes also destroyed the only evidence that a block HELD any, and a redacted
+ * thinking block is otherwise identical in its visible fields to a block with
+ * no reasoning in it — so the row projection could not tell "the model thought
+ * and you may not see it" from "the model did not think", and committed no row
+ * for a step whose only content was redacted reasoning. The derived boolean
+ * restores exactly that distinction and forwards no provider bytes: the
+ * decision that provider-private replay state never reaches the browser
+ * stands.
+ *
  * Unrecognized blocks (image/audio/document, and anything added later) are
  * preserved as an opaque `other` variant rather than dropped, so a renderer
  * can show a placeholder instead of silently losing turn content.
@@ -52,6 +62,28 @@ export interface ThinkingBlockValue {
   type: "thinking";
   thinking: string;
   signature: string;
+  /**
+   * True when the block carried provider-private continuation state — the
+   * model reasoned and the provider withheld the text.
+   *
+   * A DERIVED boolean, and the one thing this decoder keeps from
+   * `ProviderState`. The fact of redaction is display information: a redacted
+   * block and a block with no reasoning at all are `{"Signature":"",
+   * "Thinking":""}` in every VISIBLE field, so without this the transcript
+   * cannot tell "the model thought and you may not see it" from "the model did
+   * not think", and a step whose only content is redacted reasoning renders as
+   * nothing at all. The bytes themselves stay on the server: they are
+   * dialect-scoped replay state with no reader in a browser (see the module
+   * comment), and forwarding them would be a leak with no purpose.
+   *
+   * Derived from PRESENCE of a non-null `ProviderState`, not from an empty
+   * `Thinking`. `omitempty` drops only a zero-length RawMessage, so a
+   * `RawMessage("null")` really does reach the wire as `"ProviderState":null` —
+   * and a key whose value is JSON null withheld nothing. It is also
+   * independent of `thinking`: core marshals a block carrying both, so this
+   * means "some of this reasoning was withheld", not "all of it".
+   */
+  redacted: boolean;
 }
 export interface ToolUseBlockValue {
   type: "tool_use";
@@ -98,7 +130,13 @@ export function decodeBlock(raw: unknown): ContentBlock {
       // that keeps a refusal from rendering as ordinary assistant prose.
       return { type: "refusal", text: str(raw["Text"]) };
     case "thinking":
-      return { type: "thinking", thinking: str(raw["Thinking"]), signature: str(raw["Signature"]) };
+      return {
+        type: "thinking",
+        thinking: str(raw["Thinking"]),
+        signature: str(raw["Signature"]),
+        // The ONLY thing kept from ProviderState: that there was one.
+        redacted: raw["ProviderState"] !== undefined && raw["ProviderState"] !== null,
+      };
     case "tool_use":
       return { type: "tool_use", id: str(raw["ID"]), name: str(raw["Name"]), input: raw["Input"] };
     case "tool_result":

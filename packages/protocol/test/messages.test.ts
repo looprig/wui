@@ -78,7 +78,7 @@ describe("decodeMessage", () => {
     expect(msg).toEqual({
       role: "assistant",
       blocks: [
-        { type: "thinking", thinking: "hm", signature: "s" },
+        { type: "thinking", thinking: "hm", signature: "s", redacted: false },
         { type: "text", text: "answer" },
         { type: "tool_use", id: "toolu_1", name: "Read", input: {} },
       ],
@@ -105,7 +105,7 @@ describe("decodeMessage", () => {
     ).toEqual({
       role: "assistant",
       blocks: [
-        { type: "thinking", thinking: "hm", signature: "s" },
+        { type: "thinking", thinking: "hm", signature: "s", redacted: false },
         { type: "text", text: "answer" },
         { type: "tool_use", id: "toolu_1", name: "Read", input: {} },
       ],

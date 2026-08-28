@@ -72,6 +72,7 @@ describe("decodeBlock", () => {
       type: "thinking",
       thinking: "hm",
       signature: "sig",
+      redacted: false,
     });
   });
 
@@ -89,19 +90,79 @@ describe("decodeBlock", () => {
       type: "thinking",
       thinking: "hm",
       signature: "sig",
+      redacted: false,
     });
   });
 
   it("decodes a redacted thinking block to empty visible text, not undefined", () => {
     // NewThinkingBlock("", "", providerState, "gemini") — the redacted shape.
     // Thinking and Signature carry no omitempty, so both are present and empty;
-    // the payload rides in ProviderState. A renderer sees an empty thinking
-    // block, which is exactly what a redacted reasoning turn is.
+    // the payload rides in ProviderState.
     expect(
       decodeBlock(
         wire('{"ProviderState":{"d":"op"},"ProviderStateFormat":"gemini","Signature":"","Thinking":"","type":"thinking"}'),
       ),
-    ).toEqual({ type: "thinking", thinking: "", signature: "" });
+    ).toEqual({ type: "thinking", thinking: "", signature: "", redacted: true });
+  });
+
+  it("marks a redacted block WITHOUT forwarding one provider byte", () => {
+    // The whole point of the derived boolean. `redacted` says THAT reasoning
+    // was withheld; the opaque continuation state that says what it was stays
+    // on the server, where the only thing that can read it lives. Serialising
+    // the decoded block must not contain the payload or its dialect label.
+    const decoded = decodeBlock(
+      wire('{"ProviderState":{"d":"OPAQUE-PAYLOAD"},"ProviderStateFormat":"gemini","Signature":"","Thinking":"","type":"thinking"}'),
+    );
+    const serialized = JSON.stringify(decoded);
+    expect(serialized).not.toContain("OPAQUE-PAYLOAD");
+    expect(serialized).not.toContain("ProviderState");
+    expect(serialized).not.toContain("gemini");
+    expect(Object.keys(decoded).sort()).toStrictEqual(["redacted", "signature", "thinking", "type"]);
+  });
+
+  it("does NOT mark a plain empty thinking block, which is the whole distinction", () => {
+    // Both are `{"Signature":"","Thinking":""}` in their VISIBLE fields — the
+    // only thing separating "the model redacted its reasoning" from "there was
+    // no reasoning" is the presence of ProviderState. Verbatim from core@v0.6.0:
+    // NewThinkingBlock("", "", nil, "") marshals to {"Thinking":"","Signature":""}.
+    expect(decodeBlock(wire('{"Signature":"","Thinking":"","type":"thinking"}'))).toEqual({
+      type: "thinking",
+      thinking: "",
+      signature: "",
+      redacted: false,
+    });
+  });
+
+  it("marks a block that carries BOTH visible reasoning and provider state", () => {
+    // core's doc says the two "are never both populated by the same wire
+    // block", but that describes providers, not a validated invariant: a bare
+    // struct literal can pair them, and core@v0.6.0 marshals the pair happily.
+    // `redacted` is therefore independent of `thinking`, meaning "some of this
+    // step's reasoning was withheld", not "all of it".
+    expect(
+      decodeBlock(
+        wire('{"ProviderState":"op","ProviderStateFormat":"gemini","Signature":"","Thinking":"visible","type":"thinking"}'),
+      ),
+    ).toEqual({ type: "thinking", thinking: "visible", signature: "", redacted: true });
+  });
+
+  it("does NOT mark a literal null ProviderState, which carries no state at all", () => {
+    // Reachable, not hypothetical: `omitempty` on a json.RawMessage drops only
+    // a ZERO-LENGTH value, and the four bytes "null" are not zero-length, so
+    // core@v0.6.0 emits {"ProviderState":null,"ProviderStateFormat":"anthropic"}
+    // for a RawMessage("null"). A key whose value is JSON null withheld nothing.
+    expect(
+      decodeBlock(wire('{"ProviderState":null,"ProviderStateFormat":"anthropic","Signature":"","Thinking":"","type":"thinking"}')),
+    ).toEqual({ type: "thinking", thinking: "", signature: "", redacted: false });
+  });
+
+  it("marks any non-null provider state, whatever JSON shape it takes", () => {
+    // ProviderState is a json.RawMessage: an object for Gemini, a base64 string
+    // for Anthropic's redacted_thinking.data. Neither is read, both count.
+    for (const state of ['"opaque-bytes"', '{"d":"op"}', '[1,2]', "0", "false", '""']) {
+      const raw = `{"ProviderState":${state},"ProviderStateFormat":"anthropic","Signature":"","Thinking":"","type":"thinking"}`;
+      expect(decodeBlock(wire(raw)), raw).toMatchObject({ redacted: true });
+    }
   });
 
   it("reads a tool_use block's Go-cased ID, Name and Input", () => {
@@ -160,7 +221,7 @@ describe("decodeBlock", () => {
       toolUseId: "tu",
       content: [
         { type: "text", text: "a" },
-        { type: "thinking", thinking: "why", signature: "s" },
+        { type: "thinking", thinking: "why", signature: "s", redacted: false },
       ],
       isError: false,
     });

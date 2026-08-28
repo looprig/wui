@@ -400,7 +400,7 @@ describe("decodeEnduring: StepDone", () => {
         {
           role: "assistant",
           blocks: [
-            { type: "thinking", thinking: "plan", signature: "sig" },
+            { type: "thinking", thinking: "plan", signature: "sig", redacted: false },
             { type: "text", text: "reading it now" },
             { type: "tool_use", id: "toolu_1", name: "Read", input: { path: "/a" } },
           ],

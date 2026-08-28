@@ -89,7 +89,15 @@ import { decodeEnduring, isZeroUUID, turnFailureText } from "./enduring.js";
 import type { Gate } from "./gate.js";
 import type { ContentBlock } from "./blocks.js";
 import type { AssistantRow, LoopInfo, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft } from "./rows.js";
-import { narrationOf, refusalOf, splitStepGroup, thinkingOf, toolResultText, toolUsesOf } from "./rows.js";
+import {
+  narrationOf,
+  redactedThinkingOf,
+  refusalOf,
+  splitStepGroup,
+  thinkingOf,
+  toolResultText,
+  toolUsesOf,
+} from "./rows.js";
 import { toolUseSummary } from "./toolsummary.js";
 
 // --- Session view -----------------------------------------------------------
@@ -733,6 +741,11 @@ function applyLiveChunk(view: SessionView, header: EventHeader | undefined, chun
       thinking: chunk.chunkType === "thinking" ? chunk.thinking : "",
       text: chunk.chunkType === "text" ? chunk.text : "",
       refusal: chunk.chunkType === "refusal" ? chunk.text : "",
+      // Never true on a live row, and not a placeholder: harness's ephemeral
+      // thinkingChunkDTO is {chunk_type, thinking} — provider state is not on
+      // the streaming wire at all — so redaction is only ever learned at the
+      // enduring commit, where the StepDone snap replaces this row anyway.
+      redactedThinking: false,
     });
   }
   const prior = view.rows[index] as AssistantRow;
@@ -989,12 +1002,18 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
       const thinking = thinkingOf(assistant.blocks);
       const text = narrationOf(assistant.blocks);
       const refusal = refusalOf(assistant.blocks);
+      const redactedThinking = redactedThinkingOf(assistant.blocks);
       let out = snapped;
       // A pure-tool step commits NO assistant row: its tool cards stand alone.
       // A truncated step is NOT special here — its notice is an ordinary text
       // block with no distinguishing tag, so it commits as narration and the
       // turn TERMINAL is what tells a truncated group from a clean one.
-      if (thinking !== "" || text !== "" || refusal !== "") {
+      //
+      // `redactedThinking` is a fourth reason to commit, not a decoration on
+      // the other three: a redacted block projects thinking === "" and matched
+      // every one of them, so a step whose ONLY content was withheld reasoning
+      // used to commit nothing at all and the turn rendered with a hole in it.
+      if (thinking !== "" || text !== "" || refusal !== "" || redactedThinking) {
         out = appendRow(out, {
           kind: "assistant",
           loopId: decoded.loopId,
@@ -1005,6 +1024,7 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           thinking,
           text,
           refusal,
+          redactedThinking,
         });
       }
       // Block order, paired by ToolUseID. The step shape is one AIMessage

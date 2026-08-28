@@ -30,22 +30,24 @@
  * by the `journalSeq` of the COMMITTING event. `ordinal` is the append order
  * and the stable React key; `journalSeq` is the ordering key within a loop.
  *
- * ## What the row layer cannot recover: redacted reasoning
+ * ## Redacted reasoning
  *
  * A redacted thinking block reaches the wire as
  * `{"ProviderState":"…","ProviderStateFormat":"anthropic","Signature":"",
  * "Thinking":"","type":"thinking"}` and an empty one as
  * `{"Signature":"","Thinking":"","type":"thinking"}` (both verbatim from
- * core@v0.6.0's codec). The two ARE distinguishable on the wire; the
- * distinction is destroyed one layer below this one, because blocks.ts
- * deliberately drops `ProviderState`/`ProviderStateFormat` — provider-private
- * continuation bytes with no reader in a browser. A row projection built over
- * decoded blocks therefore cannot mark redaction, and inventing a marker here
- * would only assert something this layer never saw. If the transcript should
- * distinguish them, the flag belongs on `ThinkingBlockValue` in blocks.ts (a
- * derived boolean, still forwarding no provider bytes), and it belongs in the
- * task that first renders reasoning — not here, where no row carries a
- * thinking block yet.
+ * core@v0.6.0's codec). The two ARE distinguishable on the wire — but the
+ * distinction was destroyed one layer below this one, because blocks.ts drops
+ * `ProviderState`/`ProviderStateFormat`: provider-private continuation bytes
+ * with no reader in a browser. This projection then saw `thinking === ""` and
+ * committed NO row for a step whose only content was redacted reasoning, so
+ * the turn rendered with a hole in it. (Tool rows always committed, so only
+ * pure-redacted steps vanished.)
+ *
+ * The fix is where it belonged: `ThinkingBlockValue.redacted`, a DERIVED
+ * boolean in blocks.ts that forwards no provider bytes. `redactedThinkingOf`
+ * projects it and `AssistantRow.redactedThinking` carries it. The bytes still
+ * never reach the browser; only the fact that something was withheld does.
  */
 import type { ContentBlock, ConversationMessage } from "./blocks.js";
 
@@ -90,6 +92,25 @@ export interface AssistantRow extends TranscriptRowCommon {
   thinking: string;
   text: string;
   refusal: string;
+  /**
+   * True when the step held reasoning the provider withheld — projected from
+   * `ThinkingBlockValue.redacted`, which is a derived boolean and NOT the
+   * provider bytes (blocks.ts still drops those; see its module comment).
+   *
+   * It is what makes such a step visible at all. A redacted block projects
+   * `thinking === ""`, so before this field a step whose ONLY content was
+   * redacted reasoning matched every emptiness test and committed no row: the
+   * turn simply had a hole in it. Tool rows always committed, so only
+   * pure-redacted steps ever vanished.
+   *
+   * Independent of `thinking`: a step can carry visible reasoning AND a
+   * redacted block, and this then means "some of this was withheld".
+   *
+   * Always false on a LIVE row. harness's ephemeral `thinkingChunkDTO` is
+   * `{chunk_type, thinking}` — provider state is not on the streaming wire at
+   * all — so redaction is only ever learned at the enduring commit.
+   */
+  redactedThinking: boolean;
 }
 
 /** One tool call's card, from request through result. */
@@ -215,14 +236,30 @@ export function narrationOf(blocks: ContentBlock[]): string {
 /**
  * The message's sealed reasoning, in block order. A REDACTED thinking block
  * projects to "" here: its content is provider-private continuation state that
- * blocks.ts deliberately drops, so this layer never saw it (rows.ts's module
- * comment records where a redaction flag would belong instead).
+ * blocks.ts deliberately drops, so this layer never saw it. That a block WAS
+ * redacted is a separate question, answered by `redactedThinkingOf`.
  */
 export function thinkingOf(blocks: ContentBlock[]): string {
   return blocks
     .filter((b): b is Extract<ContentBlock, { type: "thinking" }> => b.type === "thinking")
     .map((b) => b.thinking)
     .join("\n");
+}
+
+/**
+ * True when ANY of the message's thinking blocks withheld its content.
+ *
+ * "Any", not "all": a step that reasoned visibly and also carried a redacted
+ * block did withhold part of its reasoning, and the row says so alongside the
+ * part it can show.
+ *
+ * This reads `ThinkingBlockValue.redacted` — a derived boolean, carrying no
+ * provider bytes — so the row projection can commit a row for a step whose only
+ * content is redacted reasoning. Without it that step projects `thinking === ""`
+ * and matches every emptiness test, and the turn renders with a hole in it.
+ */
+export function redactedThinkingOf(blocks: ContentBlock[]): boolean {
+  return blocks.some((b) => b.type === "thinking" && b.redacted);
 }
 
 /**

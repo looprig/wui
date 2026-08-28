@@ -24,6 +24,7 @@ describe("@looprig/protocol public surface", () => {
       "splitStepGroup",
       "narrationOf",
       "thinkingOf",
+      "redactedThinkingOf",
       "refusalOf",
       "toolUsesOf",
       "toolResultText",
