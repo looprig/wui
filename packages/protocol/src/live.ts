@@ -1,9 +1,9 @@
 /**
  * Real `LiveFrameSource` implementation (join.ts's `() => AsyncIterable<SseFrame>`
  * contract): streams harness's live SSE event feed over `fetch()`, same-origin,
- * via the BFF's reverse proxy (`GET /api/v1/sessions/{sid}/events` ->
- * `internal/bff/events.go`'s `NewSSEProxy`, which forwards to `pkg/serve`'s
- * `GET /v1/sessions/{sid}/events`). Every request the returned source opens is a
+ * from the wui-hosted server that served the page
+ * (`GET /v1/sessions/{sid}/events`, forwarded by `wui/handler.go` to the
+ * mounted `pkg/serve` api unchanged). Every request the returned source opens is a
  * fresh subscription starting from "now" — this module carries no cursor/resume
  * logic of its own; `join.ts` owns reconciling that against cold history (see
  * its module comment, "there is no server-side resume").
@@ -56,12 +56,14 @@ import type { FetchLike } from "./transport.js";
 
 export interface FetchLiveFrameSourceOptions {
   /**
-   * Prefix the session's events path is appended to. Defaults to "/api/v1" —
-   * a same-origin, relative path inherited from the copied looprig/client SDK,
-   * where it matched that repo's BFF route (`internal/bff/mux.go` mounts the
-   * SSE proxy at "/api/v1/sessions/{sid}/events"). It is NOT HostTransport's
-   * default, which is "/v1", what wui itself serves. Overridable for tests (an
-   * absolute `http://127.0.0.1:PORT/api/v1` against a real local server).
+   * Prefix the session's events path is appended to. Defaults to "/v1" — a
+   * same-origin, relative path, the same default HostTransport uses and what
+   * `wui/handler.go` actually serves: wui forwards everything under "/v1/" it
+   * does not handle itself, the live events route included, straight to the
+   * mounted harness api. There is no BFF and no "/api" prefix; a wrong prefix
+   * here does not 404 loudly, it falls through to wui's SPA catch-all and the
+   * source parses index.html as an event stream. Overridable for tests (an
+   * absolute `http://127.0.0.1:PORT/v1` against a real local server).
    */
   baseUrl?: string;
   /** Injectable fetch implementation. Defaults to `globalThis.fetch`. */
@@ -79,7 +81,7 @@ export function createFetchLiveFrameSource(
   sessionId: string,
   options: FetchLiveFrameSourceOptions = {},
 ): LiveFrameSource {
-  const baseUrl = options.baseUrl ?? "/api/v1";
+  const baseUrl = options.baseUrl ?? "/v1";
   const fetchImpl = options.fetch ?? (globalThis.fetch.bind(globalThis) as FetchLike);
   const url = `${baseUrl}/sessions/${encodeURIComponent(sessionId)}/events`;
   return () => new FetchLiveConnection(url, fetchImpl);

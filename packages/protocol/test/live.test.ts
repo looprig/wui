@@ -1,8 +1,8 @@
 /**
  * `createFetchLiveFrameSource` coverage against REAL HTTP round trips: a tiny
- * `node:http` server stands in for the BFF's SSE proxy
- * (`internal/bff/events.go`'s `NewSSEProxy`, itself a byte-level relay of
- * harness's `pkg/serve` events endpoint), mirroring transport.test.ts's own
+ * `node:http` server stands in for the wui-hosted events route
+ * (`GET /v1/sessions/{sid}/events`, which `wui/handler.go` forwards to the
+ * mounted `pkg/serve` api unchanged), mirroring transport.test.ts's own
  * "no fetch mock, a real server" approach.
  *
  * The flagship test here ("abort unblocks a pending read...") is the one
@@ -36,7 +36,7 @@ async function startServer(handler: Handler): Promise<{ baseUrl: string; server:
   if (address === null || typeof address === "string") {
     throw new Error("expected server to bind a TCP address");
   }
-  return { baseUrl: `http://127.0.0.1:${address.port}/api/v1`, server };
+  return { baseUrl: `http://127.0.0.1:${address.port}/v1`, server };
 }
 
 /** A promise plus its resolve/reject, so a test can synchronize on a server-side event without polling. */
@@ -79,11 +79,38 @@ afterEach(async () => {
   }
 });
 
+describe("createFetchLiveFrameSource: default base URL", () => {
+  it("defaults to the same-origin /v1 prefix wui actually serves — no /api", async () => {
+    // The live plane is served by the SAME wui handler as the control plane
+    // (wui/handler.go forwards everything under /v1/ to the mounted api), so
+    // its default must be the same "/v1" HostTransport uses. "/v1" — the
+    // default inherited from the copied looprig/client SDK, whose BFF really
+    // did mount an SSE proxy there — matches nothing wui routes and falls
+    // through to the SPA catch-all, so the source would parse index.html as
+    // an SSE stream instead of failing loudly.
+    const urls: string[] = [];
+    const source = createFetchLiveFrameSource("s-1", {
+      fetch: (input) => {
+        urls.push(input);
+        return Promise.resolve(
+          new Response("", { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+        );
+      },
+    });
+
+    const iterator = source()[Symbol.asyncIterator]();
+    await iterator.next();
+    await iterator.return?.();
+
+    expect(urls).toStrictEqual(["/v1/sessions/s-1/events"]);
+  });
+});
+
 describe("createFetchLiveFrameSource: real SSE round trip", () => {
   it("streams parsed SseFrames from a real server, in order, until the server ends the response", async () => {
     const { baseUrl, server } = await startServer((req, res) => {
       expect(req.method).toBe("GET");
-      expect(req.url).toBe(`/api/v1/sessions/${sessionId}/events`);
+      expect(req.url).toBe(`/v1/sessions/${sessionId}/events`);
       expect(req.headers.accept).toBe("text/event-stream");
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       res.write(sseFrame(1));
@@ -142,7 +169,7 @@ describe("createFetchLiveFrameSource: real SSE round trip", () => {
 
   it("rejects with NetworkError (not LiveConnectionError) when the server is unreachable", async () => {
     // Nothing listens on this port: connection refused before any response.
-    const source = createFetchLiveFrameSource(sessionId, { baseUrl: "http://127.0.0.1:1/api/v1" });
+    const source = createFetchLiveFrameSource(sessionId, { baseUrl: "http://127.0.0.1:1/v1" });
     const iterator = source()[Symbol.asyncIterator]();
 
     const rejection = iterator.next();
