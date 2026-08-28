@@ -1,0 +1,335 @@
+/**
+ * §3b rule 3: "On that loop's `StepDone`, **snap**: discard the live segment
+ * and commit from `StepDone.Messages`."
+ *
+ * The snap is the load-bearing idea. A delta carries no `step_id` (harness's
+ * `stampStepID` stamps five event types and `TokenDelta` is not one of them),
+ * so the ephemeral accumulation cannot be matched to the enduring commit by any
+ * shared key — and does not have to be, because the commit REPLACES it
+ * wholesale. That is also the whole of delta/committed deduplication.
+ *
+ * It repairs an outage too: ephemeral frames carry no `journal_seq` and are
+ * never persisted, so a reconnect replays enduring frames only and the deltas
+ * emitted during the gap are simply gone. The following `StepDone` restores the
+ * step's prose from the durable record.
+ *
+ * ## Provenance of the wire strings
+ *
+ * Every `*_WIRE` constant below is the VERBATIM stdout of `event.MarshalEvent`
+ * in `github.com/looprig/harness@v0.30.0` — this module's pin, and the version
+ * `contract/VERSION` records — driven by a throwaway main constructing real
+ * `event.StepDone` values against `core@v0.6.0` / `inference@v0.12.0` (the
+ * versions the pin's module graph resolves; a bare `go mod tidy` picks
+ * v0.6.1/v0.12.1, which is NOT the pinned wire). They are parsed with
+ * JSON.parse, so these tests consume bytes rather than object literals encoding
+ * this author's beliefs about the wire.
+ *
+ * ## What that marshalling proved about the SHAPE of a step group
+ *
+ * `validateStepDoneMessages` (`pkg/event/validate.go`) runs at the durable
+ * write boundary and rejects, with `event: invalid StepDone: Messages is
+ * invalid`, every one of: empty/nil `Messages`; a group whose FIRST message is
+ * not an `*content.AIMessage`; and a group whose LATER messages are not all
+ * `*content.ToolResultMessage`. All five were attempted against the pinned
+ * marshaller and all five errored. So:
+ *
+ *  - a `StepDone` with empty messages CANNOT exist (enforced, not conventional);
+ *  - a `UserMessage` can NEVER appear in a step group, in any position — the
+ *    plan's "ignores a UserMessage inside the step group" case is an impossible
+ *    wire shape, kept below only as a defensive assertion about splitStepGroup;
+ *  - a group can carry only ONE AIMessage.
+ *
+ * A TRUNCATED step DOES emit a StepDone: a lone AIMessage whose last block is a
+ * plain TextBlock carrying `TruncatedResponseNotice` /
+ * `InterruptedResponseNotice` (harness `internal/loopruntime/truncation.go`) —
+ * with NO distinguishing tag, which is exactly why the turn TERMINAL, not this
+ * payload, is what tells a truncated group from a clean one.
+ */
+import { describe, expect, it } from "vitest";
+import { emptySessionView } from "../src/fold.js";
+import { narrationOf, refusalOf, splitStepGroup, thinkingOf, toolResultText } from "../src/rows.js";
+import { decodeMessages, type ContentBlock } from "../src/blocks.js";
+import type { EventEnvelope } from "../src/types.js";
+import {
+  LOOP_A,
+  LOOP_B,
+  TURN_1,
+  aiMessageWire,
+  envelope,
+  history,
+  liveEphemeral,
+  resetSeq,
+  textBlockWire,
+  textDelta,
+  thinkingDelta,
+} from "./helpers.js";
+import { run } from "./run.js";
+
+const STEP_ID = "55555555-5555-4555-8555-555555555555";
+
+/** Sealed reasoning plus narration — the ordinary completed step. */
+const STEP_DONE_PROSE_ONLY_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"Signature":"sig","SignatureFormat":"anthropic","Thinking":"half a thought","type":"thinking"},{"Text":"partial answer, finished","type":"text"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+/** The model declined: a refusal block, byte-identical to a text block but for its tag. */
+const STEP_DONE_REFUSAL_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"Text":"I won\'t do that","type":"refusal"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+/** A pure-tool step: one tool_use block and nothing else. */
+const STEP_DONE_PURE_TOOL_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"ID":"toolu_9","Input":{},"Name":"Bash","type":"tool_use"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+/** A truncated step: the safe prefix, then the notice — an ORDINARY text block. */
+const STEP_DONE_TRUNCATED_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"Text":"partial answ","type":"text"},{"Text":"[truncated: the stream failed before this reply completed; the content above may be incomplete]","type":"text"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+/** Two TextBlocks in one message — the join this projection performs is visible. */
+const STEP_DONE_MULTI_TEXT_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"Text":"first","type":"text"},{"Text":"second","type":"text"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+/** REDACTED reasoning: the provider bytes are the whole block; Thinking is "". */
+const STEP_DONE_REDACTED_THINKING_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"ProviderState":"opaque","ProviderStateFormat":"anthropic","Signature":"","Thinking":"","type":"thinking"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
+function wireEnvelope(json: string): EventEnvelope {
+  return JSON.parse(json) as EventEnvelope;
+}
+
+/** A StepDone built rather than marshalled, for the multi-loop/multi-step orchestration cases. */
+function stepDone(loopId: string, blocks: Array<Record<string, unknown>>, seq?: number) {
+  return history(
+    envelope({
+      type: "StepDone",
+      loopId,
+      turnId: TURN_1,
+      stepId: STEP_ID,
+      payload: { messages: [aiMessageWire(blocks)] },
+    }),
+    seq,
+  );
+}
+
+const TEXT: ContentBlock = { type: "text", text: "narration" };
+const THINK: ContentBlock = { type: "thinking", thinking: "reasoning", signature: "sig" };
+const REFUSE: ContentBlock = { type: "refusal", text: "declined" };
+const USE: ContentBlock = { type: "tool_use", id: "toolu_1", name: "Read", input: {} };
+
+describe("rows: the step-group helpers", () => {
+  it("splitStepGroup takes the FIRST assistant message and indexes tool results by ToolUseID", () => {
+    const messages = decodeMessages([
+      { role: "assistant", blocks: [textBlockWire("first")] },
+      { role: "tool", tool_use_id: "toolu_1", blocks: [textBlockWire("one")] },
+      { role: "tool", tool_use_id: "toolu_2", is_error: true, blocks: [textBlockWire("two")] },
+    ]);
+    const { assistant, results } = splitStepGroup(messages);
+    expect(assistant?.blocks).toStrictEqual([{ type: "text", text: "first" }]);
+    expect([...results.keys()]).toStrictEqual(["toolu_1", "toolu_2"]);
+    expect(results.get("toolu_2")).toMatchObject({ isError: true });
+  });
+
+  it("splitStepGroup ignores a UserMessage and a second AIMessage — neither can reach the wire", () => {
+    // validateStepDoneMessages rejects both at MarshalEvent (see the module
+    // note): this is defence against a corrupted record, not a real order.
+    const messages = decodeMessages([
+      { role: "user", blocks: [textBlockWire("folded input")] },
+      { role: "assistant", blocks: [textBlockWire("reply")] },
+      { role: "assistant", blocks: [textBlockWire("second reply")] },
+    ]);
+    const { assistant, results } = splitStepGroup(messages);
+    expect(assistant?.blocks).toStrictEqual([{ type: "text", text: "reply" }]);
+    expect(results.size).toBe(0);
+  });
+
+  it("splitStepGroup on an empty group yields no assistant and no results", () => {
+    const { assistant, results } = splitStepGroup([]);
+    expect(assistant).toBeUndefined();
+    expect(results.size).toBe(0);
+  });
+
+  it("narrationOf joins ONLY the text blocks, in block order, with a newline", () => {
+    expect(narrationOf([THINK, TEXT, USE, { type: "text", text: "more" }, REFUSE])).toBe("narration\nmore");
+    expect(narrationOf([THINK, USE, REFUSE])).toBe("");
+    expect(narrationOf([])).toBe("");
+  });
+
+  it("thinkingOf joins ONLY the thinking blocks, and reads a redacted one as empty", () => {
+    expect(thinkingOf([THINK, TEXT, { type: "thinking", thinking: "more", signature: "" }])).toBe("reasoning\nmore");
+    // A redacted block carries its content in provider-private bytes blocks.ts
+    // deliberately drops, so it projects to "" — see rows.ts's module comment.
+    expect(thinkingOf([{ type: "thinking", thinking: "", signature: "" }])).toBe("");
+  });
+
+  it("refusalOf is separate from narration, so a declined turn is never reported as an answer", () => {
+    expect(refusalOf([TEXT, REFUSE])).toBe("declined");
+    expect(narrationOf([TEXT, REFUSE])).toBe("narration");
+    expect(refusalOf([TEXT])).toBe("");
+  });
+
+  it("toolResultText concatenates the result's text blocks with NO separator and skips the rest", () => {
+    const [result] = decodeMessages([
+      {
+        role: "tool",
+        tool_use_id: "toolu_5",
+        blocks: [textBlockWire("line one\n"), { type: "image", Source: "x" }, textBlockWire("line two")],
+      },
+    ]);
+    expect(toolResultText(result)).toBe("line one\nline two");
+    expect(toolResultText(undefined)).toBe("");
+  });
+});
+
+describe("rows: the StepDone snap", () => {
+  it("discards the provisional live segment and commits from StepDone.Messages", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      thinkingDelta("half a th", LOOP_A, TURN_1),
+      textDelta("partial answ", LOOP_A, TURN_1),
+      history(wireEnvelope(STEP_DONE_PROSE_ONLY_WIRE), 11),
+    ]);
+    expect(view.rows).toStrictEqual([
+      {
+        kind: "assistant",
+        // The live row burned ordinal 0 and was discarded; ordinals are never
+        // reused, so the committed row is 1.
+        ordinal: 1,
+        loopId: LOOP_A,
+        turnId: TURN_1,
+        journalSeq: 11,
+        live: false,
+        orphanedLoop: false,
+        thinking: "half a thought",
+        text: "partial answer, finished",
+        refusal: "",
+      },
+    ]);
+  });
+
+  it("discards the loop's live TOOL rows in the same snap", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      liveEphemeral("tool_call_started", { tool_execution_id: "f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1", tool_name: "Read" }, LOOP_A, TURN_1),
+      textDelta("thinking about it", LOOP_A, TURN_1),
+      history(wireEnvelope(STEP_DONE_PROSE_ONLY_WIRE), 12),
+    ]);
+    expect(view.rows.filter((r) => r.live)).toStrictEqual([]);
+    expect(view.rows.map((r) => r.kind)).toStrictEqual(["assistant"]);
+  });
+
+  it("still appends the generic StatusEventMarker alongside the snap", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_PROSE_ONLY_WIRE), 11)]);
+    expect(view.statusEvents).toHaveLength(1);
+    expect(view.statusEvents[0]).toMatchObject({ type: "StepDone", journalSeq: 11, stepId: STEP_ID });
+  });
+
+  it("commits a refusal as its own field, never merged into narration", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_REFUSAL_WIRE), 3)]);
+    expect(view.rows).toStrictEqual([
+      {
+        kind: "assistant",
+        ordinal: 0,
+        loopId: LOOP_A,
+        turnId: TURN_1,
+        journalSeq: 3,
+        live: false,
+        orphanedLoop: false,
+        thinking: "",
+        text: "",
+        refusal: "I won't do that",
+      },
+    ]);
+  });
+
+  it("commits NO assistant row for a pure-tool step", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_PURE_TOOL_WIRE), 4)]);
+    expect(view.rows.filter((r) => r.kind === "assistant")).toStrictEqual([]);
+  });
+
+  it("commits a truncated step exactly like a clean one — the notice is ordinary narration", () => {
+    // There is no tag to read: the notice is a TextBlock. A consumer that must
+    // tell the two apart reads the turn TERMINAL (TurnFailed / TurnInterrupted),
+    // which tasks 3.20 and 3.21 project.
+    resetSeq();
+    const view = run(emptySessionView(), [
+      textDelta("partial answ", LOOP_A, TURN_1),
+      history(wireEnvelope(STEP_DONE_TRUNCATED_WIRE), 6),
+    ]);
+    expect(view.rows).toHaveLength(1);
+    expect(view.rows[0]).toMatchObject({
+      kind: "assistant",
+      live: false,
+      journalSeq: 6,
+      text:
+        "partial answ\n[truncated: the stream failed before this reply completed; the content above may be incomplete]",
+    });
+  });
+
+  it("joins several text blocks in block order rather than keeping only one", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_MULTI_TEXT_WIRE), 7)]);
+    expect(view.rows[0]).toMatchObject({ text: "first\nsecond" });
+  });
+
+  it("commits NO row for a step whose only content is REDACTED reasoning", () => {
+    // A documented consequence, not an oversight: blocks.ts drops
+    // ProviderState/ProviderStateFormat (provider-private continuation bytes
+    // with no reader in a browser), so this layer cannot see that the block
+    // held anything. rows.ts's module comment records where a redaction flag
+    // would belong if the transcript should mark it — on ThinkingBlockValue,
+    // in the task that first RENDERS reasoning, not here.
+    resetSeq();
+    const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_REDACTED_THINKING_WIRE), 8)]);
+    expect(view.rows).toStrictEqual([]);
+    expect(view.nextOrdinal).toBe(0);
+  });
+
+  it("snaps only the committing loop, leaving another loop's live segment alone", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      textDelta("child working", LOOP_B, TURN_1),
+      textDelta("parent working", LOOP_A, TURN_1),
+      stepDone(LOOP_A, [textBlockWire("parent done")]),
+    ]);
+    const b = view.rows.find((r) => r.loopId === LOOP_B);
+    expect(b).toMatchObject({ live: true, text: "child working" });
+    expect(view.rows.filter((r) => r.loopId === LOOP_A)).toStrictEqual([
+      expect.objectContaining({ live: false, text: "parent done" }),
+    ]);
+  });
+
+  it("multi-step turns render as multiple separate assistant rows, never one merged row", () => {
+    resetSeq();
+    const view = run(emptySessionView(), [
+      stepDone(LOOP_A, [textBlockWire("step one")], 1),
+      stepDone(LOOP_A, [textBlockWire("step two")], 2),
+    ]);
+    expect(view.rows.map((r) => (r.kind === "assistant" ? r.text : r.kind))).toStrictEqual([
+      "step one",
+      "step two",
+    ]);
+    expect(view.rows.map((r) => r.journalSeq)).toStrictEqual([1, 2]);
+  });
+
+  it("leaves already-committed rows' identities alone, which per-row selectors depend on", () => {
+    resetSeq();
+    const first = run(emptySessionView(), [stepDone(LOOP_A, [textBlockWire("one")], 1)]);
+    const committed = first.rows[0];
+    const second = run(first, [stepDone(LOOP_A, [textBlockWire("two")], 2)]);
+    expect(second.rows[0], "an untouched row was re-created, so every card would re-render").toBe(committed);
+  });
+
+  it("commits nothing for a messages-less StepDone, which the durable boundary cannot produce", () => {
+    // validateStepDoneMessages rejects an empty Messages at MarshalEvent, so
+    // this is unreachable from harness; it must still not throw or half-commit.
+    resetSeq();
+    const view = run(emptySessionView(), [
+      textDelta("in flight", LOOP_A, TURN_1),
+      history(envelope({ type: "StepDone", loopId: LOOP_A, turnId: TURN_1 }), 9),
+    ]);
+    // The snap still happens: the live segment belonged to a step that has now
+    // ended, and keeping it would dangle it into the next step.
+    expect(view.rows).toStrictEqual([]);
+  });
+});

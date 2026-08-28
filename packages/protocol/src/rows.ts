@@ -43,7 +43,7 @@
  * task that first renders reasoning — not here, where no row carries a
  * thinking block yet.
  */
-import type { ContentBlock } from "./blocks.js";
+import type { ContentBlock, ConversationMessage } from "./blocks.js";
 
 export type NoticeLevel = "info" | "warn" | "error";
 export type ToolRowStatus = "running" | "ok" | "error" | "cancelled";
@@ -127,3 +127,87 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 
 /** A row with everything but its ordinal, which only the committing fold allocates. */
 export type TranscriptRowDraft = DistributiveOmit<TranscriptRow, "ordinal">;
+
+/**
+ * Splits a `StepDone` group the way tui's `splitStepGroup` does: the step shape
+ * is one AIMessage followed by zero or more ToolResultMessages, indexed by
+ * `ToolUseID`.
+ *
+ * `validateStepDoneMessages` enforces exactly that shape at harness's durable
+ * write boundary — a group whose first message is not an AIMessage, or whose
+ * later messages are not all ToolResultMessages, is REJECTED by MarshalEvent —
+ * so a UserMessage in a step group and a second AIMessage are both unreachable
+ * from harness. They are still handled: a UserMessage is IGNORED (the
+ * transcript commits user input from its own TurnStarted / TurnFoldedInto, or
+ * it would render twice) and the FIRST AIMessage wins, so a corrupted record
+ * degrades instead of throwing.
+ */
+export function splitStepGroup(messages: ConversationMessage[]): {
+  assistant: ConversationMessage | undefined;
+  results: Map<string, ConversationMessage>;
+} {
+  let assistant: ConversationMessage | undefined;
+  const results = new Map<string, ConversationMessage>();
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      if (assistant === undefined) assistant = message;
+    } else if (message.role === "tool") {
+      results.set(message.toolUseId, message);
+    }
+  }
+  return { assistant, results };
+}
+
+/**
+ * Concatenates ONLY the TextBlocks, in block order, joined by "\n" — tui's
+ * `textOnly`. Thinking blocks render as their own rail and tool-use blocks as
+ * their own cards, so neither belongs in the narration; a refusal is excluded
+ * for a stronger reason (see refusalOf).
+ */
+export function narrationOf(blocks: ContentBlock[]): string {
+  return blocks
+    .filter((b): b is Extract<ContentBlock, { type: "text" }> => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+}
+
+/**
+ * The message's sealed reasoning, in block order. A REDACTED thinking block
+ * projects to "" here: its content is provider-private continuation state that
+ * blocks.ts deliberately drops, so this layer never saw it (rows.ts's module
+ * comment records where a redaction flag would belong instead).
+ */
+export function thinkingOf(blocks: ContentBlock[]): string {
+  return blocks
+    .filter((b): b is Extract<ContentBlock, { type: "thinking" }> => b.type === "thinking")
+    .map((b) => b.thinking)
+    .join("\n");
+}
+
+/**
+ * A refusal is never folded into narration: `narrationOf` sees only TextBlocks,
+ * so a step whose message is nothing but a refusal would otherwise produce no
+ * row at all and the transcript would show a declined turn as a turn with no
+ * answer. A RefusalBlock's payload is byte-identical to a TextBlock's — the tag
+ * is the only thing that distinguishes them.
+ */
+export function refusalOf(blocks: ContentBlock[]): string {
+  return blocks
+    .filter((b): b is Extract<ContentBlock, { type: "refusal" }> => b.type === "refusal")
+    .map((b) => b.text)
+    .join("\n");
+}
+
+/**
+ * Flattens a ToolResultMessage's TextBlocks into one display string, with NO
+ * separator: the loop builds a result carrying a single flattened TextBlock, so
+ * a join would insert a newline that was never in the output. Non-text blocks
+ * have no display form here and are skipped; an absent message yields "".
+ */
+export function toolResultText(message: ConversationMessage | undefined): string {
+  if (message === undefined) return "";
+  return message.blocks
+    .filter((b): b is Extract<ContentBlock, { type: "text" }> => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+}

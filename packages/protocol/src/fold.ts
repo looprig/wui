@@ -85,6 +85,7 @@ import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "./sse.js";
 import { decodeEnduring, isZeroUUID } from "./enduring.js";
 import type { Gate } from "./gate.js";
 import type { AssistantRow, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft } from "./rows.js";
+import { narrationOf, refusalOf, splitStepGroup, thinkingOf } from "./rows.js";
 
 // --- Session view -----------------------------------------------------------
 
@@ -772,6 +773,45 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
         }),
       };
     }
+    case "StepDone": {
+      // SNAP. The enduring commit replaces the ephemeral accumulation
+      // WHOLESALE, which is why a delta needs no step_id: it always belongs to
+      // its loop's CURRENT in-flight step, so deduplication needs no shared key
+      // at all. It is also the repair for an outage — ephemeral frames carry no
+      // journal_seq and are never persisted, so the deltas emitted while a
+      // client was disconnected are simply gone, and this is what restores the
+      // step's prose from the durable record.
+      //
+      // The discard happens even when the group commits nothing, which the
+      // durable boundary cannot actually produce (validateStepDoneMessages
+      // rejects an empty Messages): the segment belonged to a step that has
+      // ended, and keeping it would dangle it into the next one.
+      const snapped = dropLiveRows(next, decoded.loopId);
+      const { assistant } = splitStepGroup(decoded.payload.messages);
+      if (assistant === undefined) return { ok: true, view: snapped };
+      const thinking = thinkingOf(assistant.blocks);
+      const text = narrationOf(assistant.blocks);
+      const refusal = refusalOf(assistant.blocks);
+      // A pure-tool step commits no assistant row: its tool cards stand alone.
+      // A truncated step is NOT special here — its notice is an ordinary text
+      // block with no distinguishing tag, so it commits as narration and the
+      // turn TERMINAL is what tells a truncated group from a clean one.
+      if (thinking === "" && text === "" && refusal === "") return { ok: true, view: snapped };
+      return {
+        ok: true,
+        view: appendRow(snapped, {
+          kind: "assistant",
+          loopId: decoded.loopId,
+          turnId: decoded.turnId,
+          journalSeq,
+          live: false,
+          orphanedLoop: false,
+          thinking,
+          text,
+          refusal,
+        }),
+      };
+    }
     case "GateOpened": {
       // Copy-on-write, like every other branch here: fold() must never mutate
       // the view it was handed (test/fold-immutability.test.ts pins that, and
@@ -802,6 +842,17 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
  * append and adds the compensating assertion; the row objects stay
  * copy-on-write regardless.
  */
+/**
+ * Drops every live row belonging to `loopId`, leaving other loops untouched —
+ * the discard half of the StepDone snap. Rows that survive are carried over BY
+ * REFERENCE, so a per-row Object.is selector does not re-render them, and a
+ * loop with nothing live returns the very same view.
+ */
+function dropLiveRows(view: SessionView, loopId: string): SessionView {
+  if (!view.rows.some((r) => r.live && r.loopId === loopId)) return view;
+  return { ...view, rows: view.rows.filter((r) => !(r.live && r.loopId === loopId)) };
+}
+
 function appendRow(view: SessionView, draft: TranscriptRowDraft): SessionView {
   const committed = { ...draft, ordinal: view.nextOrdinal };
   return { ...view, rows: [...view.rows, committed], nextOrdinal: view.nextOrdinal + 1 };
