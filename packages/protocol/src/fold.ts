@@ -84,7 +84,7 @@ import type { EphemeralFrame, EventEnvelope, EventHeader, StatusEvent } from "./
 import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "./sse.js";
 import { decodeEnduring, isZeroUUID } from "./enduring.js";
 import type { Gate } from "./gate.js";
-import type { TranscriptRow, TranscriptRowDraft } from "./rows.js";
+import type { AssistantRow, TranscriptRow, TranscriptRowDraft } from "./rows.js";
 
 // --- Session view -----------------------------------------------------------
 
@@ -387,6 +387,94 @@ function findToolCallCardIndex(view: SessionView, toolExecutionId: string | unde
   return view.toolCalls.findIndex((c) => c.toolExecutionId === toolExecutionId);
 }
 
+// --- The live segment (design §3b rule 3) ---------------------------------------
+
+/**
+ * The loop's live assistant row: the in-flight turn's provisional prose. There
+ * is at most ONE per loop, and it is DISCARDED WHOLESALE at that loop's
+ * StepDone (the snap) or committed at a turn terminal.
+ *
+ * That wholesale replacement is what makes the absent `step_id` irrelevant.
+ * harness's `stampStepID` stamps `StepID` on exactly five event types and
+ * `TokenDelta` is not one of them — `stampLoopHeader` fills a TokenDelta header
+ * turn-scoped, so a delta carries session/loop/turn and no step. A delta
+ * therefore cannot be grouped by step; it does not need to be, because it
+ * always belongs to its loop's CURRENT in-flight step, and the enduring commit
+ * replaces the accumulation rather than merging with it. Deduplication needs no
+ * shared key at all.
+ */
+function liveAssistantIndex(view: SessionView, loopId: string): number {
+  return view.rows.findIndex((r) => r.live && r.loopId === loopId && r.kind === "assistant");
+}
+
+/**
+ * Replaces the row at `index` with `next`. COPY-ON-WRITE: the row object is
+ * REPLACED, never mutated, so a `useSyncExternalStore` per-row selector
+ * comparing with `Object.is` actually re-renders. Mutating in place would leave
+ * the row identity unchanged and the update would never reach the screen. See
+ * rows.ts's module comment, and test/rows.test.ts's Object.freeze guard, which
+ * catches even a write-through that preserves the value.
+ */
+function replaceRow(view: SessionView, index: number, next: TranscriptRow): SessionView {
+  const rows = [...view.rows];
+  rows[index] = next;
+  return { ...view, rows };
+}
+
+/** The producing loop of an ephemeral frame; "" for a session-scoped frame. */
+function frameLoopId(header: EventHeader | undefined): string {
+  return header?.loop_id ?? "";
+}
+
+/**
+ * The producing turn of an ephemeral frame; "" when the frame carries none.
+ * Every frame the live segment folds is turn-scoped on the wire
+ * (`fillTurnScoped` stamps TokenDelta, ToolCallStarted and ToolCallCompleted
+ * with the loop's active TurnID), so this is normally populated — it is what
+ * lets a turn terminal commit a live row that already knows its turn.
+ */
+function frameTurnId(header: EventHeader | undefined): string {
+  return header?.turn_id ?? "";
+}
+
+/**
+ * Folds one streamed chunk into the loop's live assistant segment, creating the
+ * segment when the loop has none.
+ *
+ * A `tool_use` chunk is deliberately skipped: it is the model's in-progress
+ * tool-call CONSTRUCTION (index/id/name/partial JSON — harness's
+ * `toolUseChunkDTO`), not an execution, and it has no committable display form.
+ * The `tool_call_started`/`tool_call_completed` frames drive the live tool card
+ * instead. It still reaches `view.content`, and it never burns an ordinal.
+ *
+ * An extending chunk keeps the segment's `ordinal` (its stable render key) and
+ * the `turnId` it opened with.
+ */
+function applyLiveChunk(view: SessionView, header: EventHeader | undefined, chunk: TokenDeltaChunk): SessionView {
+  if (chunk.chunkType === "tool_use") return view;
+  const loopId = frameLoopId(header);
+  const index = liveAssistantIndex(view, loopId);
+  if (index === -1) {
+    return appendRow(view, {
+      kind: "assistant",
+      loopId,
+      turnId: frameTurnId(header),
+      journalSeq: undefined,
+      live: true,
+      orphanedLoop: false,
+      thinking: chunk.chunkType === "thinking" ? chunk.thinking : "",
+      text: chunk.chunkType === "text" ? chunk.text : "",
+      refusal: "",
+    });
+  }
+  const prior = view.rows[index] as AssistantRow;
+  const next: AssistantRow =
+    chunk.chunkType === "thinking"
+      ? { ...prior, thinking: prior.thinking + chunk.thinking }
+      : { ...prior, text: prior.text + chunk.text };
+  return replaceRow(view, index, next);
+}
+
 // --- Ephemeral fold -----------------------------------------------------------
 
 /**
@@ -404,7 +492,8 @@ function foldEphemeral(view: SessionView, frame: EphemeralFrame): FoldResult {
       const parsed = parseTokenDeltaChunk(delta);
       if (!parsed.ok) return parsed;
       const entry: ContentDelta = { ...parsed.value, header };
-      return { ok: true, view: { ...view, content: [...view.content, entry] } };
+      const withContent: SessionView = { ...view, content: [...view.content, entry] };
+      return { ok: true, view: applyLiveChunk(withContent, header, parsed.value) };
     }
 
     case "tool_call_started": {

@@ -22,6 +22,8 @@ export const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 export const LOOP_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 export const LOOP_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 export const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
+export const TURN_1 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+export const TURN_2 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
 export interface EnvelopeOptions {
   type: string;
@@ -75,9 +77,17 @@ export function liveEnduring(env: EventEnvelope, journalSeq?: number): FoldInput
   };
 }
 
-export function header(loopId?: string): EventHeader {
+/**
+ * One ephemeral frame header. `turn_id` is a real wire field on every frame the
+ * live segment folds: harness's stampLoopHeader fills a TokenDelta,
+ * ToolCallStarted and ToolCallCompleted header with fillTurnScoped
+ * (SessionID + LoopID + TurnID), and the tool pair additionally carries the
+ * StepID stampStepID stamps. `event_header.schema.json` declares all of them.
+ */
+export function header(loopId?: string, turnId?: string): EventHeader {
   const h: Record<string, unknown> = { session_id: SESSION_ID };
   if (loopId !== undefined) h["loop_id"] = loopId;
+  if (turnId !== undefined) h["turn_id"] = turnId;
   return h as unknown as EventHeader;
 }
 
@@ -86,22 +96,23 @@ export function liveEphemeral(
   kind: string,
   delta: Record<string, unknown> | undefined,
   loopId?: string,
+  turnId?: string,
 ): FoldInput {
   const frameData: Record<string, unknown> = { kind };
   if (delta !== undefined) frameData["delta"] = delta;
-  if (loopId !== undefined) frameData["header"] = header(loopId);
+  if (loopId !== undefined || turnId !== undefined) frameData["header"] = header(loopId, turnId);
   return {
     segment: "live",
     frame: { type: "ephemeral", data: frameData as unknown as EphemeralFrame },
   };
 }
 
-export function textDelta(text: string, loopId?: string): FoldInput {
-  return liveEphemeral("token_delta", { chunk_type: "text", text }, loopId);
+export function textDelta(text: string, loopId?: string, turnId?: string): FoldInput {
+  return liveEphemeral("token_delta", { chunk_type: "text", text }, loopId, turnId);
 }
 
-export function thinkingDelta(thinking: string, loopId?: string): FoldInput {
-  return liveEphemeral("token_delta", { chunk_type: "thinking", thinking }, loopId);
+export function thinkingDelta(thinking: string, loopId?: string, turnId?: string): FoldInput {
+  return liveEphemeral("token_delta", { chunk_type: "thinking", thinking }, loopId, turnId);
 }
 
 /** A Go-cased text content block, as core/content.TextBlock encodes. */
