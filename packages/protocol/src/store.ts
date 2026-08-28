@@ -88,8 +88,19 @@ export interface SessionViewStoreOptions {
   journal: JournalReader;
   sessionId: string;
   liveSource: LiveFrameSource;
-  /** Forwarded to `joinSessionView`. `signal` is always this store's own (see `stop()`). */
-  join?: Omit<JoinOptions, "signal">;
+  /**
+   * Forwarded to `joinSessionView`. `signal` is always this store's own (see
+   * `stop()`), and the queue bound is owned by `maxQueuedFrames` below so its
+   * overflow lands on this store's error channel — all three are excluded from
+   * the caller's reach rather than silently overridden.
+   */
+  join?: Omit<JoinOptions, "signal" | "maxQueuedFrames" | "onQueueOverflow">;
+  /**
+   * Upper bound on live frames buffered ahead of the fold. Defaults to
+   * `DEFAULT_MAX_QUEUED_FRAMES`. Overflow is reported on `subscribeErrors`; see
+   * `selectFrameToDrop` for the drop policy.
+   */
+  maxQueuedFrames?: number;
   scheduler?: FrameScheduler;
 }
 
@@ -109,6 +120,16 @@ export class SessionViewStore {
   private abortController: AbortController | undefined;
   private cancelActive: (() => void) | undefined;
   private offVisibility: (() => void) | undefined;
+  /**
+   * The next cumulative drop count worth reporting. Overflow is reported on a
+   * DOUBLING schedule — the 1st, 2nd, 4th, 8th ... dropped frame — rather than
+   * once per drop: a sustained overload drops thousands of frames, and
+   * notifying a subscriber thousands of times on an already-overloaded main
+   * thread makes the very condition being reported worse. The count is
+   * cumulative, so each report supersedes the last and nothing is understated,
+   * and the number of reports stays logarithmic in the size of the gap.
+   */
+  private nextOverflowReport = 1;
 
   constructor(options: SessionViewStoreOptions) {
     this.options = options;
@@ -166,6 +187,7 @@ export class SessionViewStore {
     if (this.active) return;
     this.active = true;
     this.current = this.options.join?.initialView ?? emptySessionView();
+    this.nextOverflowReport = 1;
     const generation = ++this.generation;
 
     const abortController = new AbortController();
@@ -196,6 +218,16 @@ export class SessionViewStore {
         ...this.options.join,
         autoReconnect: this.options.join?.autoReconnect ?? true,
         signal: abortController.signal,
+        ...(this.options.maxQueuedFrames === undefined
+          ? {}
+          : { maxQueuedFrames: this.options.maxQueuedFrames }),
+        onQueueOverflow: (droppedTotal) => {
+          if (generation !== this.generation || droppedTotal < this.nextOverflowReport) return;
+          this.nextOverflowReport = droppedTotal * 2;
+          this.emitError(
+            new Error(`live frame queue overflow: ${droppedTotal} live frame(s) dropped`),
+          );
+        },
       },
     );
     void this.pump(generator, generation);

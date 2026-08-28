@@ -98,6 +98,19 @@
  * affects ordering among already-unordered content, never loss or
  * duplication.
  *
+ * ## Backpressure: the buffer is BOUNDED, and drops are reported
+ *
+ * `AsyncQueue.push()` below never blocks, so without a bound the buffer grows
+ * for exactly as long as the network outruns `fold` — which, on a busy main
+ * thread, means until the tab dies. The bound has to be HERE and cannot be a
+ * wrapper the caller puts around `liveSource`: `pumpLiveConnection` is a
+ * trivial relay that awaits the source and immediately pushes, so it is never
+ * itself the slow stage. A wrapper upstream of it would never see any backlog
+ * at all (its own buffer would never exceed one frame) while this queue grew
+ * without limit behind it. `options.maxQueuedFrames` caps this queue and
+ * `options.onQueueOverflow` reports every drop; `selectFrameToDrop` states the
+ * policy.
+ *
  * ## Reconnect
  *
  * `options.autoReconnect` (default `false`) controls what happens when this
@@ -192,6 +205,19 @@ export interface JoinOptions {
    * `0` to retry immediately (e.g. in a test that doesn't want to wait).
    */
   reconnectDelayMs?: number;
+  /**
+   * Upper bound on live frames buffered ahead of the fold, per connection.
+   * Default `DEFAULT_MAX_QUEUED_FRAMES`. See `selectFrameToDrop` for the drop
+   * policy and the "Backpressure" section of this module's comment for why the
+   * bound has to live here rather than in a wrapper around `liveSource`.
+   */
+  maxQueuedFrames?: number;
+  /**
+   * Called once per dropped frame with the CUMULATIVE number this join has
+   * dropped, so a consumer can surface the gap instead of silently losing
+   * content. Never called while the buffer stays under the bound.
+   */
+  onQueueOverflow?: (droppedTotal: number) => void;
   /** Aborts the join. Checked between steps; does not preempt an in-flight `readHistory`/live `next()` call already awaited (those should honor their own cancellation, e.g. via `RequestOptions.signal` on the transport call a caller wires up). Also cuts short an in-progress error-triggered reconnect delay. */
   signal?: AbortSignal;
 }
@@ -229,7 +255,11 @@ export async function* joinSessionView(
     if (signal?.aborted) return;
 
     // --- Step 1: subscribe live FIRST. Buffering starts the instant liveSource() returns. ---
-    const queue = new AsyncQueue<SseFrame>();
+    const queue = new AsyncQueue<SseFrame>({
+      max: options.maxQueuedFrames ?? DEFAULT_MAX_QUEUED_FRAMES,
+      selectVictim: selectFrameToDrop,
+      onDrop: (droppedTotal) => options.onQueueOverflow?.(droppedTotal),
+    });
     const liveIterator = liveSource()[Symbol.asyncIterator]();
     const pumpDone = pumpLiveConnection(liveIterator, queue);
 
@@ -344,6 +374,47 @@ export async function* joinSessionView(
   }
 }
 
+/**
+ * Default cap on live frames buffered ahead of the fold, per connection.
+ * Roughly eight seconds of a fast token stream: long enough to ride out a
+ * multi-second main-thread stall without dropping anything, short enough that
+ * the buffer is a bounded, bounded-size object rather than a leak.
+ */
+export const DEFAULT_MAX_QUEUED_FRAMES = 512;
+
+/**
+ * Which buffered frame to evict when the live queue is over its bound, as an
+ * index into `frames` (oldest first). This is the drop policy, stated:
+ *
+ *  1. `heartbeat` — a pure keepalive carrying no content at all. Free to drop.
+ *  2. `ephemeral` — unsequenced, best-effort content. Losing one is ALREADY a
+ *     tolerated condition: a reconnect replays enduring frames only, so deltas
+ *     emitted during an outage are lost regardless, and the following
+ *     `StepDone` snaps the live segment wholesale and repairs the transcript
+ *     (design §9).
+ *  3. `enduring` — the durable content, and it has NO such repair: the tip
+ *     filter will not re-deliver it and the reconnect cursor advances past it
+ *     once a later frame is applied. Dropping one leaves a real gap, which is
+ *     why it goes only after every ephemeral frame is gone, and why every drop
+ *     is reported through `onQueueOverflow`.
+ *  4. `error` — dropped last, because a dropped error is a silent failure. It
+ *     is not dropped NEVER, though: a queue that grows without limit kills the
+ *     tab, which is strictly worse than a reported gap, and the overflow report
+ *     itself keeps the loss from being silent.
+ *
+ * Oldest-first within each class, so the queue always keeps the most recent
+ * state — which is what the consumer is about to render.
+ */
+export function selectFrameToDrop(frames: readonly SseFrame[]): number {
+  for (const type of FRAME_EVICTION_ORDER) {
+    const index = frames.findIndex((frame) => frame.type === type);
+    if (index !== -1) return index;
+  }
+  return 0;
+}
+
+const FRAME_EVICTION_ORDER: ReadonlyArray<SseFrame["type"]> = ["heartbeat", "ephemeral", "enduring", "error"];
+
 // --- Internals ------------------------------------------------------------------
 
 /**
@@ -394,18 +465,41 @@ function toJoinEvent(result: FoldResult, input: FoldInput, view: SessionView): J
  * comment; `AsyncQueue` itself only guarantees each item is handed to the
  * caller exactly once, not which of the two loops that happens to be.)
  */
+interface QueueBound<T> {
+  /** Maximum buffered items. Exceeding it evicts until the buffer is back at the bound. */
+  max: number;
+  /** Index of the item to evict, oldest-first within the caller's own priority. */
+  selectVictim: (items: readonly T[]) => number;
+  /** Called once per eviction with the cumulative count dropped by this queue. */
+  onDrop: (droppedTotal: number) => void;
+}
+
 class AsyncQueue<T> {
   private readonly items: T[] = [];
   private readonly waiters: Array<{ resolve: (r: IteratorResult<T, undefined>) => void; reject: (e: unknown) => void }> = [];
   private closed = false;
   private closeError: unknown;
   private hasCloseError = false;
+  private dropped = 0;
+
+  constructor(private readonly bound: QueueBound<T>) {}
 
   push(item: T): void {
     if (this.closed) return; // a well-behaved pump never pushes after close; ignored defensively rather than throwing
     const waiter = this.waiters.shift();
-    if (waiter) waiter.resolve({ value: item, done: false });
-    else this.items.push(item);
+    if (waiter) {
+      waiter.resolve({ value: item, done: false });
+      return;
+    }
+    this.items.push(item);
+    // Only a BUFFERED item can overflow: an item handed straight to a waiting
+    // consumer never occupies the buffer at all.
+    while (this.items.length > this.bound.max) {
+      const victim = this.bound.selectVictim(this.items);
+      this.items.splice(victim >= 0 && victim < this.items.length ? victim : 0, 1);
+      this.dropped += 1;
+      this.bound.onDrop(this.dropped);
+    }
   }
 
   /** Marks the queue closed. `error`, if provided, is thrown by every subsequent (and any currently-pending) `next()` call once the buffer is exhausted. */
