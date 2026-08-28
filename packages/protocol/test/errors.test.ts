@@ -77,7 +77,7 @@ describe("errorFromResponse maps the two BFF-local codes to dedicated, mutually-
   // internal/bff-local — see schema.ts's bffErrorResponseSchema doc — never
   // emitted by serve), so this constructs BFFErrorResponse values by hand
   // and validates them through validateBFFErrorResponse (the wider
-  // validator BFFTransport's request plumbing actually uses), rather than
+  // validator HostTransport's request plumbing actually uses), rather than
   // reading a fixture file the way the fixture-backed cases above do.
   it("csrf_invalid produces a CSRFRejectedError with retryable: true", () => {
     const raw = { error: { code: "csrf_invalid", message: "missing or invalid CSRF token", retryable: true } };

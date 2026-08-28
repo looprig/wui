@@ -66,7 +66,7 @@ describe("schema mirrors match the vendored contract", () => {
 // codes" — and nothing was checking that promise. Vendoring harness v0.30.0
 // proved the cost: serve had added `unauthorized`, both enums silently lacked
 // it, and only the mirror (which §1 does cover) failed. Had `unauthorized`
-// arrived in a release that changed nothing else, BFFTransport would have
+// arrived in a release that changed nothing else, HostTransport would have
 // rejected a legitimate 401 envelope as invalid at runtime with §1 still green.
 
 describe("the BFF error superset tracks the vendored error codes", () => {

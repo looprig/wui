@@ -1,9 +1,11 @@
 /**
- * `ServeTransport`-only coverage: the bearer-token auth header behavior that
- * has no BFFTransport equivalent (a browser transport carries no credential
- * of its own — see transport.ts's module doc), so it doesn't belong in the
- * shared conformance suite (conformance.test.ts), which is deliberately only
- * the intersection every LooprigTransport implementation must satisfy.
+ * `ServeTransport`-only coverage: the two ways it deliberately differs from
+ * `HostTransport` — it DOES send a bearer token (a browser transport carries no
+ * credential of its own) and it does NOT send a CSRF token (nothing guards a
+ * bare `pkg/serve` endpoint; wui's CSRFGuard sits in front of a wui-hosted
+ * server only). Neither belongs in the shared conformance suite
+ * (conformance.test.ts), which is deliberately only the intersection every
+ * LooprigTransport implementation must satisfy.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
@@ -98,5 +100,31 @@ describe("ServeTransport authorization", () => {
 
     const transport = new ServeTransport({ baseUrl });
     await transport.listSessions();
+  });
+});
+
+describe("ServeTransport carries no CSRF token", () => {
+  it("sends no X-CSRF-Token on a control (POST) request and never mints one", async () => {
+    // The non-browser path must stay unaffected by HostTransport's CSRF
+    // carriage. If the mint/echo were ever hoisted into the shared
+    // HttpTransport plumbing instead of overridden per subclass, this test
+    // fails: a request would appear at /v1/csrf-token, and the POST would
+    // carry the header. Assertions are made on a recorded log AFTER the call
+    // settles, never inside the handler.
+    const seen: { method: string; path: string; csrf: string | undefined }[] = [];
+    const { baseUrl, server } = await startServer((req, res) => {
+      const header = req.headers["x-csrf-token"];
+      seen.push({
+        method: req.method ?? "",
+        path: req.url ?? "",
+        csrf: typeof header === "string" ? header : undefined,
+      });
+      sendJSON(res, 201, readFixture("create_idle.json"));
+    });
+    activeServer = server;
+
+    await new ServeTransport({ baseUrl, token: "secret-token" }).createSession();
+
+    expect(seen).toStrictEqual([{ method: "POST", path: "/v1/sessions", csrf: undefined }]);
   });
 });

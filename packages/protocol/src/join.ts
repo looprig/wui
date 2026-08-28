@@ -161,7 +161,7 @@ import type { ReadHistoryOptions } from "./transport.js";
 /**
  * The subset of `LooprigTransport` the join needs — cold journal paging
  * only. Kept narrow (interface segregation): a caller wiring this up from a
- * real `LooprigTransport`/`BFFTransport` needs no adapter (both already
+ * real `LooprigTransport`/`HostTransport` needs no adapter (both already
  * structurally satisfy this), and a test double only has to implement one
  * method.
  */

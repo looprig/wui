@@ -244,9 +244,9 @@ export const errorResponseSchema = {
  * `internal/bff/csrf.go` mint locally when THEY reject a request, before it
  * ever reaches serve (see those two files' doc comments, and errors.go's).
  *
- * BFFTransport (transport.ts) is the only client that can ever observe these
+ * HostTransport (transport.ts) is the only client that can ever observe these
  * two codes — ServeTransport talks directly to serve, bypassing the BFF's
- * own middleware entirely — so BFFTransport's request plumbing validates
+ * own middleware entirely — so HostTransport's request plumbing validates
  * every non-2xx body against THIS schema, not the narrower vendored
  * `errorResponseSchema` above. This schema is intentionally excluded from
  * `allSchemas` below: the drift-guard test (`test/contract.test.ts`) asserts

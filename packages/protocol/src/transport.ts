@@ -11,26 +11,25 @@
  * (`HttpTransport` below), differing only in base URL and how (if at all)
  * they authenticate:
  *
- *  - `BFFTransport` — for same-origin browser apps: calls relative
- *    `/api/v1/...` paths on looprig/client's own BFF (`internal/bff/mux.go`),
- *    which strips "/api" and forwards to harness's `pkg/serve`. A browser
- *    never holds a token itself; the BFF (already authenticated, cookie/
- *    session-scoped) injects the real server-side bearer token
- *    (`internal/bff/tokencustody.go`) on the outbound leg. BFFTransport
- *    itself therefore carries no credential.
+ *  - `HostTransport` — for the browser, talking to the wui-hosted server that
+ *    served the page: calls relative, same-origin `/v1/...` paths. wui has no
+ *    backend-for-frontend — the process serving the SPA is the process holding
+ *    the rig — so these are harness `pkg/serve`'s own unprefixed routes,
+ *    reached through wui's guards (`wui/handler.go`). A browser holds no
+ *    credential of its own here, but it DOES hold a CSRF token: see the CSRF
+ *    paragraph below. This is the transport a wui-hosted app constructs
+ *    (`createHostTransport`, client.ts).
  *  - `ServeTransport` — for trusted/server-side/custom callers (a non-browser
- *    Node/CLI consumer, a backend job, a test harness) that talk DIRECTLY to
- *    `pkg/serve`'s own unprefixed `/v1/...` routes, bypassing the BFF
- *    entirely. Such a caller DOES hold a credential, so ServeTransport
+ *    Node/CLI consumer, a backend job, a test harness) that talk DIRECTLY to a
+ *    `pkg/serve` endpoint, with no wui in front of it and therefore no CSRF
+ *    guard to satisfy. Such a caller DOES hold a credential, so ServeTransport
  *    accepts an optional bearer token and sends `Authorization: Bearer
- *    <token>` on every request — the same convention the BFF's own control
- *    proxy uses when IT talks to serve as a trusted caller
- *    (`internal/bff/tokencustody.go`'s `setOutboundAuthorization`). serve's
- *    own auth is a pluggable `func(*http.Request) error`
- *    (`pkg/serve/options.go`'s `WithAuth`), so a deployment is free to demand
- *    something else entirely; a caller in that position can inject a custom
- *    `fetch` that attaches its own headers instead of using the `token`
- *    option.
+ *    <token>` on every request. serve's own auth is a pluggable
+ *    `func(*http.Request) error` (`pkg/serve/options.go`'s `WithAuth`), so a
+ *    deployment is free to demand something else entirely; a caller in that
+ *    position can inject a custom `fetch` that attaches its own headers
+ *    instead of using the `token` option. NOT for browsers: it carries a
+ *    bearer token, and (correctly) no CSRF token.
  *
  * Every response body is parsed through the ajv validators from validate.ts
  * before being returned — never cast with `as` — and every non-2xx response
@@ -39,21 +38,33 @@
  * construction: they share the same protected/private request plumbing, not
  * just the same intent independently reimplemented.
  *
- * CSRF (control-plane only): BFFTransport sits behind internal/bff's
- * HostOriginGuard AND CSRFGuard (guard.go, csrf.go) — every control-plane
- * (POST) request must carry a valid `X-CSRF-Token` header, obtained from
- * `GET /api/v1/csrf-token` (csrf.go's TokenHandler). BFFTransport fetches
- * that token lazily (on the FIRST control request, never eagerly at
- * construction — `createBFFClient()` is used as a synchronous Svelte prop
- * default, see app/src/routes/sessions/+page.svelte), caches it in memory
- * (never a cookie — see csrf.go's package doc on why an independent,
- * header-carried token is the whole point), shares one in-flight mint
- * promise across concurrent callers, and retries a `CSRFRejectedError`
- * exactly once (clear the cached token, re-mint, replay the identical
- * request) — see `HttpTransport.postJSON`'s CSRF-retry hook and
- * `BFFTransport.controlHeaders`/`beforeCSRFRetry` below. ServeTransport talks
- * directly to `pkg/serve`, bypassing the BFF (and CSRF) entirely, so its
- * `controlHeaders` stays the base no-op.
+ * CSRF (control-plane only): HostTransport sits behind wui's HostOriginGuard
+ * AND CSRFGuard (`wui/guard.go`, `wui/csrf.go`). `wui/handler.go` wraps the
+ * five state-changing control routes — `POST /v1/sessions`, `.../restore`,
+ * `.../input`, `.../interrupt`, `.../gates/{gid}` — in `CSRFGuard.Wrap`, which
+ * rejects any of them arriving without a live token in `X-CSRF-Token` with a
+ * 403 `csrf_invalid`. Without the client half below, every control request
+ * from the SPA is a permanent 403.
+ *
+ * HostTransport fetches that token lazily (on the FIRST control request, never
+ * eagerly at construction: `createHostTransport()` must stay a synchronous
+ * call usable as a component/prop default, and a browse-only page load must
+ * not spend a round trip minting a credential it never presents), caches it in
+ * memory (never a cookie — see csrf.go's package doc on why an independent,
+ * header-carried token is the whole point), shares one in-flight mint promise
+ * across concurrent callers so N simultaneous control requests trigger exactly
+ * ONE mint, and retries a `CSRFRejectedError` exactly once (clear the cached
+ * token, re-mint, replay the identical request) — see
+ * `HttpTransport.postJSON`'s CSRF-retry hook and
+ * `HostTransport.controlHeaders`/`beforeCSRFRetry` below. The retry is capped
+ * at one, never a loop: wui's tokens carry a TTL and its store is bounded
+ * (`DefaultCSRFTokenTTL`, `maxCSRFTokens`), so a long-lived tab must be able to
+ * recover from an expired token without a reload — but a server that rejects
+ * every token must not be hammered.
+ *
+ * ServeTransport talks directly to a `pkg/serve` endpoint with no wui in front
+ * of it, so there is no CSRFGuard to satisfy and its `controlHeaders` stays the
+ * base no-op — it sends no `X-CSRF-Token` and never mints one.
  */
 import {
   CSRFRejectedError,
@@ -88,23 +99,27 @@ import {
 } from "./validate.js";
 
 /**
- * The request header BFFTransport echoes a minted CSRF token back in on
- * every control-plane request. MUST match internal/bff/csrf.go's
- * `CSRFHeaderName` exactly — there is no runtime cross-check between the two
- * repos' constants, so a mismatch here would silently make every control
- * request fail CSRF verification.
+ * The request header HostTransport echoes a minted CSRF token back in on
+ * every control-plane request. MUST match `wui/csrf.go`'s `CSRFHeaderName`
+ * exactly — Go and TypeScript cannot share the constant, and nothing checks
+ * them against each other at runtime, so a mismatch here would silently make
+ * every control request fail verification. Exported so a consumer (or a
+ * cross-language contract test) can assert the two halves agree.
  */
-const CSRF_TOKEN_HEADER = "X-CSRF-Token";
+export const CSRF_TOKEN_HEADER = "X-CSRF-Token";
 
 /**
- * Path (relative to BFFTransport's own `baseUrl`) BFFTransport fetches a
- * fresh CSRF token from. MUST match internal/bff/mux.go's registered
- * `GET /api/v1/csrf-token` route: with the default `baseUrl` ("/api/v1"),
- * `${baseUrl}${CSRF_TOKEN_PATH}` resolves to exactly that path.
+ * Path (relative to HostTransport's own `baseUrl`) HostTransport fetches a
+ * fresh CSRF token from. MUST match `wui/handler.go`'s registered
+ * `GET /v1/csrf-token` route (its `routeCSRFToken`): with the default
+ * `baseUrl` ("/v1"), `${baseUrl}${CSRF_TOKEN_PATH}` resolves to exactly that
+ * path. The route is deliberately GET on the server side, so `CSRFGuard.Wrap`
+ * never demands a token to reach it — a client with none yet must be able to
+ * fetch its first one.
  */
 const CSRF_TOKEN_PATH = "/csrf-token";
 
-/** The shape csrf.go's TokenHandler writes: `{"csrf_token": "..."}`. */
+/** The shape `wui/csrf.go`'s TokenHandler writes: `{"csrf_token": "..."}`. */
 interface CSRFTokenResponse {
   csrf_token: string;
 }
@@ -121,7 +136,7 @@ function isCSRFTokenResponse(data: unknown): data is CSRFTokenResponse {
 /**
  * Wraps `promise` so the RETURNED promise also rejects with
  * `RequestAbortedError` if `signal` fires before `promise` itself settles —
- * WITHOUT cancelling `promise`. Used for BFFTransport's shared, cross-caller
+ * WITHOUT cancelling `promise`. Used for HostTransport's shared, cross-caller
  * CSRF mint: one caller aborting its own request must not cancel the
  * in-flight mint fetch for OTHER concurrent callers also awaiting it. If
  * `signal` is already aborted, rejects immediately without ever touching
@@ -272,7 +287,7 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 
 /**
  * Shared HTTP plumbing for every `LooprigTransport` implementation in this
- * module. Both `BFFTransport` and `ServeTransport` extend this rather than
+ * module. Both `HostTransport` and `ServeTransport` extend this rather than
  * each hand-rolling their own fetch/parse/error-mapping logic, so the two
  * concrete classes cannot silently diverge in how they parse responses, map
  * errors, or handle abort/network failures — the ONLY things a subclass
@@ -292,7 +307,7 @@ abstract class HttpTransport implements LooprigTransport {
    * Extra headers attached to every outbound request (e.g. an Authorization
    * bearer token for ServeTransport). Called fresh on every request rather
    * than cached once, so a subclass could rotate a credential between calls.
-   * The base implementation sends none — matching BFFTransport, which is
+   * The base implementation sends none — matching HostTransport, which is
    * same-origin and carries no credential of its own.
    */
   protected extraHeaders(): Record<string, string> {
@@ -305,7 +320,7 @@ abstract class HttpTransport implements LooprigTransport {
    * GETs above (`listSessions`/`readStatus`/`readHistory` never call this).
    * The base implementation returns none, matching `ServeTransport` (no CSRF
    * concept — it talks directly to serve, bypassing the BFF's CSRFGuard
-   * entirely) and keeping this a genuine no-op until `BFFTransport` overrides
+   * entirely) and keeping this a genuine no-op until `HostTransport` overrides
    * it. `path` is the request's own path (for a precise
    * `RequestAbortedError` if `signal` is already aborted); `signal` is the
    * caller's own abort signal for this one request.
@@ -317,7 +332,7 @@ abstract class HttpTransport implements LooprigTransport {
   /**
    * Whether `postJSON` should retry a control request exactly once after a
    * `CSRFRejectedError`. Base: false (no CSRF concept to recover from).
-   * `BFFTransport` overrides this to true.
+   * `HostTransport` overrides this to true.
    */
   protected retriesOnCSRFRejection(): boolean {
     return false;
@@ -435,7 +450,7 @@ abstract class HttpTransport implements LooprigTransport {
    * `restoreSession`/`interrupt`, whose handlers never read one).
    * `requestHeaders` are merged on top of `extraHeaders()` and this
    * request's `controlHeaders()` (e.g. `createSession`'s `Idempotency-Key`
-   * and, for `BFFTransport`, the CSRF token).
+   * and, for `HostTransport`, the CSRF token).
    *
    * CSRF retry: if the attempt throws `CSRFRejectedError` and
    * `retriesOnCSRFRejection()` says so, `beforeCSRFRetry()` runs (letting a
@@ -487,7 +502,7 @@ abstract class HttpTransport implements LooprigTransport {
    * itself is called; every public method funnels through it (via getJSON/
    * postJSON) so abort/network handling is implemented exactly once, shared
    * by every LooprigTransport implementation in this module. Protected
-   * (not private): BFFTransport also calls this directly to fetch/decode its
+   * (not private): HostTransport also calls this directly to fetch/decode its
    * CSRF token (a request with no schema-validated DTO of its own).
    */
   protected async sendRequest(
@@ -525,7 +540,7 @@ abstract class HttpTransport implements LooprigTransport {
       let errorBody: BFFErrorResponse;
       try {
         // validateBFFErrorResponse (not the narrower validateErrorResponse):
-        // this shared plumbing serves BOTH transports, and BFFTransport can
+        // this shared plumbing serves BOTH transports, and HostTransport can
         // genuinely observe the two BFF-local codes (csrf_invalid,
         // origin_not_allowed) on top of every code serve itself emits — see
         // schema.ts's bffErrorResponseSchema doc. Strictly wider acceptance
@@ -552,13 +567,16 @@ abstract class HttpTransport implements LooprigTransport {
   }
 }
 
-export interface BFFTransportOptions {
+export interface HostTransportOptions {
   /**
-   * Prefix every request path is appended to. Defaults to "/api/v1" — a
-   * same-origin, relative path, matching the BFF framing (`internal/bff/
-   * mux.go` strips "/api" and forwards the rest to serve's own "/v1/..."
-   * routes). Overridable for tests (an absolute `http://127.0.0.1:PORT/api/v1`
-   * against a real local server) or a deployment that mounts the BFF under a
+   * Prefix every request path is appended to. Defaults to "/v1" — a
+   * same-origin, relative path, matching what `wui/handler.go` actually
+   * serves: wui mounts harness `pkg/serve`'s own unprefixed `/v1/...` routes
+   * directly, with NO "/api" prefix, because there is no BFF in front of them.
+   * A wrong prefix here does not 404 loudly: every unmatched path falls
+   * through to wui's SPA catch-all, so the client would parse `index.html` as
+   * JSON. Overridable for tests (an absolute `http://127.0.0.1:PORT/v1`
+   * against a real local server) or a deployment that mounts wui under a
    * different prefix.
    */
   baseUrl?: string;
@@ -567,14 +585,20 @@ export interface BFFTransportOptions {
 }
 
 /**
- * `LooprigTransport` implementation for same-origin browser apps: calls
- * `/api/v1/...` paths via `fetch()`. The BFF already sits behind
- * authentication and CSRF/Origin guards (`internal/bff/guard.go`,
- * `csrf.go`) — this transport itself carries no bearer token (matching the
- * plan's "token stays server-side" framing) but DOES carry a CSRF token: see
- * this file's module doc and `controlHeaders`/`beforeCSRFRetry` below.
+ * `LooprigTransport` implementation for the browser, talking to the wui-hosted
+ * server that served the page: calls same-origin `/v1/...` paths via
+ * `fetch()`. wui's guards sit in front of those routes
+ * (`wui/guard.go`'s HostOriginGuard over everything, `wui/csrf.go`'s CSRFGuard
+ * per state-changing control route), so this transport carries no bearer token
+ * — a browser holds no credential here — but DOES carry a CSRF token: see this
+ * file's module doc and `controlHeaders`/`beforeCSRFRetry` below.
+ *
+ * This is the transport a wui-hosted app constructs; `createHostTransport`
+ * (client.ts) is the ergonomic entry point. `ServeTransport` is NOT an
+ * alternative for a browser: it sends no CSRF token, so every control request
+ * through it against a wui server is a 403.
  */
-export class BFFTransport extends HttpTransport {
+export class HostTransport extends HttpTransport {
   protected readonly baseUrl: string;
   protected readonly fetchImpl: FetchLike;
 
@@ -590,24 +614,23 @@ export class BFFTransport extends HttpTransport {
   /**
    * The in-flight mint fetch, shared across every concurrent caller that
    * observes `cachedCSRFToken === undefined` before it resolves — so N
-   * simultaneous control requests trigger exactly ONE `GET /api/v1/csrf-token`,
+   * simultaneous control requests trigger exactly ONE `GET /v1/csrf-token`,
    * not N. Cleared (via `.finally`) as soon as it settles, success or
    * failure, so a later call starts a fresh mint rather than replaying a
    * stale settled promise forever.
    */
   private csrfMintPromise: Promise<string> | undefined;
 
-  constructor(options: BFFTransportOptions = {}) {
+  constructor(options: HostTransportOptions = {}) {
     super();
-    this.baseUrl = options.baseUrl ?? "/api/v1";
+    this.baseUrl = options.baseUrl ?? "/v1";
     this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
-    // Deliberately NO eager mint here: createBFFClient() is used as a
-    // synchronous Svelte prop default (see app/src/routes/sessions/
-    // +page.svelte and [sid]/+page.svelte), and a browse-only deployment
-    // (internal/bff's NewBrowseOnlyMux — no control routes, no CSRF token
-    // endpoint at all) must never see a wasted GET /api/v1/csrf-token that
-    // would just 404. The token is fetched lazily, on the first control
-    // request that actually needs it (see controlHeaders below).
+    // Deliberately NO eager mint here: createHostTransport() must stay a
+    // synchronous call (it is used as a component/prop default, and a
+    // constructor cannot await), and a page load that only ever browses must
+    // not spend a round trip minting a credential it never presents. The
+    // token is fetched lazily, on the first control request that actually
+    // needs it (see controlHeaders below).
   }
 
   protected override retriesOnCSRFRejection(): boolean {
@@ -654,7 +677,7 @@ export class BFFTransport extends HttpTransport {
   }
 
   /**
-   * Issues the actual `GET /api/v1/csrf-token` request via the shared
+   * Issues the actual `GET /v1/csrf-token` request via the shared
    * `sendRequest` plumbing (so abort/network/error-envelope handling is the
    * SAME code path every other request in this module uses — a rebound Host
    * hitting this route, for instance, correctly surfaces as
@@ -675,7 +698,7 @@ export interface ServeTransportOptions {
   /**
    * Base URL harness's own unprefixed serve routes are resolved against, e.g.
    * "https://serve.internal.example:8443/v1" or (colocated)
-   * "http://127.0.0.1:8080/v1". Unlike `BFFTransportOptions.baseUrl`, there is
+   * "http://127.0.0.1:8080/v1". Unlike `HostTransportOptions.baseUrl`, there is
    * NO sensible default: `pkg/serve` exposes no fixed host/port convention
    * (bind address is entirely the deployer's choice), so a caller must always
    * supply the real endpoint.
@@ -702,13 +725,16 @@ export interface ServeTransportOptions {
 /**
  * `LooprigTransport` implementation for trusted/server-side/custom callers —
  * a non-browser Node/CLI consumer, a backend job, a test harness — that talk
- * DIRECTLY to harness's `pkg/serve`, bypassing looprig/client's BFF entirely.
- * Such a caller holds its own credential (unlike a browser via BFFTransport),
+ * DIRECTLY to a harness `pkg/serve` endpoint, with no wui in front of it.
+ * Such a caller holds its own credential (unlike a browser via HostTransport),
  * so this transport sends `Authorization: Bearer <token>` when `token` is
- * supplied. Paths are resolved against `options.baseUrl` with NO "/api"
- * prefix, matching `pkg/serve/mux.go`'s own unprefixed route table
- * (`GET /v1/capabilities`, `GET /v1/sessions`, ...) — this is a different URL
- * scheme from BFFTransport's `/api/v1/...`, not merely a different host.
+ * supplied. Paths are resolved against `options.baseUrl`, which — unlike
+ * HostTransport's — has no default: serve has no fixed host/port convention.
+ *
+ * NOT FOR BROWSERS, and not interchangeable with HostTransport against a wui
+ * server: it carries no CSRF token and never mints one, because nothing in
+ * front of a bare serve endpoint demands one. Pointing this class at a
+ * wui-hosted server would 403 on every control request (`wui/csrf.go`).
  */
 export class ServeTransport extends HttpTransport {
   protected readonly baseUrl: string;

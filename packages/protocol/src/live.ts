@@ -57,10 +57,11 @@ import type { FetchLike } from "./transport.js";
 export interface FetchLiveFrameSourceOptions {
   /**
    * Prefix the session's events path is appended to. Defaults to "/api/v1" —
-   * a same-origin, relative path, matching BFFTransport's own default and the
-   * BFF's actual route (`internal/bff/mux.go` mounts the SSE proxy at
-   * "/api/v1/sessions/{sid}/events"). Overridable for tests (an absolute
-   * `http://127.0.0.1:PORT/api/v1` against a real local server).
+   * a same-origin, relative path inherited from the copied looprig/client SDK,
+   * where it matched that repo's BFF route (`internal/bff/mux.go` mounts the
+   * SSE proxy at "/api/v1/sessions/{sid}/events"). It is NOT HostTransport's
+   * default, which is "/v1", what wui itself serves. Overridable for tests (an
+   * absolute `http://127.0.0.1:PORT/api/v1` against a real local server).
    */
   baseUrl?: string;
   /** Injectable fetch implementation. Defaults to `globalThis.fetch`. */

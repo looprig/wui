@@ -1,19 +1,26 @@
 /**
  * Thin composition tying a `LooprigTransport` implementation to the public
- * `@looprig/client` surface. At this stage (Phase 1a — cold reads only)
- * `LooprigClient` is exactly `LooprigTransport`: there is no client-only
- * behavior to layer on top yet, so this is a type alias rather than a
- * hand-written wrapper that would just forward every call unchanged. As later
- * tasks add live/control methods to LooprigTransport (and any second
- * transport, e.g. Task 28's ServeTransport), LooprigClient tracks them for
- * free.
+ * `@looprig/protocol` client surface. `LooprigClient` is exactly
+ * `LooprigTransport`: there is no client-only behavior to layer on top, so
+ * this is a type alias rather than a hand-written wrapper that would just
+ * forward every call unchanged. As methods are added to `LooprigTransport`,
+ * `LooprigClient` tracks them for free.
  *
  * `createClient` accepts any LooprigTransport, so a consumer that constructs
  * its own transport (or a test with a fake one) isn't forced through
- * `createBFFClient`. `createBFFClient` is the ergonomic default entry point
- * for the same-origin browser case this package is built for.
+ * `createHostTransport`.
+ *
+ * `createHostTransport` is THE entry point a wui-hosted app calls (00-plan.md
+ * §2's cross-phase contract names it): same-origin `/v1/...`, and — because
+ * `wui/handler.go` wraps every state-changing control route in `wui/csrf.go`'s
+ * CSRFGuard — the CSRF token carriage those routes demand. `ServeTransport` is
+ * the other implementation and is deliberately NOT reachable from a factory
+ * here: it is for non-browser callers talking to a bare `pkg/serve` endpoint,
+ * it needs an explicit `baseUrl` and (usually) a bearer token, and it sends no
+ * CSRF token — constructing it by hand is the point at which a caller states
+ * it is not a browser.
  */
-import { BFFTransport, type BFFTransportOptions, type LooprigTransport } from "./transport.js";
+import { HostTransport, type HostTransportOptions, type LooprigTransport } from "./transport.js";
 
 export type LooprigClient = LooprigTransport;
 
@@ -22,7 +29,13 @@ export function createClient(transport: LooprigTransport): LooprigClient {
   return transport;
 }
 
-/** Constructs a BFFTransport and wraps it as the public client surface — the default for same-origin browser apps. */
-export function createBFFClient(options?: BFFTransportOptions): LooprigClient {
-  return createClient(new BFFTransport(options));
+/**
+ * Constructs the browser transport for a wui-hosted server — same-origin
+ * `/v1/...`, lazily minting and echoing the CSRF token `wui/csrf.go` demands
+ * on every state-changing request — and wraps it as the public client surface.
+ * Synchronous by design: it mints nothing at construction, so it is safe as a
+ * component/prop default.
+ */
+export function createHostTransport(options?: HostTransportOptions): LooprigClient {
+  return createClient(new HostTransport(options));
 }

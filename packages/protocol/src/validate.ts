@@ -109,7 +109,7 @@ const validators = Object.fromEntries(
  * it has no vendored counterpart under `contract/schema/` for the drift
  * guard to compare against), so it isn't looped over by `schemaNames`. It's
  * still compiled against the SAME `ajv` instance (its `$id` doesn't collide
- * with anything in `allSchemas`), so BFFTransport's error decoding shares
+ * with anything in `allSchemas`), so HostTransport's error decoding shares
  * the same ajv configuration (draft-2020, the same date-time format) as
  * every other validator in this module.
  */
@@ -156,9 +156,9 @@ export const validateErrorResponse = (data: unknown): ErrorResponse => validate(
  * Validates `data` against bffErrorResponseSchema (schema.ts) — the SAME
  * envelope shape validateErrorResponse checks, but accepting the two
  * additional BFF-local codes (csrf_invalid, origin_not_allowed) alongside
- * every code the vendored schema already lists. Used by BFFTransport's
+ * every code the vendored schema already lists. Used by HostTransport's
  * request plumbing (transport.ts) in place of validateErrorResponse, since
- * BFFTransport — unlike ServeTransport — can genuinely observe either kind
+ * HostTransport — unlike ServeTransport — can genuinely observe either kind
  * of error. Not part of the `validate()`/`SchemaTypeMap` machinery above
  * (bffErrorResponseSchema is deliberately excluded from `allSchemas`; see its
  * schema.ts doc), so this wraps `bffErrorResponseValidator` directly rather

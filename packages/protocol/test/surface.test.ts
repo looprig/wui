@@ -93,12 +93,21 @@ describe("@looprig/protocol public surface", () => {
     expect(protocol).toHaveProperty("MAX_BUFFERED_LINE_BYTES");
   });
 
-  it("still exports everything the copied sdk/core surface had", () => {
+  it("still exports every capability the copied sdk/core surface had", () => {
+    // Two of these were RENAMED, not added: the copy's `BFFTransport` /
+    // `createBFFClient` are this package's `HostTransport` /
+    // `createHostTransport`. wui has no backend-for-frontend — the process
+    // serving the SPA is the process holding the rig — so the browser
+    // transport talks same-origin `/v1/...` to wui's own handler, and
+    // 00-plan.md §2 names the factory `createHostTransport`. The capability
+    // (a browser transport, CSRF-carrying, reachable from a factory) is what
+    // this test guards; the copy's spelling of it is not.
     for (const name of [
-      "BFFTransport",
+      "HostTransport",
       "ServeTransport",
       "createClient",
-      "createBFFClient",
+      "createHostTransport",
+      "CSRF_TOKEN_HEADER",
       "generateIdempotencyKey",
       "SseFrameParser",
       "parseSseStream",

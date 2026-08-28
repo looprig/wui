@@ -2,22 +2,24 @@
  * Shared conformance suite for every `LooprigTransport` implementation.
  *
  * `runConformanceSuite` below is written ONCE and invoked twice — once for
- * `BFFTransport` (mounted under `/api/v1`, matching `internal/bff/mux.go`)
- * and once for `ServeTransport` (mounted under `/v1`, matching
- * `pkg/serve/mux.go`'s own unprefixed route table) — against a real
+ * `HostTransport` (mounted under a NON-default `/mounted/v1`, standing in for
+ * a wui deployment behind a path-prefixing proxy) and once for
+ * `ServeTransport` (mounted under `/v1`, matching `pkg/serve/mux.go`'s own
+ * unprefixed route table) — against a real
  * `node:http` server, so both implementations are proven to satisfy the
  * EXACT SAME `LooprigTransport` contract rather than two independently
  * hand-written test files that could quietly diverge from each other.
  *
  * This genuinely exercises the URL scheme, not just "does it return the right
- * type": every request assertion below is built from `t.urlPrefix`, so if
- * `ServeTransport` shipped with a subtly wrong prefix (e.g. it forgot to omit
- * "/api", or added a trailing slash BFFTransport doesn't have), the SAME
- * assertion that already passes for BFFTransport would fail for ServeTransport
- * — proving the two are held to one shared standard, not eyeballed
- * independently. (transport.test.ts separately covers `BFFTransport`-only
+ * type": every request assertion below is built from `t.urlPrefix`, and the two
+ * transports are mounted under DIFFERENT prefixes on purpose — neither of which
+ * is HostTransport's own `/v1` default. An implementation that hardcoded a
+ * prefix instead of appending to its configured `baseUrl` fails here, and a
+ * subtly wrong prefix in one implementation fails the SAME assertion that
+ * already passes for the other — proving the two are held to one shared
+ * standard, not eyeballed independently. (transport.test.ts separately covers `HostTransport`-only
  * concerns — response validation edge cases, the Idempotency-Key mechanics
- * specific to the BFF's proxy, gate-id opacity — in more depth; this suite is
+ * specific to it, gate-id opacity — in more depth; this suite is
  * deliberately the intersection every transport must pass, not the union of
  * everything either one is tested for.)
  */
@@ -25,7 +27,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { BFFTransport, ServeTransport, type LooprigTransport } from "../src/transport.js";
+import { HostTransport, ServeTransport, type LooprigTransport } from "../src/transport.js";
 import {
   GateCapacityError,
   IdempotencyConflictError,
@@ -44,10 +46,10 @@ function readFixture(file: string): unknown {
 type Handler = (req: IncomingMessage, res: ServerResponse) => void;
 
 /**
- * Suffix every CSRF token-minting request BFFTransport issues ends in,
+ * Suffix every CSRF token-minting request HostTransport issues ends in,
  * regardless of `baseUrl` (see transport.ts's `CSRF_TOKEN_PATH`).
  * ServeTransport never issues one at all (its `controlHeaders` stays the
- * base no-op — no CSRF concept, it bypasses the BFF entirely), so this
+ * base no-op — no CSRF concept: nothing guards a bare serve endpoint), so this
  * interception is a genuine no-op for every ServeTransport case in this
  * shared suite.
  */
@@ -56,11 +58,11 @@ const CSRF_TOKEN_SUFFIX = "/csrf-token";
 /**
  * Wraps handler so ANY GET request ending in CSRF_TOKEN_SUFFIX is answered
  * with a freshly minted token, transparently, before handler ever sees it —
- * mirroring internal/bff/csrf.go's TokenHandler closely enough for this
+ * mirroring wui/csrf.go's TokenHandler closely enough for this
  * suite's purposes (a real, distinct-each-time string; this suite's fixture
- * servers don't need to VERIFY the token, only mint one BFFTransport can
+ * servers don't need to VERIFY the token, only mint one HostTransport can
  * cache/echo). Every control-plane test in this file goes through this
- * wrapper so it doesn't have to know or care that BFFTransport now fetches a
+ * wrapper so it doesn't have to know or care that HostTransport now fetches a
  * token before its first control request.
  */
 function withCSRFTokenEndpoint(handler: Handler): Handler {
@@ -117,9 +119,9 @@ interface TransportUnderTest {
 
 const transportsUnderTest: TransportUnderTest[] = [
   {
-    name: "BFFTransport",
-    urlPrefix: "/api/v1",
-    create: (host) => new BFFTransport({ baseUrl: `${host}/api/v1` }),
+    name: "HostTransport",
+    urlPrefix: "/mounted/v1",
+    create: (host) => new HostTransport({ baseUrl: `${host}/mounted/v1` }),
   },
   {
     name: "ServeTransport",

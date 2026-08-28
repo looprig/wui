@@ -26,7 +26,7 @@ import type { BFFErrorResponse, ErrorResponse } from "./types.js";
  * `internal/bff/guard.go` and `internal/bff/csrf.go` mint before a request
  * ever reaches serve — see `schema.ts`'s `bffErrorResponseSchema` doc.
  * ServeTransport (which talks directly to serve, bypassing the BFF) can
- * never actually observe either of these two; only BFFTransport can.
+ * never actually observe either of these two; only HostTransport can.
  */
 export type ErrorCode = ErrorResponse["error"]["code"] | "csrf_invalid" | "origin_not_allowed";
 
@@ -105,7 +105,7 @@ export class GateCapacityError extends LooprigError {
  * control-plane request for a missing, unknown, or expired CSRF token —
  * `retryable: true` on the wire (see csrf.go's Wrap doc), meaning the
  * recovery path (clear the cached token, mint a fresh one, retry the
- * identical request once) is expected and safe. `BFFTransport`'s request
+ * identical request once) is expected and safe. `HostTransport`'s request
  * plumbing (transport.ts) does exactly that automatically; a caller using
  * this class directly should follow the same one-retry-then-give-up
  * discipline rather than looping.
@@ -125,7 +125,7 @@ export class CSRFRejectedError extends LooprigError {
  * `retryable: false` on the wire — deliberately distinct from
  * `CSRFRejectedError`'s `true`: retrying an identical request against the
  * identical (rejected) origin can never succeed, so a caller (and
- * `BFFTransport`'s automatic retry logic) must NOT retry on this code.
+ * `HostTransport`'s automatic retry logic) must NOT retry on this code.
  */
 export class OriginNotAllowedError extends LooprigError {
   readonly code = "origin_not_allowed" as const;
@@ -151,7 +151,7 @@ export class UnknownLooprigError extends LooprigError {
 
 /**
  * Parses a decoded, schema-validated `BFFErrorResponse` (see
- * `validateBFFErrorResponse` in validate.ts for `BFFTransport`'s callers, or
+ * `validateBFFErrorResponse` in validate.ts for `HostTransport`'s callers, or
  * `validateErrorResponse` — a structurally-compatible narrower validator —
  * for `ServeTransport`'s; callers MUST validate the raw body before calling
  * this, it does not re-validate) plus the HTTP status it arrived with into

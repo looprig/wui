@@ -1,9 +1,9 @@
 /**
- * BFFTransport coverage against a REAL HTTP round trip: a tiny `node:http`
- * server stands in for the BFF (`internal/bff/mux.go` forwards `/api/*`,
- * prefix-stripped, to serve's own read plane), so these tests exercise the
+ * HostTransport coverage against a REAL HTTP round trip: a tiny `node:http`
+ * server stands in for the wui-hosted server (`wui/handler.go` mounts serve's
+ * own unprefixed `/v1/...` routes, same-origin), so these tests exercise the
  * real `fetch()`/`Response` codepath rather than a hand-rolled fetch mock.
- * Node 22 (this repo's runtime — see sdk/core/package.json's pinned
+ * Node 22 (this repo's runtime — see packages/protocol/package.json's pinned
  * `@types/node`) ships both `fetch` and `AbortController` globally, so no
  * extra dependency is needed to drive either side of this.
  */
@@ -11,7 +11,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { BFFTransport, generateIdempotencyKey } from "../src/transport.js";
+import { HostTransport, generateIdempotencyKey } from "../src/transport.js";
 import {
   CSRFRejectedError,
   GateCapacityError,
@@ -36,7 +36,7 @@ function readFixture(file: string): unknown {
 type Handler = (req: IncomingMessage, res: ServerResponse) => void;
 
 /**
- * Suffix every CSRF token-minting request BFFTransport issues ends in,
+ * Suffix every CSRF token-minting request HostTransport issues ends in,
  * regardless of `baseUrl` (see transport.ts's `CSRF_TOKEN_PATH`).
  */
 const CSRF_TOKEN_SUFFIX = "/csrf-token";
@@ -45,9 +45,9 @@ const CSRF_TOKEN_SUFFIX = "/csrf-token";
  * Wraps handler so ANY GET request ending in CSRF_TOKEN_SUFFIX is answered
  * with a freshly minted token, transparently, before handler ever sees it —
  * so every control-plane (POST) test below doesn't have to know or care
- * that BFFTransport now fetches/caches a CSRF token before its first
+ * that HostTransport now fetches/caches a CSRF token before its first
  * control request (Fix F). Tests that specifically exercise the CSRF
- * mint/retry/concurrency behavior itself (see the "BFFTransport CSRF token"
+ * mint/retry/concurrency behavior itself (see the "HostTransport CSRF token"
  * describe block) bypass this wrapper and drive the token endpoint directly.
  */
 function withCSRFTokenEndpoint(handler: Handler): Handler {
@@ -70,7 +70,7 @@ async function startServer(handler: Handler): Promise<{ baseUrl: string; server:
   if (address === null || typeof address === "string") {
     throw new Error("expected server to bind a TCP address");
   }
-  return { baseUrl: `http://127.0.0.1:${address.port}/api/v1`, server };
+  return { baseUrl: `http://127.0.0.1:${address.port}/v1`, server };
 }
 
 /** Same as startServer, but WITHOUT the CSRF token endpoint interception — for tests that drive the token endpoint (or its absence) directly. */
@@ -81,7 +81,7 @@ async function startServerRaw(handler: Handler): Promise<{ baseUrl: string; serv
   if (address === null || typeof address === "string") {
     throw new Error("expected server to bind a TCP address");
   }
-  return { baseUrl: `http://127.0.0.1:${address.port}/api/v1`, server };
+  return { baseUrl: `http://127.0.0.1:${address.port}/v1`, server };
 }
 
 function sendJSON(res: ServerResponse, status: number, body: unknown): void {
@@ -108,17 +108,17 @@ afterEach(async () => {
   }
 });
 
-describe("BFFTransport.listSessions", () => {
+describe("HostTransport.listSessions", () => {
   it("parses and returns a valid session list", async () => {
     const fixture = readFixture("session_list.json");
     const { baseUrl, server } = await startServer((req, res) => {
       expect(req.method).toBe("GET");
-      expect(req.url).toBe("/api/v1/sessions");
+      expect(req.url).toBe("/v1/sessions");
       sendJSON(res, 200, fixture);
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const result = await transport.listSessions();
 
     expect(result).toEqual(fixture);
@@ -127,12 +127,12 @@ describe("BFFTransport.listSessions", () => {
   it("sends skip/limit as query parameters", async () => {
     const fixture = readFixture("session_list.json");
     const { baseUrl, server } = await startServer((req, res) => {
-      expect(req.url).toBe("/api/v1/sessions?skip=10&limit=25");
+      expect(req.url).toBe("/v1/sessions?skip=10&limit=25");
       sendJSON(res, 200, fixture);
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     await transport.listSessions({ skip: 10, limit: 25 });
   });
 
@@ -143,40 +143,40 @@ describe("BFFTransport.listSessions", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
 
     await expect(transport.listSessions()).rejects.toBeInstanceOf(ContractValidationError);
   });
 });
 
-describe("BFFTransport.readStatus", () => {
+describe("HostTransport.readStatus", () => {
   it("parses and returns a valid session status", async () => {
     const fixture = readFixture("status_running.json");
     const { baseUrl, server } = await startServer((req, res) => {
-      expect(req.url).toBe("/api/v1/sessions/00000000-0000-0000-0000-000000000000/status");
+      expect(req.url).toBe("/v1/sessions/00000000-0000-0000-0000-000000000000/status");
       sendJSON(res, 200, fixture);
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const result = await transport.readStatus("00000000-0000-0000-0000-000000000000");
 
     expect(result).toEqual(fixture);
   });
 });
 
-describe("BFFTransport.readHistory", () => {
+describe("HostTransport.readHistory", () => {
   it("parses and returns a valid journal page", async () => {
     const fixture = readFixture("journal_page.json");
     const { baseUrl, server } = await startServer((req, res) => {
       expect(req.url).toBe(
-        "/api/v1/sessions/00000000-0000-0000-0000-000000000000/journal?from_journal_seq=4&limit=50",
+        "/v1/sessions/00000000-0000-0000-0000-000000000000/journal?from_journal_seq=4&limit=50",
       );
       sendJSON(res, 200, fixture);
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const result = await transport.readHistory("00000000-0000-0000-0000-000000000000", {
       fromJournalSeq: 4,
       limit: 50,
@@ -186,12 +186,12 @@ describe("BFFTransport.readHistory", () => {
   });
 });
 
-describe("BFFTransport.createSession", () => {
+describe("HostTransport.createSession", () => {
   it("POSTs to /sessions with the request body and parses the response", async () => {
     const fixture = readFixture("create_with_command.json");
     const { baseUrl, server } = await startServer(async (req, res) => {
       expect(req.method).toBe("POST");
-      expect(req.url).toBe("/api/v1/sessions");
+      expect(req.url).toBe("/v1/sessions");
       expect(req.headers["content-type"]).toBe("application/json");
       const body = await readJSONBody(req);
       expect(body).toEqual({ blocks: [{ type: "text", text: "hi" }] });
@@ -199,7 +199,7 @@ describe("BFFTransport.createSession", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const result = await transport.createSession({ blocks: [{ type: "text", text: "hi" }] });
 
     expect(result).toEqual(fixture);
@@ -214,7 +214,7 @@ describe("BFFTransport.createSession", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const result = await transport.createSession();
 
     expect(result).toEqual(fixture);
@@ -228,7 +228,7 @@ describe("BFFTransport.createSession", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     await transport.createSession();
   });
 
@@ -241,7 +241,7 @@ describe("BFFTransport.createSession", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     await transport.createSession(undefined, { idempotencyKey: key });
   });
 
@@ -259,30 +259,30 @@ describe("BFFTransport.createSession", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     await transport.createSession(undefined, { idempotencyKey: a });
   });
 });
 
-describe("BFFTransport.restoreSession", () => {
+describe("HostTransport.restoreSession", () => {
   it("POSTs to /sessions/{sid}/restore with no body and parses the response", async () => {
     const fixture = readFixture("restore.json");
     const { baseUrl, server } = await startServer(async (req, res) => {
       expect(req.method).toBe("POST");
-      expect(req.url).toBe("/api/v1/sessions/00000000-0000-0000-0000-000000000000/restore");
+      expect(req.url).toBe("/v1/sessions/00000000-0000-0000-0000-000000000000/restore");
       const body = await readJSONBody(req);
       expect(body).toBeUndefined();
       sendJSON(res, 200, fixture);
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const result = await transport.restoreSession("00000000-0000-0000-0000-000000000000");
 
     expect(result).toEqual(fixture);
   });
 
-  it("never sends an Idempotency-Key header, matching the BFF's real proxy behavior (control.go forwards it on create only)", async () => {
+  it("never sends an Idempotency-Key header — harness's handleRestore never reads one (only handleCreate does)", async () => {
     const fixture = readFixture("restore.json");
     const { baseUrl, server } = await startServer((req, res) => {
       expect(req.headers["idempotency-key"]).toBeUndefined();
@@ -290,24 +290,24 @@ describe("BFFTransport.restoreSession", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     await transport.restoreSession("00000000-0000-0000-0000-000000000000");
   });
 });
 
-describe("BFFTransport.submit", () => {
+describe("HostTransport.submit", () => {
   it("POSTs to /sessions/{sid}/input with the request body and parses the response", async () => {
     const fixture = readFixture("input.json");
     const { baseUrl, server } = await startServer(async (req, res) => {
       expect(req.method).toBe("POST");
-      expect(req.url).toBe("/api/v1/sessions/00000000-0000-0000-0000-000000000000/input");
+      expect(req.url).toBe("/v1/sessions/00000000-0000-0000-0000-000000000000/input");
       const body = await readJSONBody(req);
       expect(body).toEqual({ blocks: [{ type: "text", text: "hello" }] });
       sendJSON(res, 200, fixture);
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const result = await transport.submit("00000000-0000-0000-0000-000000000000", {
       blocks: [{ type: "text", text: "hello" }],
     });
@@ -316,38 +316,38 @@ describe("BFFTransport.submit", () => {
   });
 });
 
-describe("BFFTransport.interrupt", () => {
+describe("HostTransport.interrupt", () => {
   it("POSTs to /sessions/{sid}/interrupt with no body and parses the response", async () => {
     const fixture = readFixture("interrupt.json");
     const { baseUrl, server } = await startServer(async (req, res) => {
       expect(req.method).toBe("POST");
-      expect(req.url).toBe("/api/v1/sessions/00000000-0000-0000-0000-000000000000/interrupt");
+      expect(req.url).toBe("/v1/sessions/00000000-0000-0000-0000-000000000000/interrupt");
       const body = await readJSONBody(req);
       expect(body).toBeUndefined();
       sendJSON(res, 200, fixture);
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const result = await transport.interrupt("00000000-0000-0000-0000-000000000000");
 
     expect(result).toEqual(fixture);
   });
 });
 
-describe("BFFTransport.respondGate", () => {
+describe("HostTransport.respondGate", () => {
   it("POSTs to /sessions/{sid}/gates/{gid} with the request body and parses the response", async () => {
     const fixture = readFixture("gate_accepted.json");
     const { baseUrl, server } = await startServer(async (req, res) => {
       expect(req.method).toBe("POST");
-      expect(req.url).toBe("/api/v1/sessions/00000000-0000-0000-0000-000000000000/gates/gate-1");
+      expect(req.url).toBe("/v1/sessions/00000000-0000-0000-0000-000000000000/gates/gate-1");
       const body = await readJSONBody(req);
       expect(body).toEqual({ action: "approve", values: { scope: "session" } });
       sendJSON(res, 202, fixture);
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const result = await transport.respondGate("00000000-0000-0000-0000-000000000000", "gate-1", {
       action: "approve",
       values: { scope: "session" },
@@ -368,7 +368,7 @@ describe("BFFTransport.respondGate", () => {
     const fixture = readFixture("gate_accepted.json");
     const { baseUrl, server } = await startServer((req, res) => {
       const urlPath = req.url ?? "";
-      const expectedPath = `/api/v1/sessions/00000000-0000-0000-0000-000000000000/gates/${encodeURIComponent(weirdGateId)}`;
+      const expectedPath = `/v1/sessions/00000000-0000-0000-0000-000000000000/gates/${encodeURIComponent(weirdGateId)}`;
       expect(urlPath).toBe(expectedPath);
       // Decode the path segment the server actually received and confirm it
       // is byte-for-content identical to the original — nothing was dropped,
@@ -380,7 +380,7 @@ describe("BFFTransport.respondGate", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const result = await transport.respondGate("00000000-0000-0000-0000-000000000000", weirdGateId, {
       action: "approve",
     });
@@ -389,7 +389,7 @@ describe("BFFTransport.respondGate", () => {
   });
 });
 
-describe("BFFTransport error envelope mapping (real HTTP round trip)", () => {
+describe("HostTransport error envelope mapping (real HTTP round trip)", () => {
   const cases = [
     { file: "error_400.json", status: 400, ctor: InvalidBodyError, code: "invalid_body" },
     { file: "error_404.json", status: 404, ctor: SessionNotFoundError, code: "session_not_found" },
@@ -406,7 +406,7 @@ describe("BFFTransport error envelope mapping (real HTTP round trip)", () => {
       });
       activeServer = server;
 
-      const transport = new BFFTransport({ baseUrl });
+      const transport = new HostTransport({ baseUrl });
 
       const rejection = transport.listSessions();
       await expect(rejection).rejects.toBeInstanceOf(ctor);
@@ -430,7 +430,7 @@ describe("BFFTransport error envelope mapping (real HTTP round trip)", () => {
       });
       activeServer = server;
 
-      const transport = new BFFTransport({ baseUrl });
+      const transport = new HostTransport({ baseUrl });
 
       const rejection = transport.createSession();
       await expect(rejection).rejects.toBeInstanceOf(ctor);
@@ -442,17 +442,17 @@ describe("BFFTransport error envelope mapping (real HTTP round trip)", () => {
   }
 });
 
-describe("BFFTransport malformed error envelope handling", () => {
+describe("HostTransport malformed error envelope handling", () => {
   it("falls back to MalformedResponseError (not ContractValidationError, not a LooprigError subclass) when a non-2xx body is valid JSON but doesn't match the error_response schema", async () => {
     const { baseUrl, server } = await startServer((_req, res) => {
-      // Well-formed JSON, but not the BFF's {error:{code,message,retryable}}
+      // Well-formed JSON, but not the {error:{code,message,retryable}}
       // envelope — e.g. an infrastructure proxy/load balancer's own error
-      // shape for a 502, rather than the BFF itself ever handling the request.
+      // shape for a 502, rather than the server itself ever handling the request.
       sendJSON(res, 502, { message: "Bad Gateway" });
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
 
     const rejection = transport.listSessions();
     await expect(rejection).rejects.toBeInstanceOf(MalformedResponseError);
@@ -464,14 +464,14 @@ describe("BFFTransport malformed error envelope handling", () => {
   });
 });
 
-describe("BFFTransport abort handling", () => {
+describe("HostTransport abort handling", () => {
   it("rejects with RequestAbortedError, not a generic network error, when the signal is already aborted", async () => {
     const { baseUrl, server } = await startServer((_req, res) => {
       sendJSON(res, 200, readFixture("session_list.json"));
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const controller = new AbortController();
     controller.abort();
 
@@ -489,7 +489,7 @@ describe("BFFTransport abort handling", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const controller = new AbortController();
 
     const started = Date.now();
@@ -507,7 +507,7 @@ describe("BFFTransport abort handling", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const controller = new AbortController();
     controller.abort();
 
@@ -523,7 +523,7 @@ describe("BFFTransport abort handling", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const controller = new AbortController();
 
     const started = Date.now();
@@ -536,10 +536,10 @@ describe("BFFTransport abort handling", () => {
   });
 });
 
-describe("BFFTransport network failure", () => {
+describe("HostTransport network failure", () => {
   it("rejects with NetworkError (not RequestAbortedError) when the server is unreachable", async () => {
     // Nothing listens on this port: connection refused, no abort involved.
-    const transport = new BFFTransport({ baseUrl: "http://127.0.0.1:1/api/v1" });
+    const transport = new HostTransport({ baseUrl: "http://127.0.0.1:1/v1" });
 
     const rejection = transport.listSessions();
     await expect(rejection).rejects.toBeInstanceOf(NetworkError);
@@ -547,7 +547,7 @@ describe("BFFTransport network failure", () => {
   });
 
   it("rejects a control (POST) method with NetworkError when the server is unreachable", async () => {
-    const transport = new BFFTransport({ baseUrl: "http://127.0.0.1:1/api/v1" });
+    const transport = new HostTransport({ baseUrl: "http://127.0.0.1:1/v1" });
 
     const rejection = transport.createSession();
     await expect(rejection).rejects.toBeInstanceOf(NetworkError);
@@ -560,7 +560,7 @@ describe("BFFTransport network failure", () => {
 // auto-mint wrapper every OTHER control-plane test above uses — because they
 // need to control exactly how many times it's hit, what it returns, and in
 // what order relative to the control POST.
-describe("BFFTransport CSRF token", () => {
+describe("HostTransport CSRF token", () => {
   const sid = "00000000-0000-0000-0000-000000000000";
 
   it("full round trip: mints a token lazily on the first control request, echoes it on X-CSRF-Token, and caches it (no second mint on a later control request)", async () => {
@@ -569,12 +569,12 @@ describe("BFFTransport CSRF token", () => {
     let secondPostToken: string | undefined;
     let postCount = 0;
     const { baseUrl, server } = await startServerRaw((req, res) => {
-      if (req.method === "GET" && req.url === "/api/v1/csrf-token") {
+      if (req.method === "GET" && req.url === "/v1/csrf-token") {
         tokenRequests += 1;
         sendJSON(res, 200, { csrf_token: "the-real-token" });
         return;
       }
-      if (req.method === "POST" && req.url === "/api/v1/sessions") {
+      if (req.method === "POST" && req.url === "/v1/sessions") {
         postCount += 1;
         const token = req.headers["x-csrf-token"] as string | undefined;
         if (postCount === 1) {
@@ -590,9 +590,9 @@ describe("BFFTransport CSRF token", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
 
-    // No mint at construction — see BFFTransport's constructor doc.
+    // No mint at construction — see HostTransport's constructor doc.
     expect(tokenRequests).toBe(0);
 
     const result = await transport.createSession();
@@ -611,12 +611,12 @@ describe("BFFTransport CSRF token", () => {
     let postCount = 0;
     const seenTokens: (string | undefined)[] = [];
     const { baseUrl, server } = await startServerRaw((req, res) => {
-      if (req.method === "GET" && req.url === "/api/v1/csrf-token") {
+      if (req.method === "GET" && req.url === "/v1/csrf-token") {
         tokenCount += 1;
         sendJSON(res, 200, { csrf_token: `token-${tokenCount}` });
         return;
       }
-      if (req.method === "POST" && req.url === "/api/v1/sessions") {
+      if (req.method === "POST" && req.url === "/v1/sessions") {
         postCount += 1;
         seenTokens.push(req.headers["x-csrf-token"] as string | undefined);
         if (postCount === 1) {
@@ -631,7 +631,7 @@ describe("BFFTransport CSRF token", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const result = await transport.createSession();
 
     expect(result).toEqual(readFixture("create_idle.json"));
@@ -644,12 +644,12 @@ describe("BFFTransport CSRF token", () => {
     let postCount = 0;
     let tokenCount = 0;
     const { baseUrl, server } = await startServerRaw((req, res) => {
-      if (req.method === "GET" && req.url === "/api/v1/csrf-token") {
+      if (req.method === "GET" && req.url === "/v1/csrf-token") {
         tokenCount += 1;
         sendJSON(res, 200, { csrf_token: `always-rejected-${tokenCount}` });
         return;
       }
-      if (req.method === "POST" && req.url === "/api/v1/sessions") {
+      if (req.method === "POST" && req.url === "/v1/sessions") {
         postCount += 1;
         sendJSON(res, 403, { error: { code: "csrf_invalid", message: "nope", retryable: true } });
         return;
@@ -659,7 +659,7 @@ describe("BFFTransport CSRF token", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const rejection = transport.createSession();
     await expect(rejection).rejects.toBeInstanceOf(CSRFRejectedError);
 
@@ -671,11 +671,11 @@ describe("BFFTransport CSRF token", () => {
   it("does NOT retry on a non-CSRF 403 (origin_not_allowed)", async () => {
     let postCount = 0;
     const { baseUrl, server } = await startServerRaw((req, res) => {
-      if (req.method === "GET" && req.url === "/api/v1/csrf-token") {
+      if (req.method === "GET" && req.url === "/v1/csrf-token") {
         sendJSON(res, 200, { csrf_token: "irrelevant" });
         return;
       }
-      if (req.method === "POST" && req.url === "/api/v1/sessions") {
+      if (req.method === "POST" && req.url === "/v1/sessions") {
         postCount += 1;
         sendJSON(res, 403, { error: { code: "origin_not_allowed", message: "host not allowed", retryable: false } });
         return;
@@ -685,7 +685,7 @@ describe("BFFTransport CSRF token", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const rejection = transport.createSession();
 
     await expect(rejection).rejects.toBeInstanceOf(OriginNotAllowedError);
@@ -696,14 +696,14 @@ describe("BFFTransport CSRF token", () => {
   it("shares exactly one in-flight mint across N concurrent control requests", async () => {
     let tokenRequests = 0;
     const { baseUrl, server } = await startServerRaw((req, res) => {
-      if (req.method === "GET" && req.url === "/api/v1/csrf-token") {
+      if (req.method === "GET" && req.url === "/v1/csrf-token") {
         tokenRequests += 1;
         // A small delay so the concurrent callers below genuinely overlap
         // rather than serializing by accident.
         setTimeout(() => sendJSON(res, 200, { csrf_token: "shared-token" }), 20);
         return;
       }
-      if (req.method === "POST" && req.url === `/api/v1/sessions/${sid}/input`) {
+      if (req.method === "POST" && req.url === `/v1/sessions/${sid}/input`) {
         sendJSON(res, 200, readFixture("input.json"));
         return;
       }
@@ -712,7 +712,7 @@ describe("BFFTransport CSRF token", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     const concurrentCallCount = 5;
     await Promise.all(
       Array.from({ length: concurrentCallCount }, () =>
@@ -728,12 +728,12 @@ describe("BFFTransport CSRF token", () => {
     let tokenCount = 0;
     const seenKeys: (string | undefined)[] = [];
     const { baseUrl, server } = await startServerRaw((req, res) => {
-      if (req.method === "GET" && req.url === "/api/v1/csrf-token") {
+      if (req.method === "GET" && req.url === "/v1/csrf-token") {
         tokenCount += 1;
         sendJSON(res, 200, { csrf_token: `k-${tokenCount}` });
         return;
       }
-      if (req.method === "POST" && req.url === "/api/v1/sessions") {
+      if (req.method === "POST" && req.url === "/v1/sessions") {
         postCount += 1;
         seenKeys.push(req.headers["idempotency-key"] as string | undefined);
         if (postCount === 1) {
@@ -748,7 +748,7 @@ describe("BFFTransport CSRF token", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     await transport.createSession();
 
     expect(postCount).toBe(2);
@@ -763,12 +763,12 @@ describe("BFFTransport CSRF token", () => {
     const seenKeys: (string | undefined)[] = [];
     const callerKey = "caller-chosen-key-abc";
     const { baseUrl, server } = await startServerRaw((req, res) => {
-      if (req.method === "GET" && req.url === "/api/v1/csrf-token") {
+      if (req.method === "GET" && req.url === "/v1/csrf-token") {
         tokenCount += 1;
         sendJSON(res, 200, { csrf_token: `k-${tokenCount}` });
         return;
       }
-      if (req.method === "POST" && req.url === "/api/v1/sessions") {
+      if (req.method === "POST" && req.url === "/v1/sessions") {
         postCount += 1;
         seenKeys.push(req.headers["idempotency-key"] as string | undefined);
         if (postCount === 1) {
@@ -783,7 +783,7 @@ describe("BFFTransport CSRF token", () => {
     });
     activeServer = server;
 
-    const transport = new BFFTransport({ baseUrl });
+    const transport = new HostTransport({ baseUrl });
     await transport.createSession(undefined, { idempotencyKey: callerKey });
 
     expect(postCount).toBe(2);
