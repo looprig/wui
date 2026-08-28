@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:check": "vite build && node scripts/check-dist.mjs",
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.node.json",
     "test": "vitest run",

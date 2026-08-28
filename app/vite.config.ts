@@ -86,15 +86,16 @@ export default defineConfig({
         },
       },
       {
-        // A second, node-only project for exactly one file: the assertions
-        // about THIS config object. It cannot live in the browser project —
-        // importing `vite.config.ts` there would drag @vitejs/plugin-react,
-        // @tailwindcss/vite and node:url into a browser bundle.
+        // A second, node-only project for the two things that cannot run in a
+        // browser: the assertions about THIS config object (importing
+        // `vite.config.ts` from the browser project would drag
+        // @vitejs/plugin-react, @tailwindcss/vite and node:url into a browser
+        // bundle) and the build-output guard, which imports `node:fs`.
         extends: "./vite.config.ts",
         test: {
-          name: "config",
+          name: "node",
           environment: "node",
-          include: ["vite.config.test.ts"],
+          include: ["vite.config.test.ts", "scripts/**/*.test.ts"],
         },
       },
     ],
