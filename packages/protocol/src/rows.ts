@@ -227,3 +227,65 @@ export function toolResultText(message: ConversationMessage | undefined): string
     .map((b) => b.text)
     .join("");
 }
+
+/**
+ * The minimal read surface the row selectors need. Declared here rather than
+ * importing `SessionView` so rows.ts stays a leaf: fold.ts imports rows.ts, and
+ * naming `SessionView` here would close the cycle.
+ */
+export interface RowSource {
+  rows: TranscriptRow[];
+}
+
+/**
+ * One loop's rows, ordered by the `journalSeq` of the COMMITTING event, with
+ * live rows (which have none) last in append order.
+ *
+ * There is deliberately NO global sort. `handlers_events.go` subscribes
+ * `LoopScope{All: true}`, so a child loop's frames share one stream with its
+ * parent's, and a subagent runs to completion INSIDE the parent turn that
+ * contains its tool call — its `TurnDone` therefore carries a LOWER
+ * `journal_seq` than the parent turn's own terminal. Ordering every row by
+ * `journal_seq` would splice the child's whole transcript into the middle of
+ * the parent's turn. Partitioning first is what makes that harmless; a child
+ * block anchors at the parent's subagent tool card via
+ * `LoopStarted.ParentToolUseID` instead (see `anchorOf`).
+ *
+ * Sorting a COPY, never `source.rows` itself: the view's array is the append
+ * order and the ordinal allocation depends on it.
+ *
+ * The comparator falls back to `ordinal` so that two rows committed by the SAME
+ * event — a `StepDone`'s assistant row and its tool rows — keep block order.
+ * That tiebreak is currently redundant (rows are only ever appended in ordinal
+ * order, so a stable sort already preserves it) and is written anyway: it stops
+ * being redundant the moment anything reorders `rows`.
+ */
+export function rowsForLoop(source: RowSource, loopId: string): TranscriptRow[] {
+  return source.rows
+    .filter((row) => row.loopId === loopId)
+    .sort((a, b) => {
+      // A live row has no journal_seq at all; it sorts after every committed
+      // row of its loop, which is exactly where the in-flight turn belongs.
+      const aSeq = a.journalSeq ?? Number.POSITIVE_INFINITY;
+      const bSeq = b.journalSeq ?? Number.POSITIVE_INFINITY;
+      if (aSeq !== bSeq) return aSeq - bSeq;
+      return a.ordinal - b.ordinal;
+    });
+}
+
+/**
+ * Every loop that has produced a row, in FIRST-APPEARANCE order — the order the
+ * loops themselves became visible, which is stable across folds because rows
+ * are only ever appended.
+ *
+ * `""` (a session-scoped or optimistic row) is not special-cased: it is a
+ * partition like any other, and dropping it would hide the composer's own
+ * pending row from a consumer that enumerates partitions.
+ */
+export function loopIdsInOrder(source: RowSource): string[] {
+  const seen: string[] = [];
+  for (const row of source.rows) {
+    if (!seen.includes(row.loopId)) seen.push(row.loopId);
+  }
+  return seen;
+}
