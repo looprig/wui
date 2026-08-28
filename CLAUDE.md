@@ -52,6 +52,15 @@ Because nothing imports harness until the contract guard exists, **`go mod tidy`
 - `honnef.co/go/tools/cmd/staticcheck` — extended static analysis (dev/tool only)
 - `github.com/looprig/harness` — test-only; the pinned wire contract the vendored `contract/` directory is asserted against, and the source of the event fixtures
 
+npm, in `app/` (the SPA), all named by the wui implementation plan's Phase 5:
+
+- `@tanstack/react-router` — the router, with BROWSER history. Capstan's platform design §7 pins the same router on hash history; wui departs, because `Assets()` already serves the SPA fallback in Go and `/sessions/<uuid>` is therefore a real, refreshable path. Deliberately NOT taken alongside it: TanStack Query and Zustand (the store is `@looprig/protocol`'s), and `@virtuoso.dev/message-list`, whose licence is unresolved.
+- `tailwindcss` + `@tailwindcss/vite` — the styling layer capstan-spec.md §12's design system is written against.
+- `clsx` + `tailwind-merge` — `cn()`, shadcn/ui's own class helper. Together they are what makes a conditional Tailwind class safe to override.
+- `@fontsource-variable/inter`, `@fontsource-variable/jetbrains-mono` — self-hosted copies of the two §12 typefaces. Self-hosted rather than CDN-linked so the embedded bundle stays a single offline artefact and the browser makes no third-party request.
+
+`react-virtuoso` is named by the plan for the virtualized transcript (task 5.19) and is deliberately **not** installed yet: nothing imports it, and an unused dependency in `package.json` is a supply-chain surface with no benefit.
+
 ## Secure Coding Patterns
 
 **Randomness** — Use `crypto/rand` for anything security-sensitive (tokens, nonces, IDs). Never use `math/rand` for secrets.
