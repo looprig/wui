@@ -23,7 +23,7 @@
  * NOT decoded: it keeps the generic `other` payload, exactly as before.
  */
 import type { EventEnvelope } from "./types.js";
-import { isRecord, str } from "./blocks.js";
+import { decodeMessage, isRecord, str, type ConversationMessage } from "./blocks.js";
 
 /** The canonical all-zeros uuid, as `uuid.UUID.String()` renders `[16]byte{}`. */
 const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
@@ -56,8 +56,28 @@ export function isZeroUUID(id: string | undefined): boolean {
   return id === undefined || id === "" || id === ZERO_UUID;
 }
 
+/**
+ * TurnStarted is the first enduring turn event, carrying the exact UserMessage
+ * committed as the turn's first message. TurnFoldedInto is the same shape for
+ * queued input folded into a mandatory tool-continuation.
+ *
+ * Neither payload tells you whether to render a user row: that is decided by
+ * Header.Cause.LoopID (zero = genuine user input; non-zero = a subagent
+ * hand-back), which lives on the shared header, not here. isZeroUUID above is
+ * that predicate, and DecodedEnduring.causeLoopId is what it reads.
+ *
+ * Both fields are `omitzero` on the wire, so a nil *content.UserMessage and a
+ * zero TurnIndex are ABSENT keys, not nulls or zeros — verified by marshalling
+ * a real TurnStarted{} (see test/enduring.test.ts's provenance note).
+ */
+export interface TurnOpenerPayload {
+  kind: "TurnStarted" | "TurnFoldedInto";
+  turnIndex: number;
+  message: ConversationMessage | undefined;
+}
+
 /** The type-specific half of a decoded enduring event. Extended per task. */
-export type EnduringPayload = { kind: "other" };
+export type EnduringPayload = TurnOpenerPayload | { kind: "other" };
 
 /**
  * A decoded enduring event: the shared header coordinates (promoted onto the
@@ -101,10 +121,25 @@ export function decodeEnduring(envelope: EventEnvelope): DecodedEnduring {
 }
 
 function decodePayload(type: string, raw: Record<string, unknown>): EnduringPayload {
-  void raw;
   switch (type) {
+    case "TurnStarted":
+    case "TurnFoldedInto":
+      return {
+        kind: type,
+        turnIndex: num(raw["turn_index"]),
+        message: isRecord(raw["message"]) ? decodeMessage(raw["message"]) : undefined,
+      };
     default:
       // The long tail keeps the generic marker, per design §3a.
       return { kind: "other" };
   }
+}
+
+/**
+ * `omitzero` drops a zero numeric field, so an absent value means 0. A
+ * non-number reads as 0 too rather than NaN: a NaN turn index would poison
+ * every downstream comparison silently, where 0 is at least a real turn.
+ */
+function num(x: unknown): number {
+  return typeof x === "number" ? x : 0;
 }

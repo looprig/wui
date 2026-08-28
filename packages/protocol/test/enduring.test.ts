@@ -261,3 +261,134 @@ describe("decodeEnduring: the untyped long tail", () => {
     expect(decoded.payload).toEqual({ kind: "other" });
   });
 });
+
+// --- Task 3.5: the turn openers ---------------------------------------------
+
+/**
+ * ## Provenance of the wire strings from here down
+ *
+ * `contract/fixtures/` carries exactly TWO enduring envelopes — `journal_page
+ * .json`'s TurnDone and `status_running.json`'s StepDone — so TurnStarted,
+ * TurnFoldedInto, TurnRejected, TurnFailed, TurnInterrupted and InputCancelled
+ * have NO fixture coverage at all. Hand-authoring them would only encode this
+ * author's beliefs about the wire and pass happily if those beliefs were wrong
+ * (the mistake blocks.test.ts's header describes).
+ *
+ * Every `*_WIRE` constant below is therefore the VERBATIM stdout of
+ * `event.MarshalEvent` in `github.com/looprig/harness@v0.30.0` — this module's
+ * pin, and the version `contract/VERSION` records — driven by a throwaway main
+ * package that constructed the real event values. They are parsed with
+ * JSON.parse so the tests consume bytes, not JS object literals. The two real
+ * fixtures are still read from disk and asserted alongside them.
+ *
+ * Regenerate by marshalling the same values against that harness version. The
+ * ids are helpers.ts's SESSION_ID / LOOP_A / LOOP_B plus the four below, so the
+ * bytes line up with the rest of the suite.
+ *
+ * Cases labelled NOT REAL WIRE are exactly that: shapes a corrupted record or
+ * a wrong assumption would produce, kept so a decoder reading the wrong key
+ * could not pass this file.
+ */
+const TURN_1 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const STEP_1 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const EVENT_1 = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+const CMD_1 = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+
+/** Parses one real marshalled envelope, so the test decodes bytes, not a literal. */
+function wireEnvelope(json: string): EventEnvelope {
+  return asEnvelope(object(JSON.parse(json) as unknown));
+}
+
+const TURN_STARTED_WIRE =
+  '{"cause":{"command_id":"ffffffff-ffff-4fff-8fff-ffffffffffff"},"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"user","blocks":[{"Text":"do the thing","type":"text"}]},"session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":3,"type":"TurnStarted","v":1}';
+
+const TURN_STARTED_BARE_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"TurnStarted","v":1}';
+
+const TURN_FOLDED_INTO_WIRE =
+  '{"cause":{"loop_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","command_id":"ffffffff-ffff-4fff-8fff-ffffffffffff"},"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","message":{"role":"user","blocks":[{"Text":"subagent result","type":"text"}]},"session_id":"11111111-1111-4111-8111-111111111111","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","turn_index":4,"type":"TurnFoldedInto","v":1}';
+
+describe("decodeEnduring: turn openers", () => {
+  it("decodes a REAL TurnStarted's user message and turn_index", () => {
+    const decoded = decodeEnduring(wireEnvelope(TURN_STARTED_WIRE));
+    expect(decoded.payload).toStrictEqual({
+      kind: "TurnStarted",
+      turnIndex: 3,
+      message: {
+        role: "user",
+        blocks: [{ type: "text", text: "do the thing" }],
+        toolUseId: "",
+        isError: false,
+      },
+    });
+    // The header half the §3b gate reads. MarshalEvent emitted `cause` with a
+    // command_id and NO loop_id, which is the genuine-user-input shape.
+    expect(decoded.causeCommandId).toBe(CMD_1);
+    expect(decoded.causeLoopId).toBe("");
+    expect(isZeroUUID(decoded.causeLoopId)).toBe(true);
+    expect(decoded.turnId).toBe(TURN_1);
+    expect(decoded.eventId).toBe(EVENT_1);
+  });
+
+  it("decodes a REAL TurnFoldedInto under its own kind, with its own turn_index", () => {
+    const decoded = decodeEnduring(wireEnvelope(TURN_FOLDED_INTO_WIRE));
+    expect(decoded.payload).toStrictEqual({
+      kind: "TurnFoldedInto",
+      turnIndex: 4,
+      message: {
+        role: "user",
+        blocks: [{ type: "text", text: "subagent result" }],
+        toolUseId: "",
+        isError: false,
+      },
+    });
+    // A non-zero cause loop id is a subagent hand-back: §3b commits NO user row.
+    expect(decoded.causeLoopId).toBe(LOOP_B);
+    expect(isZeroUUID(decoded.causeLoopId)).toBe(false);
+  });
+
+  it("keeps the two openers distinguishable, which is the only thing the kind carries", () => {
+    // Byte-for-byte the same payload shape; only `type` differs, and §3b's rule
+    // is identical for both — but a renderer still labels them apart.
+    expect(decodeEnduring(wireEnvelope(TURN_STARTED_WIRE)).payload.kind).toBe("TurnStarted");
+    expect(decodeEnduring(wireEnvelope(TURN_FOLDED_INTO_WIRE)).payload.kind).toBe("TurnFoldedInto");
+  });
+
+  it("survives a REAL omitzero TurnStarted: no message key, no turn_index key", () => {
+    // MarshalEvent of TurnStarted{Message: nil, TurnIndex: 0} — `omitzero` on
+    // both fields drops both keys, and the wholly-zero Cause drops `cause` too.
+    const raw = object(JSON.parse(TURN_STARTED_BARE_WIRE) as unknown);
+    expect(Object.hasOwn(raw, "message")).toBe(false);
+    expect(Object.hasOwn(raw, "turn_index")).toBe(false);
+    expect(Object.hasOwn(raw, "cause")).toBe(false);
+    const decoded = decodeEnduring(asEnvelope(raw));
+    expect(decoded.payload).toStrictEqual({
+      kind: "TurnStarted",
+      turnIndex: 0,
+      message: undefined,
+    });
+  });
+
+  it("reports a non-object message as absent rather than an empty row", () => {
+    // NOT REAL WIRE: `message` is `*content.UserMessage`, so a corrupted record
+    // is the only way `null` gets here. Returning a role-less empty message
+    // would render a blank user row; `undefined` lets the projection skip it.
+    const decoded = decodeEnduring(
+      envelope({ type: "TurnStarted", loopId: LOOP_A, payload: { message: null } }),
+    );
+    expect(decoded.payload).toStrictEqual({ kind: "TurnStarted", turnIndex: 0, message: undefined });
+  });
+
+  it("reports a non-numeric turn_index as 0 rather than NaN", () => {
+    // NOT REAL WIRE: TurnIndex is a Go int. NaN would poison every comparison
+    // downstream, so a malformed value reads as the zero turn.
+    const decoded = decodeEnduring(
+      envelope({ type: "TurnFoldedInto", loopId: LOOP_A, payload: { turn_index: "3" } }),
+    );
+    expect(decoded.payload).toStrictEqual({
+      kind: "TurnFoldedInto",
+      turnIndex: 0,
+      message: undefined,
+    });
+  });
+});
