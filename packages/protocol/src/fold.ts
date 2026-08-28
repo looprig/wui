@@ -839,6 +839,15 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
       }
       return { ok: true, view: out };
     }
+    case "TurnDone":
+      // Defensive, and only defensive: every completed step already committed
+      // through its own StepDone. What survives here is a step that decoded
+      // nothing usable and so emitted no StepDone at all. A still-running card
+      // at a SUCCESSFUL terminal resolves "ok" — the step finalized.
+      return {
+        ok: true,
+        view: commitTerminalSegment(next, decoded.loopId, journalSeq, "ok"),
+      };
     case "GateOpened": {
       // Copy-on-write, like every other branch here: fold() must never mutate
       // the view it was handed (test/fold-immutability.test.ts pins that, and
@@ -878,6 +887,93 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
 function dropLiveRows(view: SessionView, loopId: string): SessionView {
   if (!view.rows.some((r) => r.live && r.loopId === loopId)) return view;
   return { ...view, rows: view.rows.filter((r) => !(r.live && r.loopId === loopId)) };
+}
+
+/**
+ * True for a live assistant row of `loopId` that carries no prose at all.
+ *
+ * `applyLiveChunk` opens a segment on the FIRST chunk it sees whatever that
+ * chunk's length, so a zero-length delta leaves an empty row behind; committing
+ * it would put a blank assistant bubble in the transcript. All three prose
+ * fields are checked, not just `text` — a refusal-only segment is not empty,
+ * and dropping it would erase a declined turn entirely (`refusalOf`'s doc
+ * comment in rows.ts is the same argument one layer up).
+ */
+function isEmptyLiveProse(row: TranscriptRow, loopId: string): boolean {
+  return (
+    row.live &&
+    row.loopId === loopId &&
+    row.kind === "assistant" &&
+    row.thinking === "" &&
+    row.text === "" &&
+    row.refusal === ""
+  );
+}
+
+/**
+ * Discards `loopId`'s live prose row when it accumulated nothing. Called by
+ * every terminal BEFORE `commitLiveRows`, so "commit any NON-EMPTY live
+ * segment" (§3b rule 2) is literally what happens.
+ */
+function dropEmptyLiveProse(view: SessionView, loopId: string): SessionView {
+  if (!view.rows.some((r) => isEmptyLiveProse(r, loopId))) return view;
+  return { ...view, rows: view.rows.filter((r) => !isEmptyLiveProse(r, loopId)) };
+}
+
+/**
+ * Commits every live row of `loopId` in place of discarding it: each row is
+ * REPLACED (copy-on-write) with `live: false` and the terminal's `journalSeq`,
+ * keeping its ordinal and its position, so a per-row `Object.is` selector sees
+ * the transition and the transcript's order is unchanged.
+ *
+ * This is §3b rule 2's "every turn terminal first commits any non-empty live
+ * segment, then resets it". It matters because a step that decoded nothing
+ * usable emits NO `StepDone` at all — harness's `MarshalEvent` refuses a
+ * `StepDone` with empty `Messages` — and `StepDone` is the only other place a
+ * live segment is snapped. Without this, an abnormal terminal would silently
+ * discard the partial work and dangle the segment into the next turn.
+ *
+ * `resolveRunning` decides what a still-RUNNING tool card becomes: `"ok"` at a
+ * successful terminal (the step finalized — tui's `stepToolCard` applies the
+ * same rule), `"cancelled"` on an interrupt, `"error"` on a failure. A card
+ * that already resolved keeps its own status: blanket-assigning would rewrite a
+ * real tool failure as a success.
+ */
+function commitLiveRows(
+  view: SessionView,
+  loopId: string,
+  journalSeq: number | undefined,
+  resolveRunning: ToolRowStatus,
+): SessionView {
+  if (!view.rows.some((r) => r.live && r.loopId === loopId)) return view;
+  const rows = view.rows.map((row): TranscriptRow => {
+    if (!row.live || row.loopId !== loopId) return row;
+    if (row.kind === "tool") {
+      return {
+        ...row,
+        live: false,
+        journalSeq,
+        status: row.status === "running" ? resolveRunning : row.status,
+      };
+    }
+    return { ...row, live: false, journalSeq };
+  });
+  return { ...view, rows };
+}
+
+/**
+ * The shared terminal prologue: drop an empty live prose row, then commit every
+ * remaining live row of the loop. Every turn terminal calls this FIRST, before
+ * appending anything of its own — a tombstone or an error notice appended
+ * before the partial work would read as work done after the turn ended.
+ */
+function commitTerminalSegment(
+  view: SessionView,
+  loopId: string,
+  journalSeq: number | undefined,
+  resolveRunning: ToolRowStatus,
+): SessionView {
+  return commitLiveRows(dropEmptyLiveProse(view, loopId), loopId, journalSeq, resolveRunning);
 }
 
 function appendRow(view: SessionView, draft: TranscriptRowDraft): SessionView {
