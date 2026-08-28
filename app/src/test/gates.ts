@@ -1,4 +1,4 @@
-import { GATE_KIND_PERMISSION, type Gate } from "@looprig/protocol";
+import { GATE_KIND_PERMISSION, isAnswerableGate, type Gate } from "@looprig/protocol";
 import type { OpenGate } from "@looprig/react";
 
 export const GATE_ID = "4f5a6b7c-8d9e-4f0a-8b1c-2d3e4f5a6b7c";
@@ -43,14 +43,22 @@ export function gate(overrides: Partial<Gate> = {}): Gate {
   };
 }
 
-/** `useGate`'s projection of one open gate, with the per-tab answer state zeroed. */
+/**
+ * `useGate`'s projection of one open gate, with the per-tab answer state zeroed.
+ *
+ * `answerable` is DERIVED through `isAnswerableGate` and applied last, so a
+ * fixture cannot claim a form gate is answerable — a state the real hook can
+ * never produce, and the one a test asserting "only permission gates get
+ * buttons" would otherwise pass against vacuously.
+ */
 export function openGate(overrides: Partial<OpenGate> = {}): OpenGate {
+  const envelope = gate(overrides);
   return {
-    ...gate(),
-    answerable: true,
+    ...envelope,
     responding: false,
     alreadyAnswered: false,
     error: undefined,
     ...overrides,
+    answerable: isAnswerableGate(envelope),
   };
 }
