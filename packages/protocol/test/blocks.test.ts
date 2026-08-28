@@ -26,9 +26,11 @@
  * are seeds in content/block_json_fuzz_test.go (key order is not significant;
  * MarshalBlock round-trips through a map).
  *
- * The one exception is the lowercase-`text` case, which is deliberately NOT
- * real wire: it is the shape a naive snake_case assumption would produce, and
- * it exists so a decoder that read the wrong key could not pass this file.
+ * The NEGATIVE cases are deliberately NOT real wire: the lowercase-`text`
+ * block, the Go-cased `tool_result` block, the wrongly-typed fields and the
+ * non-object inputs are the shapes a wrong assumption or a corrupted record
+ * would produce, and they exist so a decoder that read the wrong key could not
+ * pass this file. Each is labelled where it appears.
  */
 import { describe, expect, it } from "vitest";
 import { decodeBlock, decodeBlocks } from "../src/blocks.js";
