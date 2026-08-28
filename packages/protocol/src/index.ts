@@ -1,32 +1,69 @@
-// Public barrel export for @looprig/client (sdk/core).
-//
-// This package is the framework-neutral TypeScript boundary over harness's
-// `pkg/serve` wire contract: type-level DTOs (types.ts) derived from the
-// vendored JSON Schema documents (schema.ts), ajv-backed runtime validation
-// (validate.ts) compiled from those same schemas, a typed error hierarchy
-// over the error envelope (errors.ts), a transport abstraction plus its
-// same-origin browser implementation (transport.ts), the thin client
-// composition over a transport (client.ts), and a streaming SSE frame
-// parser for the live event plane (sse.ts).
-
+/**
+ * The public surface of `@looprig/protocol`.
+ *
+ * This package is the framework-neutral TypeScript boundary over harness's
+ * `pkg/serve` wire contract, and it is the ONE package a non-React consumer
+ * installs — `packages/react` is only the reference adapter, so a Vue or Solid
+ * author must be able to reach every capability from this barrel and never need
+ * a deep import into `src/`. It has no framework dependencies, which is the
+ * package's whole reason to exist (design §1). `test/surface.test.ts` pins
+ * every name below.
+ *
+ * The layers, bottom up:
+ *
+ *  - `types` / `schema` / `validate` — DTOs derived from the vendored JSON
+ *    Schema documents, the documents themselves, and the ajv-compiled runtime
+ *    validators.
+ *  - `errors` / `transport` / `client` — the typed error hierarchy over the
+ *    error envelope, the transport abstraction plus its browser and
+ *    same-origin implementations, and the thin client composition over one.
+ *  - `sse` / `live` — the streaming frame parser for the live event plane and
+ *    the `fetch`-backed source that feeds it.
+ *  - `blocks` / `gate` / `enduring` — decoders for the payloads
+ *    `event_envelope.schema.json` leaves open: content blocks and messages,
+ *    the gate envelope, and the per-type enduring payloads.
+ *  - `rows` / `fold` / `join` — the transcript row projection, the session
+ *    state-machine fold both segments accumulate into, and the exact
+ *    history-to-live join that drives it.
+ *  - `store` — the framework-neutral subscribe/notify store over that join.
+ *  - `content` / `gate-actions` — small composition helpers for the UI layer.
+ *
+ * `blocks.ts`'s `isRecord` and `str` are deliberately NOT re-exported: they are
+ * cross-module decode helpers for `enduring.ts`, `gate.ts` and `fold.ts`, not
+ * public API on a package root.
+ */
 export * from "./types.js";
 export * from "./validate.js";
 export * from "./errors.js";
 export * from "./transport.js";
 export * from "./client.js";
 export * from "./sse.js";
+export {
+  decodeBlock,
+  decodeBlocks,
+  decodeMessage,
+  decodeMessages,
+  type ContentBlock,
+  type ConversationMessage,
+  type OpaqueBlockValue,
+  type RefusalBlockValue,
+  type TextBlockValue,
+  type ThinkingBlockValue,
+  type ToolResultBlockValue,
+  type ToolUseBlockValue,
+} from "./blocks.js";
+export * from "./gate.js";
+export * from "./enduring.js";
+export * from "./rows.js";
 export * from "./fold.js";
 export * from "./join.js";
 export * from "./live.js";
 export * from "./store.js";
 export * from "./content.js";
-export * from "./blocks.js";
 export * from "./gate-actions.js";
-export * from "./gate.js";
-export * from "./enduring.js";
-export * from "./rows.js";
 export {
   allSchemas,
+  bffErrorResponseSchema,
   capabilitiesSchema,
   createRequestSchema,
   createResponseSchema,
