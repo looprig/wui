@@ -1,7 +1,9 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { createHostTransport, type LooprigTransport } from "@looprig/protocol";
 import { useSessionList } from "@looprig/react";
 import { SessionRow } from "../components/session-row";
+import { SessionsFilterBar, type StatusFilter } from "../components/sessions-filter-bar";
+import { filterSessions } from "../lib/filter-sessions";
 import { sessionsListState } from "../lib/sessions-state";
 
 export interface SessionsPageProps {
@@ -41,6 +43,9 @@ export function SessionsPage({ transport, onOpenSession }: SessionsPageProps = {
   const host = useMemo(() => transport ?? createHostTransport(), [transport]);
   const { sessions, loading, error, limit } = useSessionList(host);
   const state = sessionsListState({ sessions, loading, error, limit });
+  const [query, setQuery] = useState("");
+  const [status, setStatus] = useState<StatusFilter>("all");
+  const visible = useMemo(() => filterSessions(sessions, status, query), [sessions, status, query]);
 
   return (
     <main data-testid="sessions-page" data-state={state} className="mx-auto max-w-4xl p-6">
@@ -75,16 +80,38 @@ export function SessionsPage({ transport, onOpenSession }: SessionsPageProps = {
           <p className="text-sm">Sessions you start will show up here.</p>
         </div>
       ) : (
-        <div data-testid="sessions-list" className="overflow-hidden rounded-md border border-border bg-card">
-          {sessions.map((session) => (
-            <SessionRow
-              key={session.session_id}
-              session={session}
-              href={`/sessions/${session.session_id}`}
-              onActivate={onOpenSession ? () => onOpenSession(session.session_id) : undefined}
-            />
-          ))}
-        </div>
+        <>
+          <SessionsFilterBar
+            query={query}
+            status={status}
+            onQueryChange={setQuery}
+            onStatusChange={setStatus}
+          />
+          {visible.length === 0 ? (
+            /* Distinct from `sessions-empty`: the catalogue is not empty, the
+               filter is just too narrow, and the fix is to widen it rather
+               than to start a session. The bar stays mounted above so that fix
+               is one keystroke away. */
+            <div
+              data-testid="sessions-no-match"
+              className="rounded-md border border-dashed border-border p-10 text-center text-muted"
+            >
+              <p className="font-medium">No sessions match this filter</p>
+              <p className="text-sm">Clear the search or pick a different status.</p>
+            </div>
+          ) : (
+            <div data-testid="sessions-list" className="overflow-hidden rounded-md border border-border bg-card">
+              {visible.map((session) => (
+                <SessionRow
+                  key={session.session_id}
+                  session={session}
+                  href={`/sessions/${session.session_id}`}
+                  onActivate={onOpenSession ? () => onOpenSession(session.session_id) : undefined}
+                />
+              ))}
+            </div>
+          )}
+        </>
       )}
     </main>
   );

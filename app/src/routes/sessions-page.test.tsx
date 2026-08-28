@@ -5,7 +5,13 @@ import { NetworkError } from "@looprig/protocol";
 import { FakeTransport, emptySessionList } from "../test/fakes";
 import { SessionsPage } from "./sessions-page";
 
-const BRANCHES = ["sessions-loading", "sessions-error", "sessions-empty", "sessions-list"] as const;
+const BRANCHES = [
+  "sessions-loading",
+  "sessions-error",
+  "sessions-empty",
+  "sessions-no-match",
+  "sessions-list",
+] as const;
 
 /** Exactly one of the four branches may be in the document at a time. */
 function renderedBranches(): string[] {
