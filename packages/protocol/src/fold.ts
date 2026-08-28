@@ -473,7 +473,8 @@ function foldToolCallStartedCard(
       startedHeader: header,
       completedHeader: undefined,
     };
-    return { ...view, toolCalls: [...view.toolCalls, card] };
+    view.toolCalls.push(card);
+    return { ...view };
   }
 
   // A card for this id already exists (see the ToolCallCard doc comment for why
@@ -507,7 +508,8 @@ function foldToolCallCompletedCard(
       startedHeader: undefined,
       completedHeader: header,
     };
-    return { ...view, toolCalls: [...view.toolCalls, card] };
+    view.toolCalls.push(card);
+    return { ...view };
   }
 
   const toolCalls = [...view.toolCalls];
@@ -654,7 +656,10 @@ function foldEphemeral(input: SessionView, frame: EphemeralFrame): FoldResult {
       const parsed = parseTokenDeltaChunk(delta);
       if (!parsed.ok) return parsed;
       const entry: ContentDelta = { ...parsed.value, header };
-      const withContent: SessionView = { ...view, content: [...view.content, entry] };
+      // In place, and only AFTER the parse succeeded -- a failed fold must
+      // append nothing (see appendRow).
+      view.content.push(entry);
+      const withContent: SessionView = { ...view };
       return { ok: true, view: applyLiveChunk(withContent, header, parsed.value) };
     }
 
@@ -740,7 +745,8 @@ function foldEphemeral(input: SessionView, frame: EphemeralFrame): FoldResult {
 
     case "input_queued": {
       const marker: QueuedInputMarker = { header };
-      return { ok: true, view: { ...view, queuedInputs: [...view.queuedInputs, marker] } };
+      view.queuedInputs.push(marker);
+      return { ok: true, view: { ...view } };
     }
 
     case "compaction_started": {
@@ -757,7 +763,9 @@ function foldEphemeral(input: SessionView, frame: EphemeralFrame): FoldResult {
         basis: { revision: basis["revision"], throughEventId: basis["through_event_id"] },
         header,
       };
-      return { ok: true, view: { ...view, compactions: [...view.compactions, marker] } };
+      // After both shape checks: a rejected frame appends nothing.
+      view.compactions.push(marker);
+      return { ok: true, view: { ...view } };
     }
 
     default: {
@@ -794,13 +802,15 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
     createdAt: envelope.created_at,
     envelope,
   };
+  // Appended IN PLACE (design §3c). This runs on EVERY enduring event including
+  // the whole cold journal replay, so spreading the array here was O(M^2)
+  // before first paint -- the dominant cost on the "open a session that already
+  // ran" path. See appendRow for the full carve-out and what still holds.
+  view.statusEvents.push(marker);
   // Register the producing loop next to the marker: a loop first seen through
   // an ordinary event is recorded UNOBSERVED, which is what keeps its rows and
   // tags them rather than dropping them when its LoopStarted never arrives.
-  const next: SessionView = ensureLoop(
-    { ...view, statusEvents: [...view.statusEvents, marker] },
-    envelope.loop_id ?? "",
-  );
+  const next: SessionView = ensureLoop({ ...view }, envelope.loop_id ?? "");
 
   // Kind-specific cases alongside the generic fallback — this module's own
   // documented extension point (see the "Gates are NOT folded here" section
@@ -1059,21 +1069,6 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
 }
 
 /**
- * Appends `draft` to a COPY of `view.rows`, allocating its ordinal here so no
- * caller can pick one. Copy-on-write in both directions: the input view's array
- * is never appended to, and the rows already in it are carried over BY
- * REFERENCE, which is what keeps a per-row `Object.is` selector from re-rendering
- * every card on every event. Task 3.25 replaces the array copy with an in-place
- * append and adds the compensating assertion; the row objects stay
- * copy-on-write regardless.
- */
-/**
- * Drops every live row belonging to `loopId`, leaving other loops untouched —
- * the discard half of the StepDone snap. Rows that survive are carried over BY
- * REFERENCE, so a per-row Object.is selector does not re-render them, and a
- * loop with nothing live returns the very same view.
- */
-/**
  * True for a row that belongs to `loopId`'s in-flight LIVE SEGMENT — the thing a
  * StepDone snaps and a turn terminal commits.
  *
@@ -1088,6 +1083,12 @@ function isLiveSegmentRow(row: TranscriptRow, loopId: string): boolean {
   return row.live && row.loopId === loopId && row.kind !== "user";
 }
 
+/**
+ * Drops every live row belonging to `loopId`, leaving other loops untouched —
+ * the discard half of the StepDone snap. Rows that survive are carried over BY
+ * REFERENCE, so a per-row Object.is selector does not re-render them, and a
+ * loop with nothing live returns the very same view.
+ */
 function dropLiveRows(view: SessionView, loopId: string): SessionView {
   if (!view.rows.some((r) => isLiveSegmentRow(r, loopId))) return view;
   return { ...view, rows: view.rows.filter((r) => !isLiveSegmentRow(r, loopId)) };
@@ -1268,9 +1269,45 @@ function relinkLoop(
   });
 }
 
+/**
+ * Appends `draft` to `view.rows` IN PLACE, allocating its ordinal here so no
+ * caller can pick one.
+ *
+ * ## The one place fold writes through its input, and why it is safe
+ *
+ * Design §3c: "The outer array may be appended in place." Copying it per event
+ * made a cold journal replay O(M^2) before first paint, which is the exact path
+ * the row projection exists to serve. It is safe because NOTHING holds an older
+ * `SessionView` and expects it frozen: `joinSessionView` keeps one reassigned
+ * `view` variable, and the only place it hands back a PREVIOUS view is a failed
+ * fold -- which appends nothing, so "previous" and "current" are the same value
+ * there anyway. No consumer diffs two views.
+ *
+ * The consequence is real and deliberate: a caller that DOES retain an older
+ * view sees the newer rows through it, while that stale object's `nextOrdinal`
+ * stays where it was. Retaining a view is therefore not supported; retaining a
+ * ROW is, and that is what the per-row selectors actually do.
+ *
+ * ## What stays copy-on-write, and is asserted
+ *
+ * - Row OBJECTS. Completing a tool card or extending the live segment builds a
+ *   NEW object (`replaceRow`), so a `useSyncExternalStore` per-row selector
+ *   comparing with `Object.is` re-renders exactly the row that changed.
+ *   test/rows.test.ts freezes committed rows, so even a value-preserving
+ *   write-through throws.
+ * - The Maps (`gates`, `loops`, `pending`, `commandOutcomes`).
+ * - Every NON-append edit: `replaceRow`, `dropLiveRows`, `dropEmptyLiveProse`,
+ *   `commitLiveRows` and `resolveCommand` all build a new array. The carve-out
+ *   is for APPENDS only, and narrowly so: an append leaves an older view
+ *   holding a coherent PREFIX, while a replacement or a removal would rewrite
+ *   history it had already shown.
+ * - A FAILED fold appends nothing. Every push above happens after the case's
+ *   validation, which is what keeps the view `join.ts` yields on error correct.
+ */
 function appendRow(view: SessionView, draft: TranscriptRowDraft): SessionView {
   const committed = { ...draft, ordinal: view.nextOrdinal };
-  return { ...view, rows: [...view.rows, committed], nextOrdinal: view.nextOrdinal + 1 };
+  view.rows.push(committed);
+  return { ...view, nextOrdinal: view.nextOrdinal + 1 };
 }
 
 /**

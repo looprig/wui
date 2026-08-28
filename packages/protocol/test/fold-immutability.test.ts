@@ -1,11 +1,35 @@
 /**
- * fold.ts's module contract: "returning a new SessionView (never mutates
- * `view` in place)". join.ts depends on it — `toJoinEvent` yields the PRIOR
- * view on a failed fold, which is only correct if the failed fold left it
- * untouched. Nothing pinned it before this test. Every later task in Phase 3
- * edits fold, and task 3.25 deliberately AMENDS this contract to append the
- * outer arrays in place; that amendment is only safe if the behaviour it
- * replaces was pinned first, which is what this file is for.
+ * fold.ts's immutability contract. AMENDED, deliberately and once.
+ *
+ * The original pin was blanket: "fold returns a new SessionView and never
+ * mutates `view` in place". Design §3c narrows it — "The outer array may be
+ * appended in place" — because spreading `statusEvents` ran on EVERY enduring
+ * event including the whole cold journal replay, which is O(M^2) before first
+ * paint on exactly the path the row projection exists to serve.
+ *
+ * The narrowing is safe for one reason and it is checked, not assumed:
+ * `joinSessionView` keeps ONE reassigned `view` variable, and the only place it
+ * hands back a PREVIOUS view is a failed fold — which appends nothing, so
+ * "previous" and "current" are the same value there. Nothing diffs two
+ * SessionViews.
+ *
+ * The blanket assertion below is therefore SCOPED rather than deleted, and the
+ * three properties the amendment does NOT touch are asserted explicitly so the
+ * carve-out cannot quietly widen:
+ *
+ *  1. fold never mutates an EXISTING element of any array. Row objects are
+ *     copy-on-write (test/rows.test.ts freezes them, so even a value-preserving
+ *     write-through throws) and so are `toolCalls` cards.
+ *  2. fold never mutates the Maps — `gates`, `loops`, `pending`,
+ *     `commandOutcomes` — in place; each is copied on write.
+ *  3. A FAILED fold appends nothing and changes nothing. This is what keeps the
+ *     view `join.ts` yields on error correct, and it is the whole reason the
+ *     amendment is safe at all.
+ *
+ * Only APPENDS are carved out. `replaceRow`, `dropLiveRows`,
+ * `dropEmptyLiveProse`, `commitLiveRows` and `resolveCommand` still build a new
+ * array: an append leaves any retained view holding a coherent PREFIX, while a
+ * replacement or a removal would rewrite history it had already shown.
  *
  * The inputs below deliberately include ids that COLLIDE with the seeded
  * view's (`seed`), not just fresh ones. `foldEphemeral`'s
@@ -74,27 +98,6 @@ const SEEDED_ORPHAN_CMD = "dddddddd-1111-4111-8111-111111111111";
 
 function gateOpenedWire(gateId: string): Record<string, unknown> {
   return { gate: { id: gateId, kind: "harness.permission", prompt: { title: "Allow?" } } };
-}
-
-/**
- * The subset of `SessionView`'s keys whose value is an array. Now that `gates`
- * exists this is a real subset, and the narrowing is what keeps `.length`
- * type-safe below rather than a cast.
- */
-type ArrayKey = {
-  [K in keyof SessionView]: SessionView[K] extends readonly unknown[] ? K : never;
-}[keyof SessionView];
-
-/**
- * Returns the view's array-valued keys. Derived rather than hardcoded so that
- * an array added to `SessionView` later is checked without editing this file;
- * a non-array field (the `gates` Map) is skipped here and asserted separately
- * rather than crashing on `.length`.
- */
-function arrayKeys(view: SessionView): ArrayKey[] {
-  return (Object.keys(view) as Array<keyof SessionView>).filter(
-    (k): k is ArrayKey => Array.isArray(view[k]),
-  );
 }
 
 /**
@@ -195,16 +198,79 @@ function inputs(): FoldInput[] {
   ];
 }
 
+/**
+ * Every `SessionView` key EXCEPT the append-only arrays §3c carves out. A field
+ * added to `SessionView` later is not silently exempt: it has to be listed here
+ * or in APPEND_ONLY_ARRAYS, which is a decision rather than an omission.
+ */
+const APPEND_ONLY_ARRAYS = [
+  "content",
+  "toolCalls",
+  "queuedInputs",
+  "compactions",
+  "statusEvents",
+  "rows",
+] as const satisfies readonly (keyof SessionView)[];
+
+/** The view with the carved-out arrays replaced by their LENGTH. */
+function protectedPart(view: SessionView): unknown {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(view) as Array<keyof SessionView>) {
+    out[key] = (APPEND_ONLY_ARRAYS as readonly string[]).includes(key)
+      ? undefined
+      : structuredClone(view[key]);
+  }
+  return out;
+}
+
 describe("fold immutability contract", () => {
-  it("does not mutate its input view, for any input kind", () => {
+  it("does not mutate anything outside the append-only arrays, for any input kind", () => {
     for (const input of inputs()) {
       const view = seededView();
-      const before = snapshot(view);
+      const before = protectedPart(view);
       fold(view, input);
       expect(
-        snapshot(view),
+        protectedPart(view),
         `input mutated the view: ${JSON.stringify(input).slice(0, 120)}`,
       ).toEqual(before);
+    }
+  });
+
+  it("APPENDS to the carved-out arrays and never edits or shortens them", () => {
+    // The compensating assertion for the amendment: an append-in-place is
+    // allowed, an in-place EDIT of an element already there is not, and neither
+    // is a removal. structuredClone of the prefix, not the identities: this is
+    // about the values a retained view would read back.
+    for (const input of inputs()) {
+      const view = seededView();
+      const prefixes = APPEND_ONLY_ARRAYS.map((key) => structuredClone(view[key]));
+      fold(view, input);
+      APPEND_ONLY_ARRAYS.forEach((key, i) => {
+        const prefix = prefixes[i]!;
+        expect(
+          view[key].length,
+          `${key} was shortened by ${JSON.stringify(input).slice(0, 80)}`,
+        ).toBeGreaterThanOrEqual(prefix.length);
+        expect(
+          structuredClone(view[key]).slice(0, prefix.length),
+          `${key}'s existing entries were edited by ${JSON.stringify(input).slice(0, 80)}`,
+        ).toEqual(prefix);
+      });
+    }
+  });
+
+  it("never mutates a row or tool card OBJECT already in the view", () => {
+    // Identity-level, not value-level: freezing is what catches a write-through
+    // that preserves the value, which no deep compare can see. Phase 4's
+    // per-row Object.is selectors depend on exactly this.
+    for (const input of inputs()) {
+      const view = seededView();
+      view.rows.forEach((row) => Object.freeze(row));
+      view.toolCalls.forEach((card) => Object.freeze(card));
+      expect(
+        () => fold(view, input),
+        `input wrote through a frozen row or card: ${JSON.stringify(input).slice(0, 120)}`,
+      ).not.toThrow();
     }
   });
 
@@ -222,15 +288,14 @@ describe("fold immutability contract", () => {
         ).toMatch(/"heartbeat"|"journal_seq":99/);
         continue;
       }
-      // A new top-level object is not enough: every array it exposes must be
-      // a new array too, or a later in-place append would escape notice.
-      for (const key of arrayKeys(view)) {
-        if (result.view[key].length !== view[key].length) {
-          expect(result.view[key], `${key} grew but reuses the input's array object`).not.toBe(
-            view[key],
-          );
-        }
-      }
+      // The original rule here was "every array that grew must be a NEW array
+      // object". The amendment inverts it for the carved-out arrays — they are
+      // now SHARED with the input by design — and it cannot simply be flipped,
+      // because a non-append edit (replaceRow, dropLiveRows, resolveCommand)
+      // legitimately does hand back a new array. "Appended in place" is a
+      // PERFORMANCE property and it is pinned where it belongs, on the pure
+      // append paths, in test/fold-perf.test.ts. What survives here is the
+      // safety half: the prefix is never edited (above) and the Maps below.
       // Same rule for the Maps, each of which can shrink as well as grow —
       // `loops` only ever grows, but it is copy-on-write for the same reason.
       const maps = ["gates", "pending", "commandOutcomes", "loops"] as const;
@@ -251,11 +316,23 @@ describe("fold immutability contract", () => {
     if (heartbeat.ok) expect(heartbeat.view).toBe(view);
   });
 
-  it("leaves the view untouched on a failed fold, which is what join.ts relies on", () => {
-    const view = seededView();
-    const before = snapshot(view);
-    const result = fold(view, liveEphemeral("token_delta", { chunk_type: "nonesuch" }, LOOP_A));
-    expect(result.ok).toBe(false);
-    expect(snapshot(view)).toEqual(before);
+  it("leaves the view ENTIRELY untouched on a failed fold, which is what join.ts relies on", () => {
+    // Unscoped on purpose: a failed fold may not append either. This is the
+    // assertion the whole append-in-place amendment rests on, so it keeps the
+    // original full-view snapshot compare.
+    const failures: FoldInput[] = [
+      liveEphemeral("token_delta", { chunk_type: "nonesuch" }, LOOP_A),
+      liveEphemeral("token_delta", undefined, LOOP_A),
+      liveEphemeral("compaction_started", { attempt_id: "a1" }, LOOP_A),
+      liveEphemeral("compaction_started", { attempt_id: "a1", reason: 1 }, LOOP_A),
+      { segment: "live", frame: { type: "error", error: new Error("upstream") } as never },
+    ];
+    for (const input of failures) {
+      const view = seededView();
+      const before = snapshot(view);
+      const result = fold(view, input);
+      expect(result.ok, `expected a FAILED fold for ${JSON.stringify(input).slice(0, 80)}`).toBe(false);
+      expect(snapshot(view), `a failed fold changed the view: ${JSON.stringify(input).slice(0, 80)}`).toEqual(before);
+    }
   });
 });

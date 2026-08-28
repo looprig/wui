@@ -200,17 +200,25 @@ describe("rows: the shape and the ordinal", () => {
 });
 
 describe("rows: copy-on-write", () => {
-  it("never appends into the input view's rows array", () => {
+  it("APPENDS INTO the input view's rows array, and advances no counter on it", () => {
+    // AMENDED by the O(M^2) fix. This case pinned the opposite — "never appends
+    // into the input view's rows array" — and design §3c deliberately reversed
+    // it: "The outer array may be appended in place." Copying it per event made
+    // a cold journal replay quadratic before first paint.
+    //
+    // The consequence is written down rather than hidden. A caller that retains
+    // an older view reads the NEWER rows through it while that object's
+    // `nextOrdinal` stays put, so retaining a view is unsupported. Retaining a
+    // ROW is supported, and the two cases below are what make it so.
     resetSeq();
     const before = run(emptySessionView(), [history(wireEnvelope(TURN_STARTED_USER_WIRE), 1)]);
     const beforeRows = before.rows;
     const after = run(before, [history(wireEnvelope(TURN_STARTED_USER_WIRE), 2)]);
 
-    expect(before.rows, "the input view's rows array grew in place").toHaveLength(1);
-    expect(before.rows, "the input view's rows array object was replaced under it").toBe(beforeRows);
-    expect(before.nextOrdinal, "the input view's ordinal counter advanced in place").toBe(1);
-    expect(after.rows, "the new view reuses the input's rows array object").not.toBe(before.rows);
+    expect(after.rows, "the append copied the array instead of pushing into it").toBe(beforeRows);
     expect(after.rows).toHaveLength(2);
+    expect(before.nextOrdinal, "the ordinal counter must stay per-view, not shared").toBe(1);
+    expect(after.nextOrdinal).toBe(2);
   });
 
   it("keeps an already-committed row's object identity across later folds, which per-row Object.is selectors depend on", () => {

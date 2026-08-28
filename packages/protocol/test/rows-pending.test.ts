@@ -98,13 +98,21 @@ describe("rows: the optimistic pending row", () => {
     expect(view.commandOutcomes.size).toBe(0);
   });
 
-  it("does not mutate the input view", () => {
+  it("copies the pending map and the counter, and appends the row in place", () => {
+    // AMENDED alongside fold's contract: `rows` is an append-only outer array
+    // and §3c allows appending it in place, so the row DOES land in the input
+    // view's array. Everything else addPendingRow touches is still
+    // copy-on-write — the `pending` map above all, since a per-map selector
+    // compares it by identity.
     const before = emptySessionView();
+    const rows = before.rows;
     const after = addPendingRow(before, CMD_1, []);
-    expect(before.rows).toStrictEqual([]);
-    expect(before.pending.size).toBe(0);
-    expect(before.nextOrdinal).toBe(0);
+    expect(after.rows, "the row append copied the array instead of pushing into it").toBe(rows);
+    expect(after.rows).toHaveLength(1);
+    expect(before.pending.size, "the input view's pending map was written through").toBe(0);
+    expect(before.nextOrdinal, "the input view's ordinal counter advanced in place").toBe(0);
     expect(after.pending).not.toBe(before.pending);
+    expect(after.nextOrdinal).toBe(1);
   });
 
   it("keys each submit separately, allocating a fresh ordinal per row", () => {

@@ -12,11 +12,15 @@
  * Completing a tool call REPLACES the row object; it never mutates it.
  * Mutating in place would leave the row's identity unchanged, so a
  * `useSyncExternalStore` per-row selector comparing with `Object.is` would
- * never re-render the completed card. Every later task that updates a row
- * therefore builds a new object; test/rows.test.ts pins the property now, on
- * the only operation that exists yet (the append), so the amendment task 3.25
- * makes to the OUTER array — appending in place — cannot quietly take the row
- * objects with it.
+ * never re-render the completed card.
+ *
+ * The OUTER array is a different matter and was carved out deliberately
+ * (design §3c): `fold` appends into it in place, because copying it per event
+ * made a cold journal replay O(M^2) before first paint. That carve-out covers
+ * appends only, and it does NOT extend to the row objects — test/rows.test.ts
+ * freezes committed rows so that even a value-preserving write-through throws,
+ * and test/fold-immutability.test.ts records the amendment and what still
+ * holds either side of it.
  *
  * ## Ordering
  *
