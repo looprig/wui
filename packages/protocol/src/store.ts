@@ -109,6 +109,7 @@ export class SessionViewStore {
   private readonly scheduler: FrameScheduler;
   private readonly listeners = new Set<() => void>();
   private readonly errorListeners = new Set<(error: Error) => void>();
+  private readonly lifecycleListeners = new Set<(active: boolean) => void>();
 
   private current: SessionView = emptySessionView();
   private published: SessionViewSnapshot;
@@ -172,6 +173,35 @@ export class SessionViewStore {
     };
   }
 
+  /**
+   * Subscribes to LIVENESS transitions: `true` when a join starts, `false` when
+   * it ends — by `stop()`, by the live stream ending with `autoReconnect` off,
+   * or by a terminal join failure. Returns an unsubscribe.
+   *
+   * `isActive()` alone is not enough, and neither is `subscribe`. `commit()` is
+   * a no-op when nothing is dirty, so a stream that ends cleanly with no
+   * pending update leaves the store inactive having notified nobody; a
+   * connection indicator built on the notify channel would read "live"
+   * indefinitely. Measured before this channel existed: a clean end produced
+   * zero notifies and zero errors.
+   *
+   * Fires only on a REAL transition — an idempotent `start()` and a `stop()`
+   * while already inactive say nothing — and, like `subscribeErrors`, is not
+   * coalesced: a transition is an event.
+   *
+   * ORDERING, which is what a consumer classifies on: a terminal join failure
+   * is delivered on `subscribeErrors` FIRST, while `isActive()` is still true,
+   * and the `false` transition follows. So reading `isActive()` from inside an
+   * error listener reports "non-fatal" even for a fatal failure — the two
+   * channels have to be combined, not either used alone.
+   */
+  subscribeLifecycle(listener: (active: boolean) => void): () => void {
+    this.lifecycleListeners.add(listener);
+    return () => {
+      this.lifecycleListeners.delete(listener);
+    };
+  }
+
   /** The current published snapshot. Its reference changes only at notify. */
   snapshot(): SessionViewSnapshot {
     return this.published;
@@ -189,7 +219,7 @@ export class SessionViewStore {
    */
   start(): void {
     if (this.active) return;
-    this.active = true;
+    this.setActive(true);
     this.current = this.options.join?.initialView ?? emptySessionView();
     if (this.stalePublication) {
       // Publish the reset, do not merely stage it: snapshot() is what a
@@ -255,7 +285,7 @@ export class SessionViewStore {
    */
   stop(): void {
     this.generation += 1;
-    this.active = false;
+    this.setActive(false);
     this.abortController?.abort();
     this.cancelActive?.();
     this.abortController = undefined;
@@ -281,7 +311,7 @@ export class SessionViewStore {
       this.emitError(asError(error));
     } finally {
       if (generation === this.generation) {
-        this.active = false;
+        this.setActive(false);
         this.offVisibility?.();
         this.offVisibility = undefined;
         this.finalize();
@@ -291,6 +321,19 @@ export class SessionViewStore {
 
   private emitError(error: Error): void {
     for (const listener of [...this.errorListeners]) listener(error);
+  }
+
+  /**
+   * The ONE place `active` is written, so every transition is announced exactly
+   * once and a no-op assignment announces nothing. Copies the listener set
+   * before iterating, for the same reason `commit()` does: a listener that
+   * subscribes from inside a notify would otherwise be invoked re-entrantly for
+   * a transition that happened before it subscribed.
+   */
+  private setActive(active: boolean): void {
+    if (this.active === active) return;
+    this.active = active;
+    for (const listener of [...this.lifecycleListeners]) listener(active);
   }
 
   /** Marks state dirty and schedules at most one notify per frame. */
