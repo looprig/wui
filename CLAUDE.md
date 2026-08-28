@@ -59,7 +59,7 @@ npm, in `app/` (the SPA), all named by the wui implementation plan's Phase 5:
 - `clsx` + `tailwind-merge` — `cn()`, shadcn/ui's own class helper. Together they are what makes a conditional Tailwind class safe to override.
 - `@fontsource-variable/inter`, `@fontsource-variable/jetbrains-mono` — self-hosted copies of the two §12 typefaces. Self-hosted rather than CDN-linked so the embedded bundle stays a single offline artefact and the browser makes no third-party request.
 
-`react-virtuoso` is named by the plan for the virtualized transcript (task 5.19) and is deliberately **not** installed yet: nothing imports it, and an unused dependency in `package.json` is a supply-chain surface with no benefit.
+`react-virtuoso` is named by the plan for the virtualized transcript (task 5.19) and is deliberately **not** installed. Task 5.19 shipped without it: nothing imports it, and an unused dependency in `package.json` is a supply-chain surface with no benefit. `Transcript` renders every committed row, which is a real cost in a long session and is documented on the component — but the row list is already the shape a virtualizer wants (a count plus `(ordinal) => element`), so adopting one later replaces one `Array.from` and no data flow. It arrives together with hoisting `ToolCallStep`'s collapse state out of the row, which is only safe today *because* nothing unmounts a scrolled-away row.
 
 ## Secure Coding Patterns
 
