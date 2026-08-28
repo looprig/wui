@@ -27,7 +27,9 @@ export class FakeTransport implements LooprigTransport {
   createSessionResult: Promise<CreateResponse> = new Promise(() => {});
   submitResult: Promise<InputResponse> = new Promise(() => {});
   respondGateResult: Promise<GateAcceptedResponse> = Promise.resolve({ status: "accepted" });
-  restoreSessionResult: Promise<RestoreResponse> = Promise.resolve({ session_id: "", restored: false });
+  /** A factory, for the same reason `readStatusResponder` is one. */
+  restoreSessionResponder: () => Promise<RestoreResponse> = () =>
+    Promise.resolve({ session_id: "", restored: false });
   /**
    * A FACTORY, not a stored promise: a test arms a probe to fail by swapping
    * this, and a stored rejected promise nobody has awaited yet is an unhandled
@@ -65,7 +67,7 @@ export class FakeTransport implements LooprigTransport {
   readonly restoreCalls: string[] = [];
   restoreSession(sessionId: string): Promise<RestoreResponse> {
     this.restoreCalls.push(sessionId);
-    return this.restoreSessionResult;
+    return this.restoreSessionResponder();
   }
   submit(sessionId: string, request: CreateRequest): Promise<InputResponse> {
     this.submitCalls.push({ sessionId, request });

@@ -123,7 +123,9 @@ describe("useSessionReachability", () => {
 
     render(<Probe transport={transport} store={store} />);
     await new Promise((resolve) => setTimeout(resolve, PROBE_MS * 5));
-    expect(transport.readStatusCalls).toBe(0);
+    // Exactly the one mount probe, and nothing from any of the five intervals
+    // that have since elapsed.
+    expect(transport.readStatusCalls).toBe(1);
     expect(page.getByTestId("reachability").element().textContent).toBe("reachable");
   });
 });

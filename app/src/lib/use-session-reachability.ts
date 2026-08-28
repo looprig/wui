@@ -124,6 +124,13 @@ export function useSessionReachability(
   }, []);
 
   useEffect(() => {
+    // One probe on mount, before the first interval. Two reasons, both real:
+    // `alreadyLive` skips the restore entirely, so nothing has verified the
+    // host at all; and the session STATE this returns drives the header's
+    // status dot, which would otherwise read "unknown" for a whole interval on
+    // every session opened. Under StrictMode the effect runs twice and the
+    // in-flight guard collapses that to one request.
+    void probe();
     const handle = setInterval(() => {
       // A notify since the last tick proves the stream is alive; asking the
       // host as well would be noise. Consumed, not merely read, so the NEXT
