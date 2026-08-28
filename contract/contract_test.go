@@ -27,7 +27,11 @@ func pinnedHarness(t *testing.T) (dir, version string) {
 		cmd := exec.Command("go", args...) // #nosec G204 -- fixed argv, no external input
 		cmd.Env = append(os.Environ(), "GOWORK=off")
 		out, err := cmd.Output()
-		return strings.TrimSpace(string(out)), err
+		// TrimRight, never TrimSpace: an EMPTY Dir is the signal that the module is
+		// not yet in the cache, and it arrives as a leading tab. TrimSpace would eat
+		// it, collapsing "\tv0.30.0\n" to "v0.30.0" so the Cut below reports no pair
+		// at all and the download branch never fires.
+		return strings.TrimRight(string(out), "\n"), err
 	}
 
 	out, err := run("list", "-m", "-f", "{{.Dir}}"+sep+"{{.Version}}", modulePath)
