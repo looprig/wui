@@ -86,3 +86,34 @@ contract:
 	@# the files stay editable for a review diff.
 	chmod -R u+w contract/schema contract/fixtures
 	@echo "$(HARNESS_VERSION)" > contract/VERSION
+
+# --- release ------------------------------------------------------------
+# The module zip is source-only: `go get` runs no build step, so whatever is
+# COMMITTED under dist/ is what every consumer's //go:embed all:dist serves.
+# Day to day .gitignore keeps the built bundle out of the tree (see its header),
+# which is right for development and wrong for a tag -- v0.1.0 shipped the
+# placeholder and served "build the app to replace this placeholder" to anyone
+# who imported it.
+#
+# So a release commit carves out: build, force-add the bundle, verify the Go
+# handler actually serves it, and only then is the tree taggable. This is a
+# target rather than a documented ritual precisely so it cannot be forgotten.
+#
+# `make dist-reset` returns to the development state.
+release-dist:
+	npm ci
+	npm run build
+	git add -f dist/index.html dist/assets
+	@echo "--- staged for release ---"
+	@git diff --cached --stat -- dist | tail -3
+	@grep -q 'placeholder' dist/index.html && { echo "REFUSING: dist/index.html is still the placeholder"; exit 1; } || true
+	GOWORK=off go test -race -count=1 ./...
+	@echo "OK: built SPA staged and the Go suite passes against it. Commit, then tag."
+
+dist-reset:
+	git rm -r --cached --ignore-unmatch -q dist/assets
+	rm -rf dist/assets
+	git checkout -- dist/index.html
+	@echo "OK: back to the development state (placeholder only)."
+
+.PHONY: release-dist dist-reset

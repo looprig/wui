@@ -74,3 +74,11 @@ require (
 	google.golang.org/protobuf v1.36.12 // indirect
 	honnef.co/go/tools v0.8.1 // indirect
 )
+
+// v0.1.0 was tagged from a development tree, so its module zip carries only the
+// committed dist/index.html placeholder -- a consumer importing it gets a working
+// Go handler that serves "build the app to replace this placeholder". Module zips
+// are source-only and `go get` runs no build step, so nothing downstream could
+// repair it. `make release-dist` now force-adds the built bundle onto a release
+// commit and refuses to proceed if the placeholder is still in place.
+retract v0.1.0 // Ships the placeholder SPA instead of the built bundle.
