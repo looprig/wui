@@ -20,22 +20,42 @@ import type { SseFrame } from "../src/sse.js";
 import type { EventEnvelope, EventJournalPage } from "../src/types.js";
 
 export interface ManualScheduler extends FrameScheduler {
-  /** Runs every callback scheduled since the last flush. */
+  /**
+   * Runs the callbacks scheduled since the last flush that are still eligible.
+   * A callback scheduled under a DIFFERENT visibility state than the current
+   * one is stranded and never runs — see `setHidden`.
+   */
   flush(): void;
   /** How many scheduled callbacks are still live (cancelled ones do not count). */
   pendingCount(): number;
-  /** Flips `isHidden()` and fires every visibility listener, like the DOM event. */
+  /**
+   * Flips `isHidden()` and fires every visibility listener, like the DOM event.
+   *
+   * Crossing this boundary STRANDS every callback scheduled under the previous
+   * state: a `requestAnimationFrame` scheduled just before a tab hides never
+   * fires and never falls through, and a `setTimeout` scheduled while hidden is
+   * not what a visible tab should be publishing on. Modelling that is what
+   * makes the store's cancel-and-reschedule testable at all — without it,
+   * `flush()` would run the stranded callback and the test would pass against a
+   * store that does nothing on `visibilitychange`.
+   */
   setHidden(hidden: boolean): void;
   visibilityListenerCount(): number;
 }
 
+interface ScheduledFrame {
+  callback: () => void;
+  /** The visibility state this frame was scheduled under. */
+  hidden: boolean;
+}
+
 export function manualScheduler(): ManualScheduler {
-  let pending: Array<(() => void) | undefined> = [];
+  let pending: Array<ScheduledFrame | undefined> = [];
   let hidden = false;
   const listeners = new Set<() => void>();
   return {
     schedule(callback) {
-      pending.push(callback);
+      pending.push({ callback, hidden });
       return pending.length; // 1-based, so 0 is never a valid handle
     },
     cancel(handle) {
@@ -51,9 +71,11 @@ export function manualScheduler(): ManualScheduler {
     flush() {
       const run = pending;
       pending = [];
-      for (const callback of run) callback?.();
+      for (const frame of run) {
+        if (frame !== undefined && frame.hidden === hidden) frame.callback();
+      }
     },
-    pendingCount: () => pending.filter((callback) => callback !== undefined).length,
+    pendingCount: () => pending.filter((frame) => frame !== undefined).length,
     setHidden(next) {
       hidden = next;
       for (const listener of [...listeners]) listener();

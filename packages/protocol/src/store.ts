@@ -107,6 +107,7 @@ export class SessionViewStore {
   private active = false;
   private abortController: AbortController | undefined;
   private cancelActive: (() => void) | undefined;
+  private offVisibility: (() => void) | undefined;
 
   constructor(options: SessionViewStoreOptions) {
     this.options = options;
@@ -148,6 +149,20 @@ export class SessionViewStore {
     const { source, cancelActive } = cancelableLiveSource(this.options.liveSource);
     this.cancelActive = cancelActive;
 
+    // A frame scheduled just before the tab hides NEVER fires and never falls
+    // through, which would freeze the transcript and any open permission gate
+    // indefinitely. Cancel the pending handle and re-schedule on whichever
+    // timer the NEW visibility state selects. Switching schedulers without
+    // cancelling is not enough: the dead handle would still be this store's
+    // `frame`, so publish() would treat a frame as already scheduled and never
+    // ask for another.
+    this.offVisibility = this.scheduler.onVisibilityChange(() => {
+      if (this.frame === undefined) return;
+      this.scheduler.cancel(this.frame);
+      this.frame = undefined;
+      if (this.dirty) this.publish();
+    });
+
     const generator = joinSessionView(
       abortableJournal(this.options.journal, abortController.signal),
       this.options.sessionId,
@@ -173,6 +188,8 @@ export class SessionViewStore {
     this.cancelActive?.();
     this.abortController = undefined;
     this.cancelActive = undefined;
+    this.offVisibility?.();
+    this.offVisibility = undefined;
     this.finalize();
   }
 
@@ -188,6 +205,8 @@ export class SessionViewStore {
     } finally {
       if (generation === this.generation) {
         this.active = false;
+        this.offVisibility?.();
+        this.offVisibility = undefined;
         this.finalize();
       }
     }
@@ -257,18 +276,52 @@ function abortableJournal(inner: JournalReader, signal: AbortSignal): JournalRea
   };
 }
 
-/** rAF-backed scheduler. */
+/**
+ * About 30 Hz — the cadence a hidden tab publishes at. Fast enough that a gate
+ * or a completed turn is visible the moment the user comes back, slow enough
+ * that a backgrounded session is not burning a core.
+ */
+const HIDDEN_FRAME_MS = 33;
+
+/**
+ * `requestAnimationFrame` while the tab is visible; a ~33 ms timer while it is
+ * hidden.
+ *
+ * A hidden tab's rAF is throttled to a standstill in every browser — a callback
+ * scheduled just before the tab hides never fires AT ALL — so a store that only
+ * ever used rAF would stop publishing the moment the user switched tabs and
+ * would not resume until they came back. `document.hidden` is re-read on every
+ * `schedule()`, so one scheduler instance spans a visibility change correctly.
+ */
 export function browserFrameScheduler(): FrameScheduler {
+  const doc = (): Document | undefined => (typeof document === "undefined" ? undefined : document);
+  const hidden = (): boolean => doc()?.hidden === true;
   return {
-    schedule: (callback) =>
-      typeof requestAnimationFrame === "function"
-        ? requestAnimationFrame(callback)
-        : (setTimeout(callback, 16) as unknown as number),
-    cancel: (handle) => {
+    schedule(callback) {
+      if (hidden() || typeof requestAnimationFrame !== "function") {
+        return setTimeout(callback, HIDDEN_FRAME_MS) as unknown as number;
+      }
+      return requestAnimationFrame(callback);
+    },
+    cancel(handle) {
+      // Cancel through BOTH: the handle may have been minted by either path and
+      // the two id spaces are independent, so cancelling only one leaves a live
+      // callback that publishes after teardown. Handing a foreign handle to
+      // either canceller is a silent no-op, so doing both is always safe.
       if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(handle);
       clearTimeout(handle);
     },
-    isHidden: () => false,
-    onVisibilityChange: () => () => {},
+    isHidden: hidden,
+    onVisibilityChange(callback) {
+      const target = doc();
+      if (target === undefined) return () => {};
+      const handler = (): void => {
+        callback();
+      };
+      target.addEventListener("visibilitychange", handler);
+      return () => {
+        target.removeEventListener("visibilitychange", handler);
+      };
+    },
   };
 }
