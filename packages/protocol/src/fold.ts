@@ -87,6 +87,7 @@ import type { Gate } from "./gate.js";
 import type { ContentBlock } from "./blocks.js";
 import type { AssistantRow, LoopInfo, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft } from "./rows.js";
 import { narrationOf, refusalOf, splitStepGroup, thinkingOf, toolResultText, toolUsesOf } from "./rows.js";
+import { toolUseSummary } from "./toolsummary.js";
 
 // --- Session view -----------------------------------------------------------
 
@@ -914,7 +915,13 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           toolUseId: use.id,
           toolExecutionId: "",
           toolName: use.name,
-          summary: "",
+          // Derived, not carried: the enduring record has no Summary field (it
+          // is the EPHEMERAL ToolCallStarted that carries one), so a replayed
+          // card would otherwise show a name and a result and nothing about
+          // what the call was for. tui's storedStepToolCard derives it the same
+          // way, from the same input, so the two transcripts agree — and the
+          // derivation redacts, which is why this is not ToolRow.input.
+          summary: toolUseSummary(use.name, use.input),
           // A missing result is a call whose outcome the group does not carry;
           // "ok" matches tui's storedStepToolCard rather than inventing an error.
           status: result?.isError === true ? "error" : "ok",

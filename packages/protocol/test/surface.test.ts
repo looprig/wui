@@ -27,6 +27,7 @@ describe("@looprig/protocol public surface", () => {
       "refusalOf",
       "toolUsesOf",
       "toolResultText",
+      "toolUseSummary",
     ]) {
       expect(protocol, `missing export: ${name}`).toHaveProperty(name);
     }

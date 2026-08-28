@@ -100,6 +100,14 @@ const STEP_DONE_PROSE_AND_TOOLS_WIRE =
 const STEP_DONE_TOOL_THEN_TEXT_WIRE =
   '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"ID":"toolu_1","Input":{},"Name":"Read","type":"tool_use"},{"Text":"narration after the call","type":"text"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
 
+/**
+ * Five tool calls with REAL inputs, one per summariser shape: a path tool, a
+ * command tool, a byte-counted write, a scoped search, and a task tool that
+ * deliberately has no summary at all.
+ */
+const STEP_DONE_SUMMARY_TOOLS_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"ID":"toolu_1","Input":{"path":"/etc/hosts"},"Name":"Read","type":"tool_use"},{"ID":"toolu_2","Input":{"command":"ls -la /tmp"},"Name":"Bash","type":"tool_use"},{"ID":"toolu_3","Input":{"path":"/tmp/out.txt","content":"hello"},"Name":"WriteFile","type":"tool_use"},{"ID":"toolu_4","Input":{"pattern":"TODO","path":"src"},"Name":"Grep","type":"tool_use"},{"ID":"toolu_5","Input":{"title":"do it"},"Name":"TaskCreate","type":"tool_use"}]}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
+
 /** A result carrying several blocks, one of which has no display form at all. */
 const STEP_DONE_MULTIBLOCK_RESULT_WIRE =
   '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","messages":[{"role":"assistant","blocks":[{"ID":"toolu_5","Input":{},"Name":"Bash","type":"tool_use"}]},{"role":"tool","blocks":[{"Text":"line one\\n","type":"text"},{"MediaType":"image/png","Source":{"URL":"","Data":"iVA="},"type":"image"},{"Text":"line two","type":"text"}],"tool_use_id":"toolu_5"}],"session_id":"11111111-1111-4111-8111-111111111111","step_id":"55555555-5555-4555-8555-555555555555","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"StepDone","v":1}';
@@ -390,7 +398,9 @@ describe("rows: StepDone tool expansion", () => {
       // journal, so a cold replay has no value to put here.
       toolExecutionId: "",
       toolName: "Read",
-      summary: "",
+      // Was "" before the cold-replay fix: derived from the stored
+      // ToolUseBlock's Input {"path":"/a"} by tui's toolUseSummary.
+      summary: "/a",
       status: "error",
       result: "no such file",
       spawnedLoopId: "",
@@ -399,6 +409,7 @@ describe("rows: StepDone tool expansion", () => {
       ordinal: 2,
       toolUseId: "toolu_2",
       toolName: "Read",
+      summary: "/b",
       status: "ok",
       result: "B body",
       journalSeq: 20,
@@ -426,6 +437,28 @@ describe("rows: StepDone tool expansion", () => {
     const view = run(emptySessionView(), [history(wireEnvelope(STEP_DONE_MULTIBLOCK_RESULT_WIRE), 23)]);
     expect(view.rows).toHaveLength(1);
     expect(view.rows[0]).toMatchObject({ kind: "tool", toolUseId: "toolu_5", result: "line one\nline two" });
+  });
+
+  it("derives each committed card's summary from the stored tool-use Input", () => {
+    // THE COLD-REPLAY FIX. Before it, every row below carried summary: "" and a
+    // replayed transcript showed a tool name and a result and nothing about
+    // what the call was for. The derivation is tui's `toolUseSummary`, so a
+    // card the TUI and the browser both render reads the same in both.
+    resetSeq();
+    const view = run(emptySessionView(), [
+      loopStarted(LOOP_A),
+      history(wireEnvelope(STEP_DONE_SUMMARY_TOOLS_WIRE), 25),
+    ]);
+    expect(view.rows.map((r) => (r.kind === "tool" ? [r.toolName, r.summary] : r.kind))).toStrictEqual([
+      ["Read", "/etc/hosts"],
+      ["Bash", "ls -la /tmp"],
+      // Counted, never shown: the write's body is not in the row.
+      ["WriteFile", "/tmp/out.txt (5 bytes)"],
+      ["Grep", "TODO in src"],
+      // A task tool has no redacted fragment to show; its card is name-only.
+      ["TaskCreate", ""],
+    ]);
+    expect(JSON.stringify(view.rows)).not.toContain("hello");
   });
 
   it("replaces the live card with the committed row rather than showing both", () => {

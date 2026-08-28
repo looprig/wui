@@ -22,9 +22,10 @@
  *  - `blocks` / `gate` / `enduring` — decoders for the payloads
  *    `event_envelope.schema.json` leaves open: content blocks and messages,
  *    the gate envelope, and the per-type enduring payloads.
- *  - `rows` / `fold` / `join` — the transcript row projection, the session
- *    state-machine fold both segments accumulate into, and the exact
- *    history-to-live join that drives it.
+ *  - `rows` / `toolsummary` / `fold` / `join` — the transcript row projection,
+ *    the redacted tool-call summariser a cold-replayed card derives its detail
+ *    line from, the session state-machine fold both segments accumulate into,
+ *    and the exact history-to-live join that drives it.
  *  - `store` — the framework-neutral subscribe/notify store over that join.
  *  - `content` / `gate-actions` — small composition helpers for the UI layer.
  *
@@ -55,6 +56,7 @@ export {
 export * from "./gate.js";
 export * from "./enduring.js";
 export * from "./rows.js";
+export * from "./toolsummary.js";
 export * from "./fold.js";
 export * from "./join.js";
 export * from "./live.js";

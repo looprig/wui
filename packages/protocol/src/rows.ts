@@ -100,6 +100,23 @@ export interface ToolRow extends TranscriptRowCommon {
   /** The EPHEMERAL execution id, the live card's key. "" on a snapped row. */
   toolExecutionId: string;
   toolName: string;
+  /**
+   * The redacted one-line detail: what the call was FOR. Two provenances that
+   * must agree, or one call renders as two different cards.
+   *
+   *  - LIVE: harness's `ToolCallStarted.Summary`, computed server-side.
+   *  - COMMITTED: DERIVED at snap time by `toolUseSummary` from the stored
+   *    `ToolUseBlock.Input`, because the enduring record carries no summary
+   *    field at all — the ephemeral frame that has one is never persisted.
+   *    tui's `storedStepToolCard` derives it the same way from the same input.
+   *
+   * The input itself is deliberately NOT carried on the row. It already
+   * crosses to the browser inside `StepDone.Messages`, so this is not about
+   * exposure — it is that the summariser REDACTS (no file contents, no edit
+   * substrings, no request bodies, no task text), and a row that carried the
+   * raw input would push that decision into every renderer. "" is a card with
+   * a name and no detail line, which is what an unknown tool gets.
+   */
   summary: string;
   status: ToolRowStatus;
   result: string;
