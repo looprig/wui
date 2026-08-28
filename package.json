@@ -4,5 +4,9 @@
   "workspaces": [
     "packages/*",
     "app"
-  ]
+  ],
+  "scripts": {
+    "build": "npm run build --workspace app",
+    "dist:reset": "npm run dist:reset --workspace app"
+  }
 }

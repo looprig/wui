@@ -38,6 +38,14 @@ export default defineConfig({
       "@looprig/protocol": fileURLToPath(new URL("../packages/protocol/src/index.ts", import.meta.url)),
     },
   },
+  // Pre-bundled up front rather than discovered mid-run. Vitest reloads the
+  // page when the optimizer finds a new dependency during a run, and warns
+  // that doing so "may cause tests to fail, lead to flaky behaviour or
+  // duplicated test runs". It happens on any cold cache -- a fresh `npm ci` on
+  // CI, exactly where a flake is hardest to read.
+  optimizeDeps: {
+    include: ["react", "react-dom", "react-dom/client", "react/jsx-dev-runtime", "@tanstack/react-router"],
+  },
   build: {
     // The Go side embeds this directory (wui/dist). Keeping the build output
     // and the embed path identical means there is no copy step to forget.

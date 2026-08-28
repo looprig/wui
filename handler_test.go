@@ -129,8 +129,14 @@ func TestHandlerRoutes(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200", rec.Code)
 		}
-		if !strings.Contains(rec.Body.String(), "placeholder") {
-			t.Fatalf("body = %q, want the SPA shell", rec.Body.String())
+		// Compared against the EMBEDDED bytes, not against a word from the
+		// committed placeholder's copy. dist/index.html is whatever is on disk
+		// at compile time -- the placeholder in a fresh checkout, the real Vite
+		// shell after `npm run build` -- and a substring check for
+		// "placeholder" made this subtest fail in the second state, which is
+		// exactly the state `npm run build && GOWORK=off go test` produces.
+		if got, want := rec.Body.String(), indexContent(t); got != want {
+			t.Fatalf("body = %q, want the embedded SPA shell %q", got, want)
 		}
 	})
 
