@@ -16,7 +16,7 @@
  * `toolCalls[matchIndex].status = "completed"`.
  */
 import { describe, expect, it } from "vitest";
-import { emptySessionView, fold, type FoldInput, type SessionView } from "../src/fold.js";
+import { addPendingRow, emptySessionView, fold, type FoldInput, type SessionView } from "../src/fold.js";
 import {
   LOOP_A,
   LOOP_B,
@@ -61,6 +61,16 @@ const SEEDED_ARRAYS = [
  * gate and `inputs()` below resolves it.
  */
 const SEEDED_GATE_ID = "9e2f0000-0000-4000-8000-0000000000ff";
+
+/**
+ * The command ids the seeded view holds. `pending` and `commandOutcomes` are
+ * the other two non-array fields fold may DELETE from and write to, and both
+ * are copy-on-write; an unseeded pair would make "did not mutate them" a claim
+ * about empty maps. SEEDED_PENDING_CMD is resolved by `inputs()` below (which
+ * is the delete), SEEDED_ORPHAN_CMD is left dangling.
+ */
+const SEEDED_PENDING_CMD = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+const SEEDED_ORPHAN_CMD = "dddddddd-1111-4111-8111-111111111111";
 
 function gateOpenedWire(gateId: string): Record<string, unknown> {
   return { gate: { id: gateId, kind: "harness.permission", prompt: { title: "Allow?" } } };
@@ -112,10 +122,13 @@ function seededView(): SessionView {
     expect(seeded.ok, "a seed input must fold cleanly").toBe(true);
     if (seeded.ok) view = seeded.view;
   }
+  view = addPendingRow(view, SEEDED_PENDING_CMD, [{ type: "text", text: "pending" }]);
+  view = addPendingRow(view, SEEDED_ORPHAN_CMD, [{ type: "text", text: "orphan" }]);
   for (const key of SEEDED_ARRAYS) {
     expect(view[key].length, `seeded view leaves ${key} empty`).toBeGreaterThan(0);
   }
   expect(view.gates.size, "seeded view leaves gates empty").toBeGreaterThan(0);
+  expect(view.pending.size, "seeded view leaves pending empty").toBe(2);
   return view;
 }
 
@@ -139,6 +152,22 @@ function inputs(): FoldInput[] {
     // copy `gates`, one of which DELETES from it.
     history(envelope({ type: "GateOpened", loopId: LOOP_B, payload: gateOpenedWire("9e2f0000-0000-4000-8000-0000000000ee") })),
     history(envelope({ type: "GateResolved", loopId: LOOP_A, payload: { gate_id: SEEDED_GATE_ID, action: "Approve" } })),
+    // The three command-resolving branches: one that DELETES from `pending`
+    // while writing `commandOutcomes`, one that writes `commandOutcomes` only,
+    // and one that must touch neither (no command id at all).
+    history(
+      envelope({
+        type: "TurnStarted",
+        loopId: LOOP_A,
+        cause: { command_id: SEEDED_PENDING_CMD },
+        payload: { message: userMessageWire([textBlockWire("acknowledged")]) },
+      }),
+    ),
+    history(envelope({ type: "TurnRejected", loopId: LOOP_A, cause: { command_id: SEEDED_PENDING_CMD }, payload: { reason: 1 } })),
+    history(envelope({ type: "InputCancelled", loopId: LOOP_A, cause: { command_id: "9e2f0000-0000-4000-8000-00000000000c" } })),
+    history(envelope({ type: "InputCancelled", loopId: LOOP_A })),
+    history(envelope({ type: "TurnInterrupted", loopId: LOOP_A })),
+    history(envelope({ type: "TurnFailed", loopId: LOOP_A, payload: { err: { kind: "tool_limit", message: "too many" } } })),
     textDelta("tok", LOOP_A),
     thinkingDelta("think", LOOP_A),
     liveEphemeral("tool_call_started", { tool_execution_id: "t1", tool_name: "Read" }, LOOP_A),
@@ -202,11 +231,14 @@ describe("fold immutability contract", () => {
           );
         }
       }
-      // Same rule for the gate map, which can SHRINK as well as grow.
-      if (result.view.gates.size !== view.gates.size) {
-        expect(result.view.gates, "gates changed but reuses the input's Map object").not.toBe(
-          view.gates,
-        );
+      // Same rule for the three Maps, each of which can SHRINK as well as grow.
+      const maps = ["gates", "pending", "commandOutcomes"] as const;
+      for (const key of maps) {
+        if (result.view[key].size !== view[key].size) {
+          expect(result.view[key], `${key} changed but reuses the input's Map object`).not.toBe(
+            view[key],
+          );
+        }
       }
     }
   });

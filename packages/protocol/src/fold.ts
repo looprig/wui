@@ -84,6 +84,7 @@ import type { EphemeralFrame, EventEnvelope, EventHeader, StatusEvent } from "./
 import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "./sse.js";
 import { decodeEnduring, isZeroUUID, turnFailureText } from "./enduring.js";
 import type { Gate } from "./gate.js";
+import type { ContentBlock } from "./blocks.js";
 import type { AssistantRow, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft } from "./rows.js";
 import { narrationOf, refusalOf, splitStepGroup, thinkingOf, toolResultText, toolUsesOf } from "./rows.js";
 
@@ -239,7 +240,45 @@ export interface SessionView {
   rows: TranscriptRow[];
   /** The next ordinal to allocate. Monotonic; never reused, never reset. */
   nextOrdinal: number;
+  /**
+   * Ordinals of the optimistic pending user rows this tab is holding, keyed by
+   * the submit's command id.
+   *
+   * PER-TAB by construction. `input_queued` is ephemeral and carries no `delta`
+   * and therefore no text — it announces that something was queued, not what —
+   * so the submitted blocks exist only in the composer that sent them. The row
+   * enters through `addPendingRow`, never through a fold input, and a second
+   * tab (or the TUI) sees nothing for this submit until `TurnStarted`.
+   */
+  pending: Map<string, number>;
+  /**
+   * What the server did with each command id it ACKNOWLEDGED, from
+   * `Header.Cause.CommandID` on `TurnStarted` / `TurnFoldedInto` /
+   * `TurnRejected` / `InputCancelled` — the four events §3b names as resolving
+   * the optimistic pending row.
+   *
+   * This is the only place pending-row resolution is observable. Scanning
+   * `rows` cannot do it: `TurnRejected` commits a NOTICE row rather than a user
+   * row, and `InputCancelled` commits no row at all, so a consumer would have
+   * to find the command id on three different row kinds — and on a row kind
+   * that does not carry it. Keyed by exactly the key `addPendingRow` files
+   * under, so `outcome = view.commandOutcomes.get(commandId)` is the whole
+   * consumer-side protocol.
+   *
+   * Last write wins. The four events are mutually exclusive terminals for one
+   * submit, so the only repeat in practice is the same event redelivered across
+   * the journal/live join window, which is idempotent.
+   */
+  commandOutcomes: Map<string, CommandOutcome>;
 }
+
+/**
+ * What became of one submitted command. `"started"` covers both `TurnStarted`
+ * and `TurnFoldedInto`: §3b treats them identically, and from the composer's
+ * side both mean "the server took it and the authoritative row is in `rows`
+ * now" — a folded input is still the user's input.
+ */
+export type CommandOutcome = "started" | "rejected" | "cancelled";
 
 export function emptySessionView(): SessionView {
   return {
@@ -251,6 +290,8 @@ export function emptySessionView(): SessionView {
     gates: new Map(),
     rows: [],
     nextOrdinal: 0,
+    pending: new Map(),
+    commandOutcomes: new Map(),
   };
 }
 
@@ -756,13 +797,19 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
       // isZeroUUID, never `cause?.loop_id === undefined`: production OMITS a
       // zero id, but harness's fixture normaliser REPLACES ids, so the
       // all-zeros spelling is equally real wire. Both must gate identically.
+      //
+      // The ACKNOWLEDGEMENT is recorded before that gate, not inside it: the
+      // turn started whether or not this event commits a user row, and a
+      // pending row left behind a hand-back (or behind an opener carrying no
+      // message) would dangle live forever.
+      const resolved = resolveCommand(next, decoded.causeCommandId, "started");
       const message = decoded.payload.message;
       if (!isZeroUUID(decoded.causeLoopId) || message === undefined) {
-        return { ok: true, view: next };
+        return { ok: true, view: resolved };
       }
       return {
         ok: true,
-        view: appendRow(next, {
+        view: appendRow(resolved, {
           kind: "user",
           loopId: decoded.loopId,
           turnId: decoded.turnId,
@@ -873,6 +920,38 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
         }),
       };
     }
+    case "TurnRejected": {
+      // A rejected submit must never silently vanish. The optimistic row goes,
+      // so something has to say why it went — and an error NOTICE, not a user
+      // row, is what says it, which is exactly why commandOutcomes exists: a
+      // consumer scanning `rows` for its command id would find nothing here.
+      //
+      // `turnId` is always "": MarshalEvent REFUSES a TurnRejected carrying a
+      // non-zero TurnID ("event: invalid TurnRejected: TurnID must be zero"),
+      // because the rejection is a reply to a submit that never opened a turn.
+      // It is projected from the header anyway rather than hardcoded, so the
+      // notice keeps saying what the envelope said.
+      const resolved = resolveCommand(next, decoded.causeCommandId, "rejected");
+      return {
+        ok: true,
+        view: appendRow(resolved, {
+          kind: "notice",
+          level: "error",
+          text: `input rejected: ${decoded.payload.reasonText}`,
+          loopId: decoded.loopId,
+          turnId: decoded.turnId,
+          journalSeq,
+          live: false,
+          orphanedLoop: false,
+        }),
+      };
+    }
+    case "InputCancelled":
+      // A client retract, or a queued input returned after an abnormal turn
+      // end. It never entered history, so it commits NO row — but the
+      // affordance still has to go, and the outcome still has to be observable,
+      // which is the other half of what commandOutcomes is for.
+      return { ok: true, view: resolveCommand(next, decoded.causeCommandId, "cancelled") };
     case "TurnFailed": {
       // A truncated step commits its safe prefix through its own StepDone — and
       // that StepDone's notice is an ordinary TextBlock with no distinguishing
@@ -937,9 +1016,24 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
  * REFERENCE, so a per-row Object.is selector does not re-render them, and a
  * loop with nothing live returns the very same view.
  */
+/**
+ * True for a row that belongs to `loopId`'s in-flight LIVE SEGMENT — the thing a
+ * StepDone snaps and a turn terminal commits.
+ *
+ * A live USER row is deliberately excluded. The only live user row is an
+ * optimistic pending row, which is per-tab, belongs to no loop (its `loopId` is
+ * "", the same value a session-scoped frame folds under) and is resolved by
+ * command id and by nothing else. Without this exclusion, any snap or terminal
+ * that happened to carry no loop id would stamp the composer's unsent text into
+ * the transcript as though the server had accepted it, or discard it silently.
+ */
+function isLiveSegmentRow(row: TranscriptRow, loopId: string): boolean {
+  return row.live && row.loopId === loopId && row.kind !== "user";
+}
+
 function dropLiveRows(view: SessionView, loopId: string): SessionView {
-  if (!view.rows.some((r) => r.live && r.loopId === loopId)) return view;
-  return { ...view, rows: view.rows.filter((r) => !(r.live && r.loopId === loopId)) };
+  if (!view.rows.some((r) => isLiveSegmentRow(r, loopId))) return view;
+  return { ...view, rows: view.rows.filter((r) => !isLiveSegmentRow(r, loopId)) };
 }
 
 /**
@@ -998,9 +1092,9 @@ function commitLiveRows(
   journalSeq: number | undefined,
   resolveRunning: ToolRowStatus,
 ): SessionView {
-  if (!view.rows.some((r) => r.live && r.loopId === loopId)) return view;
+  if (!view.rows.some((r) => isLiveSegmentRow(r, loopId))) return view;
   const rows = view.rows.map((row): TranscriptRow => {
-    if (!row.live || row.loopId !== loopId) return row;
+    if (!isLiveSegmentRow(row, loopId)) return row;
     if (row.kind === "tool") {
       return {
         ...row,
@@ -1032,6 +1126,59 @@ function commitTerminalSegment(
 function appendRow(view: SessionView, draft: TranscriptRowDraft): SessionView {
   const committed = { ...draft, ordinal: view.nextOrdinal };
   return { ...view, rows: [...view.rows, committed], nextOrdinal: view.nextOrdinal + 1 };
+}
+
+/**
+ * Records an optimistic pending user row for a just-submitted input: the blocks
+ * the composer sent, filed under the command id `POST /v1/sessions/{sid}/input`
+ * returned.
+ *
+ * This is a caller-driven entry point rather than a fold case because the text
+ * is not on the wire to fold: `input_queued` carries no `delta`, so the only
+ * copy of what was typed is in the composer that typed it. The row is
+ * `live: true` with no loop and no turn — it is not part of any loop's live
+ * segment (see `isLiveSegmentRow`) — and is resolved by `fold` on the submit's
+ * `TurnStarted` / `TurnFoldedInto` / `TurnRejected` / `InputCancelled`, each of
+ * which also records a `commandOutcomes` entry the caller can read.
+ */
+export function addPendingRow(
+  view: SessionView,
+  commandId: string,
+  blocks: ContentBlock[],
+): SessionView {
+  const ordinal = view.nextOrdinal;
+  const appended = appendRow(view, {
+    kind: "user",
+    loopId: "",
+    turnId: "",
+    journalSeq: undefined,
+    live: true,
+    orphanedLoop: false,
+    blocks,
+  });
+  const pending = new Map(appended.pending);
+  pending.set(commandId, ordinal);
+  return { ...appended, pending };
+}
+
+/**
+ * Resolves one command id: records `outcome` and removes this tab's pending row
+ * for it, if it has one. Copy-on-write in both maps; a view that changes
+ * neither is handed straight back, so a per-map selector does not churn.
+ *
+ * An empty command id records nothing. Not every event carrying a `Cause` has a
+ * command behind it, and a "" key would collapse every such event into one
+ * entry that no composer could ever match.
+ */
+function resolveCommand(view: SessionView, commandId: string, outcome: CommandOutcome): SessionView {
+  if (commandId === "") return view;
+  const commandOutcomes = new Map(view.commandOutcomes);
+  commandOutcomes.set(commandId, outcome);
+  const ordinal = view.pending.get(commandId);
+  if (ordinal === undefined) return { ...view, commandOutcomes };
+  const pending = new Map(view.pending);
+  pending.delete(commandId);
+  return { ...view, commandOutcomes, pending, rows: view.rows.filter((r) => r.ordinal !== ordinal) };
 }
 
 function foldStatusEvent(view: SessionView, event: StatusEvent): FoldResult {

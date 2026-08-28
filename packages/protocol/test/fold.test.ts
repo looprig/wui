@@ -385,6 +385,8 @@ describe("emptySessionView", () => {
       gates: new Map(),
       rows: [],
       nextOrdinal: 0,
+      pending: new Map(),
+      commandOutcomes: new Map(),
     });
   });
 
@@ -403,6 +405,17 @@ describe("emptySessionView", () => {
     const first = emptySessionView();
     first.gates.set("g", { id: "g" } as never);
     expect(emptySessionView().gates.size).toBe(0);
+  });
+
+  it("gives every call its OWN pending and commandOutcomes maps", () => {
+    // Same hazard, and worse for these two: a shared `pending` would show one
+    // tab's unsent composer text in every other session in the process.
+    const first = emptySessionView();
+    first.pending.set("cmd", 0);
+    first.commandOutcomes.set("cmd", "started");
+    const second = emptySessionView();
+    expect(second.pending.size).toBe(0);
+    expect(second.commandOutcomes.size).toBe(0);
   });
 
   it("returns a distinct object each call (fold() never mutates its input, so callers must not assume a shared reference either)", () => {
