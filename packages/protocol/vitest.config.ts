@@ -3,7 +3,7 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     include: ["test/**/*.test.ts"],
-    // Seven of the nine suites ported verbatim from `client/sdk/core` resolve
+    // The suites ported from `client/sdk/core` that resolve
     // `../../../contract/fixtures/` — i.e. `wui/contract/`, which Task 2.11
     // vendors from the pinned harness and which does not exist yet. They are
     // copied unmodified rather than rewritten, because the fixtures are the
@@ -22,7 +22,7 @@ export default defineConfig({
       "test/conformance.test.ts",
       "test/contract.test.ts",
       "test/errors.test.ts",
-      "test/fold.test.ts",
+      "test/fold-contract-fixtures.test.ts",
       "test/serve-transport.test.ts",
       "test/sse.test.ts",
       "test/transport.test.ts",

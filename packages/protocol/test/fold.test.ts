@@ -6,18 +6,14 @@
  * total minimum"). Section 2 covers the unknown-kind case — a `kind` value
  * outside the current five, simulating a future wire addition — and proves
  * it produces a typed `FoldError`, not a thrown exception or a silent
- * no-op. Section 3 proves a cold `StatusEvent` (from the real
- * `journal_page.json` fixture) and a live `enduring` `SseFrame` (from the
- * real `enduring_frame.sse` fixture, parsed through the REAL `sse.ts`
- * parser) fold into structurally comparable `StatusEventMarker`s — the
- * "one renderer, two segments" property this task exists to prove, not just
- * assert in theory. Section 4 covers a few supporting behaviors (heartbeat/
+ * no-op. Section 3 — the one part of this suite that needs the vendored wire
+ * fixtures — lives in fold-contract-fixtures.test.ts, split out so the rest of
+ * this file can run before Task 2.11 vendors `wui/contract/`. Section 4
+ * covers a few supporting behaviors (heartbeat/
  * error live frames, malformed-delta payloads, tool-call started+completed
  * pairing) that round out `fold()` without being explicitly required by the
  * task's minimum test plan.
  */
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   FoldError,
@@ -26,19 +22,9 @@ import {
   type FoldInput,
   type SessionView,
 } from "../src/fold.js";
-import { SseFrameParser, type EnduringSseFrame, type SseFrame } from "../src/sse.js";
-import { validateEphemeralFrame, validateEventJournalPage } from "../src/validate.js";
-import type { EphemeralFrame, EventJournalPage } from "../src/types.js";
-
-const fixtureDir = fileURLToPath(new URL("../../../contract/fixtures/", import.meta.url));
-
-function readFixtureBytes(file: string): Uint8Array {
-  return new Uint8Array(readFileSync(fixtureDir + file));
-}
-
-function readFixtureJson(file: string): unknown {
-  return JSON.parse(readFileSync(fixtureDir + file, "utf8"));
-}
+import { SseFrameParser, type SseFrame } from "../src/sse.js";
+import { validateEphemeralFrame } from "../src/validate.js";
+import type { EphemeralFrame } from "../src/types.js";
 
 /** Parses one fixture's bytes as a single SSE frame and asserts it's the expected `type`. */
 function parseOneFrame(bytes: Uint8Array): SseFrame {
@@ -233,52 +219,6 @@ describe("foldEphemeral: unknown kind", () => {
     if (result.ok) throw new Error("unreachable");
     expect(result.error).toBeInstanceOf(FoldError);
     expect(result.error.reason).toBe("upstream_frame_error");
-  });
-});
-
-// --- 3. History and live fold into structurally comparable output -----------
-
-describe("history (cold StatusEvent) and live (SSE enduring frame) fold into the same shape", () => {
-  it("the journal_page.json fixture's StatusEvent and the enduring_frame.sse fixture's live frame both fold to a comparable StatusEventMarker", () => {
-    // Both fixtures carry the SAME underlying TurnDone event content (byte-for-content
-    // identical event object; only journal_seq legitimately differs: 3 in the cold
-    // page vs. 42 stamped on the live SSE frame's id: line) — see contract/fixtures/.
-    const page = validateEventJournalPage(readFixtureJson("journal_page.json")) as EventJournalPage;
-    expect(page.events).toHaveLength(1);
-    const statusEvent = page.events[0]!;
-
-    const enduringBytes = readFixtureBytes("enduring_frame.sse");
-    const liveFrame = parseOneFrame(enduringBytes);
-    expect(liveFrame.type).toBe("enduring");
-    const enduringFrame = liveFrame as EnduringSseFrame;
-
-    const historyResult = fold(emptySessionView(), { segment: "history", event: statusEvent });
-    const liveResult = fold(emptySessionView(), { segment: "live", frame: enduringFrame });
-
-    const historyView = expectOk(historyResult);
-    const liveView = expectOk(liveResult);
-
-    expect(historyView.statusEvents).toHaveLength(1);
-    expect(liveView.statusEvents).toHaveLength(1);
-    const historyMarker = historyView.statusEvents[0]!;
-    const liveMarker = liveView.statusEvents[0]!;
-
-    // Structurally comparable: identical key sets (same SessionView shape
-    // regardless of source)...
-    expect(Object.keys(historyMarker).sort()).toEqual(Object.keys(liveMarker).sort());
-
-    // ...and, since the two fixtures carry the same underlying event, identical
-    // field-for-field EXCEPT journalSeq (which legitimately differs by source).
-    const { journalSeq: historyJournalSeq, ...historyRest } = historyMarker;
-    const { journalSeq: liveJournalSeq, ...liveRest } = liveMarker;
-    expect(historyRest).toEqual(liveRest);
-    expect(historyJournalSeq).toBe(3);
-    expect(liveJournalSeq).toBe(42);
-
-    // And both correctly surfaced the real event content.
-    expect(historyMarker.type).toBe("TurnDone");
-    expect(historyMarker.sessionId).toBe("00000000-0000-0000-0000-000000000000");
-    expect(historyMarker.createdAt).toBe("2026-07-08T12:00:00Z");
   });
 });
 
