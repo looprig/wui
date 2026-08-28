@@ -833,3 +833,227 @@ describe("decodeEnduring: InputCancelled", () => {
     });
   });
 });
+
+/**
+ * ## Provenance of the permission wire strings
+ *
+ * No fixture covers PermissionRequested or PermissionDecided either, so both
+ * constants below are the VERBATIM stdout of `event.MarshalEvent` in
+ * harness@v0.30.0, driven by a throwaway main that built real
+ * `event.PermissionRequested` / `event.PermissionDecided` values carrying a
+ * real `tool.Request`.
+ *
+ * The PermissionRequested value the first constant came from was constructed
+ * with `Preview: &tool.MutationPreview{}` SET. There is no `preview` key in the
+ * bytes: `marshalPermissionRequested` encodes `permissionRequestedWire`, which
+ * has Header, ToolExecutionID and Request and nothing else. That is the
+ * evidence for `hasPreview: false` below — not the struct tag, which says the
+ * same thing about `Request` and is wrong about it.
+ */
+const PERMISSION_REQUESTED_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","request":{"tool_name":"Write","summary":"write /tmp/x","requirements":[{"kind":"file.write","scope":"workspace","match":"/tmp/x","description":"write file /tmp/x","candidates":[{"kind":"file.write","match":"/tmp/**","description":"allow writes under /tmp"}]}]},"session_id":"11111111-1111-4111-8111-111111111111","step_id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","tool_execution_id":"99999999-9999-4999-8999-999999999999","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"PermissionRequested","v":1}';
+
+const PERMISSION_REQUESTED_COMMAND_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","request":{"tool_name":"Bash","summary":"run go test","execution_id":"exec-1","command":"go test ./...","working_directory":"/work","expires_at_unix_milli":1772186400000,"requirements":[{"kind":"command.execute","scope":"","match":"go test ./...","description":"run go test ./...","grant_class":"command.start.v1","grant_target":"go test ./...","candidates":[{"kind":"command.execute","match":"go test ./...","description":"always allow go test ./...","grant_class":"command.start.v1","grant_target":"go test ./..."}]}]},"session_id":"11111111-1111-4111-8111-111111111111","step_id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","tool_execution_id":"99999999-9999-4999-8999-999999999999","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"PermissionRequested","v":1}';
+
+const PERMISSION_REQUESTED_EMPTY_REQUEST_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","request":{},"session_id":"11111111-1111-4111-8111-111111111111","step_id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","tool_execution_id":"99999999-9999-4999-8999-999999999999","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"PermissionRequested","v":1}';
+
+const PERMISSION_DECIDED_DENY_WIRE =
+  '{"audit":"denied by workspace rule","created_at":"2026-08-27T10:00:00Z","effect":"deny","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","reason":"policy","session_id":"11111111-1111-4111-8111-111111111111","step_id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","subject":"Write(/etc/passwd)","tool_execution_id":"99999999-9999-4999-8999-999999999999","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"PermissionDecided","v":1}';
+
+const PERMISSION_DECIDED_APPROVE_BARE_WIRE =
+  '{"created_at":"2026-08-27T10:00:00Z","effect":"approve","event_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","loop_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"11111111-1111-4111-8111-111111111111","step_id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","tool_execution_id":"99999999-9999-4999-8999-999999999999","turn_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","type":"PermissionDecided","v":1}';
+
+const TOOL_EXEC_1 = "99999999-9999-4999-8999-999999999999";
+
+/** An all-empty prepared request — what `"request":{}` decodes to. */
+const EMPTY_REQUEST = {
+  toolName: "",
+  summary: "",
+  executionId: "",
+  command: "",
+  workingDirectory: "",
+  expiresAtUnixMilli: 0,
+  requirements: [],
+};
+
+describe("decodeEnduring: permission events", () => {
+  it("has no `preview` key in a REAL PermissionRequested whose Preview was set", () => {
+    // The producer set Preview to a non-nil *tool.MutationPreview. Read the
+    // bytes rather than asserting the decoder's constant: `hasPreview: false`
+    // is only honest if the wire really carries nothing.
+    const raw = object(JSON.parse(PERMISSION_REQUESTED_WIRE) as unknown);
+    expect(Object.hasOwn(raw, "preview")).toBe(false);
+    expect(Object.keys(raw).some((k) => k.toLowerCase().includes("preview"))).toBe(false);
+  });
+
+  it("decodes a REAL PermissionRequested's typed prepared request", () => {
+    const decoded = decodeEnduring(wireEnvelope(PERMISSION_REQUESTED_WIRE));
+    expect(decoded.payload).toStrictEqual({
+      kind: "PermissionRequested",
+      toolExecutionId: TOOL_EXEC_1,
+      request: {
+        toolName: "Write",
+        summary: "write /tmp/x",
+        executionId: "",
+        command: "",
+        workingDirectory: "",
+        expiresAtUnixMilli: 0,
+        requirements: [
+          {
+            kind: "file.write",
+            scope: "workspace",
+            match: "/tmp/x",
+            description: "write file /tmp/x",
+            grantClass: "",
+            grantTarget: "",
+            candidates: [
+              {
+                kind: "file.write",
+                match: "/tmp/**",
+                description: "allow writes under /tmp",
+                grantClass: "",
+                grantTarget: "",
+              },
+            ],
+          },
+        ],
+      },
+      hasPreview: false,
+    });
+    expect(decoded.turnId).toBe(TURN_1);
+    expect(decoded.stepId).toBe(STEP_1);
+  });
+
+  it("decodes a REAL command-grant request's execution binding", () => {
+    // A requirement that asks for a grant forces ValidateRequest to demand the
+    // execution binding quartet (execution_id/command/working_directory/
+    // expires_at_unix_milli). Dropping any of them would leave the card unable
+    // to say WHAT command is being authorized.
+    const decoded = decodeEnduring(wireEnvelope(PERMISSION_REQUESTED_COMMAND_WIRE));
+    if (decoded.payload.kind !== "PermissionRequested") throw new Error("unreachable");
+    expect(decoded.payload.request).toStrictEqual({
+      toolName: "Bash",
+      summary: "run go test",
+      executionId: "exec-1",
+      command: "go test ./...",
+      workingDirectory: "/work",
+      expiresAtUnixMilli: 1772186400000,
+      requirements: [
+        {
+          kind: "command.execute",
+          scope: "",
+          match: "go test ./...",
+          description: "run go test ./...",
+          grantClass: "command.start.v1",
+          grantTarget: "go test ./...",
+          // A candidate's grant pair must equal its requirement's exactly
+          // (tool.validateRuleCandidate), so this is the only shape in which a
+          // NON-empty candidate grantClass/grantTarget can reach the wire.
+          candidates: [
+            {
+              kind: "command.execute",
+              match: "go test ./...",
+              description: "always allow go test ./...",
+              grantClass: "command.start.v1",
+              grantTarget: "go test ./...",
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("projects every key a REAL prepared request puts on the wire", () => {
+    // Derived from the bytes, not from a literal: a field harness adds to
+    // tool.Request and this decoder ignores fails HERE rather than being
+    // silently dropped from the permission card.
+    const request = object(object(JSON.parse(PERMISSION_REQUESTED_COMMAND_WIRE) as unknown)["request"]);
+    expect(Object.keys(request).sort()).toStrictEqual([
+      "command",
+      "execution_id",
+      "expires_at_unix_milli",
+      "requirements",
+      "summary",
+      "tool_name",
+      "working_directory",
+    ]);
+    const requirement = object((request["requirements"] as unknown[])[0]);
+    expect(Object.keys(requirement).sort()).toStrictEqual([
+      "candidates",
+      "description",
+      "grant_class",
+      "grant_target",
+      "kind",
+      "match",
+      "scope",
+    ]);
+    const candidate = object((requirement["candidates"] as unknown[])[0]);
+    expect(Object.keys(candidate).sort()).toStrictEqual([
+      "description",
+      "grant_class",
+      "grant_target",
+      "kind",
+      "match",
+    ]);
+  });
+
+  it("decodes a REAL pure tool's empty request, which is `{}` and never absent", () => {
+    // json.RawMessage's omitempty cannot fire on the two bytes "{}", so
+    // marshalPermissionRequested ALWAYS emits a `request` key even for a
+    // zero tool.Request. A decoder must not treat "no requirements" as "no
+    // request".
+    const raw = object(JSON.parse(PERMISSION_REQUESTED_EMPTY_REQUEST_WIRE) as unknown);
+    expect(raw["request"]).toStrictEqual({});
+    const decoded = decodeEnduring(asEnvelope(raw));
+    if (decoded.payload.kind !== "PermissionRequested") throw new Error("unreachable");
+    expect(decoded.payload.request).toStrictEqual(EMPTY_REQUEST);
+  });
+
+  it("survives an entirely absent request rather than throwing", () => {
+    // NOT REAL WIRE for v0.30.0 (see above), but `request` is omitempty on the
+    // wire struct, so a legacy record could lack it.
+    const decoded = decodeEnduring(
+      envelope({ type: "PermissionRequested", loopId: LOOP_A, payload: { tool_execution_id: TOOL_EXEC_1 } }),
+    );
+    expect(decoded.payload).toStrictEqual({
+      kind: "PermissionRequested",
+      toolExecutionId: TOOL_EXEC_1,
+      request: EMPTY_REQUEST,
+      hasPreview: false,
+    });
+  });
+
+  it("decodes a REAL PermissionDecided's effect, reason, subject and audit", () => {
+    const decoded = decodeEnduring(wireEnvelope(PERMISSION_DECIDED_DENY_WIRE));
+    expect(decoded.payload).toStrictEqual({
+      kind: "PermissionDecided",
+      toolExecutionId: TOOL_EXEC_1,
+      effect: "deny",
+      reason: "policy",
+      subject: "Write(/etc/passwd)",
+      audit: "denied by workspace rule",
+    });
+  });
+
+  it("decodes a REAL bare approve, whose omitempty strings are all absent", () => {
+    const raw = object(JSON.parse(PERMISSION_DECIDED_APPROVE_BARE_WIRE) as unknown);
+    for (const key of ["reason", "subject", "audit"]) {
+      expect(Object.hasOwn(raw, key)).toBe(false);
+    }
+    expect(decodeEnduring(asEnvelope(raw)).payload).toStrictEqual({
+      kind: "PermissionDecided",
+      toolExecutionId: TOOL_EXEC_1,
+      effect: "approve",
+      reason: "",
+      subject: "",
+      audit: "",
+    });
+  });
+
+  it("keeps the two permission kinds distinct — a decided one is NOT a request", () => {
+    expect(decodeEnduring(wireEnvelope(PERMISSION_REQUESTED_WIRE)).payload.kind).toBe("PermissionRequested");
+    expect(decodeEnduring(wireEnvelope(PERMISSION_DECIDED_DENY_WIRE)).payload.kind).toBe("PermissionDecided");
+  });
+});

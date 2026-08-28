@@ -209,6 +209,115 @@ export interface InputCancelledPayload {
   message: ConversationMessage | undefined;
 }
 
+/**
+ * One reusable allow rule that was DISPLAYED to the user and offered for
+ * durable persistence behind the "Approve always for this workspace" action.
+ *
+ * tool.RuleCandidate carries no grant or token material by construction:
+ * GrantClass and GrantTarget describe only the structural enforcement contract
+ * a future match must preserve, and both are `omitempty` (absent for a
+ * direct-enforcement rule), so they project to "" rather than undefined.
+ */
+export interface PermissionRuleCandidate {
+  kind: string;
+  match: string;
+  description: string;
+  grantClass: string;
+  grantTarget: string;
+}
+
+/**
+ * One normalized capability the prepared tool call needs.
+ *
+ * `kind`, `scope`, `match` and `description` carry NO `omitempty` on
+ * tool.Requirement, so all four are always present on the wire — `scope` is
+ * emitted as `""` for a global capability rather than dropped. `grantClass`
+ * and `grantTarget` are an all-or-nothing `omitempty` pair.
+ */
+export interface PermissionRequirement {
+  kind: string;
+  scope: string;
+  match: string;
+  description: string;
+  grantClass: string;
+  grantTarget: string;
+  candidates: PermissionRuleCandidate[];
+}
+
+/**
+ * The typed, validated prepared access request (harness's tool.Request) the
+ * permission card renders.
+ *
+ * It is a TYPED struct on both sides, not an opaque bag: harness validates it
+ * with tool.ValidateRequest on marshal and the strict gate.DecodeRequest on
+ * unmarshal, so a malformed or token-bearing record can neither be journaled
+ * nor restored. It has no grant-token field and no raw-tool-arguments field to
+ * leak — permission evaluation never parses raw arguments (see pkg/tool's
+ * package comment).
+ *
+ * The execution binding — `executionId`, `command`, `workingDirectory`,
+ * `expiresAtUnixMilli` — is REQUIRED by ValidateRequest whenever any
+ * requirement asks for a grant, and absent otherwise. It is what lets the card
+ * name the exact command being authorized instead of just its summary.
+ */
+export interface PermissionRequest {
+  toolName: string;
+  summary: string;
+  executionId: string;
+  command: string;
+  workingDirectory: string;
+  expiresAtUnixMilli: number;
+  requirements: PermissionRequirement[];
+}
+
+/**
+ * PermissionRequested carries the typed prepared tool.Request, projected into
+ * a sibling "request" key by the marshaler (the struct tag is `json:"-"`; see
+ * permissionRequestedWire in harness/pkg/event/marshal.go). It never carries
+ * grant tokens or raw tool arguments.
+ *
+ * `request` is NOT optional in practice and is not modelled as such:
+ * marshalPermissionRequested always sets the raw field to the two bytes `{}`
+ * for a zero tool.Request, and `omitempty` cannot fire on a non-empty
+ * json.RawMessage — so a pure tool's PermissionRequested still carries
+ * `"request":{}`. An absent key (only reachable from a legacy or corrupted
+ * record) decodes to the same all-empty value, so a consumer never has to
+ * distinguish "no requirements" from "no request".
+ *
+ * PermissionRequested.Preview is DELIBERATELY not projected: it reaches
+ * neither the journal nor any wire, so the web permission card has no mutation
+ * preview. That is a declared limitation of this design (§3a), not a decoding
+ * gap — `hasPreview` exists so a renderer states it rather than silently
+ * showing an empty diff. This is NOT an inference from the `json:"-"` tag:
+ * `Request` carries the same tag and IS projected. It was verified by
+ * marshalling a real PermissionRequested whose Preview was set and reading the
+ * absence of the key out of the bytes (test/enduring.test.ts).
+ */
+export interface PermissionRequestedPayload {
+  kind: "PermissionRequested";
+  toolExecutionId: string;
+  request: PermissionRequest;
+  hasPreview: false;
+}
+
+/**
+ * A NON-gated approve/deny — the rule engine resolved it without asking a
+ * human. A gated ask is GateOpened/GateResolved instead, which is why
+ * `effect` is only ever "approve" or "deny" and never "ask".
+ *
+ * `subject` and `audit` are redacted summaries by contract (event/tool.go:
+ * "grant tokens and raw args must never appear here"), but they are still
+ * UNTRUSTED display text — render them as text, never as markup.
+ */
+export interface PermissionDecidedPayload {
+  kind: "PermissionDecided";
+  toolExecutionId: string;
+  effect: string;
+  reason: string;
+  subject: string;
+  audit: string;
+}
+
 /** The type-specific half of a decoded enduring event. Extended per task. */
 export type EnduringPayload =
   | TurnOpenerPayload
@@ -218,6 +327,8 @@ export type EnduringPayload =
   | TurnInterruptedPayload
   | TurnRejectedPayload
   | InputCancelledPayload
+  | PermissionRequestedPayload
+  | PermissionDecidedPayload
   | { kind: "other" };
 
 /**
@@ -302,10 +413,66 @@ function decodePayload(type: string, raw: Record<string, unknown>): EnduringPayl
         reason: num(raw["reason"]),
         message: isRecord(raw["message"]) ? decodeMessage(raw["message"]) : undefined,
       };
+    case "PermissionRequested":
+      return {
+        kind: "PermissionRequested",
+        toolExecutionId: str(raw["tool_execution_id"]),
+        request: decodePermissionRequest(raw["request"]),
+        // Not a decoding gap: Preview reaches neither journal nor wire.
+        hasPreview: false,
+      };
+    case "PermissionDecided":
+      return {
+        kind: "PermissionDecided",
+        toolExecutionId: str(raw["tool_execution_id"]),
+        effect: str(raw["effect"]),
+        reason: str(raw["reason"]),
+        subject: str(raw["subject"]),
+        audit: str(raw["audit"]),
+      };
     default:
       // The long tail keeps the generic marker, per design §3a.
       return { kind: "other" };
   }
+}
+
+/**
+ * Decodes the projected tool.Request. Every field is read under the snake_case
+ * json tag tool.Request declares; an absent `request` (legacy only — see
+ * PermissionRequestedPayload) and an empty `{}` both yield the same all-empty
+ * value rather than undefined.
+ */
+function decodePermissionRequest(raw: unknown): PermissionRequest {
+  const r = isRecord(raw) ? raw : {};
+  const requirements = Array.isArray(r["requirements"]) ? r["requirements"] : [];
+  return {
+    toolName: str(r["tool_name"]),
+    summary: str(r["summary"]),
+    executionId: str(r["execution_id"]),
+    command: str(r["command"]),
+    workingDirectory: str(r["working_directory"]),
+    expiresAtUnixMilli: num(r["expires_at_unix_milli"]),
+    requirements: requirements.filter(isRecord).map(decodePermissionRequirement),
+  };
+}
+
+function decodePermissionRequirement(raw: Record<string, unknown>): PermissionRequirement {
+  const candidates = Array.isArray(raw["candidates"]) ? raw["candidates"] : [];
+  return {
+    kind: str(raw["kind"]),
+    scope: str(raw["scope"]),
+    match: str(raw["match"]),
+    description: str(raw["description"]),
+    grantClass: str(raw["grant_class"]),
+    grantTarget: str(raw["grant_target"]),
+    candidates: candidates.filter(isRecord).map((c) => ({
+      kind: str(c["kind"]),
+      match: str(c["match"]),
+      description: str(c["description"]),
+      grantClass: str(c["grant_class"]),
+      grantTarget: str(c["grant_target"]),
+    })),
+  };
 }
 
 /**
