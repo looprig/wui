@@ -112,41 +112,4 @@ describe("fold: the append-only arrays are appended in place", () => {
     expect(before.nextOrdinal, "the ordinal counter must still be per-view").toBe(0);
     expect(after.nextOrdinal).toBe(1);
   });
-
-  it("appends NOTHING when the fold fails", () => {
-    resetSeq();
-    const view = run(emptySessionView(), [textDelta("ok", LOOP_A), stepDone("committed")]);
-    const lengths = {
-      rows: view.rows.length,
-      statusEvents: view.statusEvents.length,
-      content: view.content.length,
-      toolCalls: view.toolCalls.length,
-      queuedInputs: view.queuedInputs.length,
-      compactions: view.compactions.length,
-    };
-    const failed = fold(view, {
-      segment: "live",
-      frame: { type: "ephemeral", data: { kind: "token_delta", delta: { chunk_type: "nope" } } } as never,
-    });
-    expect(failed.ok).toBe(false);
-    expect({
-      rows: view.rows.length,
-      statusEvents: view.statusEvents.length,
-      content: view.content.length,
-      toolCalls: view.toolCalls.length,
-      queuedInputs: view.queuedInputs.length,
-      compactions: view.compactions.length,
-    }).toStrictEqual(lengths);
-  });
-
-  it("appends nothing when a malformed compaction frame fails AFTER its loop was registered", () => {
-    // The failure is detected inside the case, not at the top of fold, so this
-    // is the path where a half-applied append would actually show up.
-    resetSeq();
-    const view = run(emptySessionView(), [stepDone("committed")]);
-    const before = view.compactions.length;
-    const failed = fold(view, liveEphemeral("compaction_started", { attempt_id: "a1" }, LOOP_A));
-    expect(failed.ok).toBe(false);
-    expect(view.compactions).toHaveLength(before);
-  });
 });

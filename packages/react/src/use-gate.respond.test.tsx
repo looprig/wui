@@ -25,17 +25,6 @@ async function openGate(): Promise<Opened> {
   return { transport, live, view, result };
 }
 
-test("the three actions are harness's exact strings", () => {
-  // `gate.ParseApprovalAction` does an exact match. A renderer that invents
-  // "approve_once" or "Yes" gets gate_action_invalid, and the user is told they
-  // resolved something they did not.
-  expect(Object.values(GATE_APPROVAL_ACTIONS)).toStrictEqual([
-    "Approve",
-    "Approve always for this workspace",
-    "Deny",
-  ]);
-});
-
 test("sends one of the three exact action strings and masks the gate", async () => {
   const { transport, view, result } = await openGate();
 

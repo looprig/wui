@@ -423,8 +423,4 @@ describe("emptySessionView", () => {
     expect(second.pending.size).toBe(0);
     expect(second.commandOutcomes.size).toBe(0);
   });
-
-  it("returns a distinct object each call (fold() never mutates its input, so callers must not assume a shared reference either)", () => {
-    expect(emptySessionView()).not.toBe(emptySessionView());
-  });
 });

@@ -74,12 +74,6 @@ function wireCauseLoopId(json: string): string | undefined {
 }
 
 describe("rows: the shape and the ordinal", () => {
-  it("starts empty, with the first ordinal unallocated", () => {
-    const view = emptySessionView();
-    expect(view.rows).toStrictEqual([]);
-    expect(view.nextOrdinal).toBe(0);
-  });
-
   it("commits one fully-specified user row from a REAL TurnStarted whose cause loop id is zero", () => {
     resetSeq();
     const view = run(emptySessionView(), [

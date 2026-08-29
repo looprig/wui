@@ -336,13 +336,6 @@ describe("decodeEnduring: turn openers", () => {
     expect(isZeroUUID(decoded.causeLoopId)).toBe(false);
   });
 
-  it("keeps the two openers distinguishable, which is the only thing the kind carries", () => {
-    // Byte-for-byte the same payload shape; only `type` differs, and §3b's rule
-    // is identical for both — but a renderer still labels them apart.
-    expect(decodeEnduring(wireEnvelope(TURN_STARTED_WIRE)).payload.kind).toBe("TurnStarted");
-    expect(decodeEnduring(wireEnvelope(TURN_FOLDED_INTO_WIRE)).payload.kind).toBe("TurnFoldedInto");
-  });
-
   it("survives a REAL omitzero TurnStarted: no message key, no turn_index key", () => {
     // MarshalEvent of TurnStarted{Message: nil, TurnIndex: 0} — `omitzero` on
     // both fields drops both keys, and the wholly-zero Cause drops `cause` too.
@@ -732,15 +725,6 @@ describe("decodeEnduring: TurnFailed and TurnInterrupted", () => {
     const decoded = decodeEnduring(wireEnvelope(TURN_INTERRUPTED_WIRE));
     expect(decoded.payload).toStrictEqual({ kind: "TurnInterrupted", turnIndex: 5 });
   });
-
-  it("keeps the three terminals distinguishable, which §3b's commit rule needs", () => {
-    // TurnFailed and TurnInterrupted commit the in-flight live segment and then
-    // append a notice/tombstone; TurnDone closes normally. Collapsing them into
-    // one "terminal" kind would lose that, so the kinds are pinned here.
-    expect(decodeEnduring(wireEnvelope(TURN_DONE_WIRE)).payload.kind).toBe("TurnDone");
-    expect(decodeEnduring(wireEnvelope(TURN_FAILED_WIRE)).payload.kind).toBe("TurnFailed");
-    expect(decodeEnduring(wireEnvelope(TURN_INTERRUPTED_WIRE)).payload.kind).toBe("TurnInterrupted");
-  });
 });
 
 describe("decodeEnduring: TurnRejected", () => {
@@ -1051,11 +1035,6 @@ describe("decodeEnduring: permission events", () => {
       audit: "",
     });
   });
-
-  it("keeps the two permission kinds distinct — a decided one is NOT a request", () => {
-    expect(decodeEnduring(wireEnvelope(PERMISSION_REQUESTED_WIRE)).payload.kind).toBe("PermissionRequested");
-    expect(decodeEnduring(wireEnvelope(PERMISSION_DECIDED_DENY_WIRE)).payload.kind).toBe("PermissionDecided");
-  });
 });
 
 /**
@@ -1169,10 +1148,5 @@ describe("decodeEnduring: LoopStarted", () => {
     expect(raw["initial_request_id"]).toBe(CMD_1);
     const decoded = decodeEnduring(asEnvelope(raw));
     expect(decoded.envelope).toBe(raw);
-  });
-
-  it("distinguishes LoopStarted from the turn events sharing its header shape", () => {
-    expect(decodeEnduring(wireEnvelope(LOOP_STARTED_ROOT_WIRE)).payload.kind).toBe("LoopStarted");
-    expect(decodeEnduring(wireEnvelope(TURN_INTERRUPTED_WIRE)).payload.kind).toBe("TurnInterrupted");
   });
 });

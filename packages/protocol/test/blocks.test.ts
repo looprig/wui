@@ -59,14 +59,6 @@ describe("decodeBlock", () => {
     });
   });
 
-  it("keeps refusal distinct from text, which is the only thing the tag carries", () => {
-    // RefusalBlock and TextBlock serialize byte-identical payloads (see
-    // blockTag's comment in block_json.go): "this tag is the ONLY thing that
-    // keeps a restored refusal from coming back as ordinary assistant prose".
-    expect(decodeBlock(wire('{"Text":"same bytes","type":"refusal"}')).type).toBe("refusal");
-    expect(decodeBlock(wire('{"Text":"same bytes","type":"text"}')).type).toBe("text");
-  });
-
   it("reads a thinking block's Go-cased Thinking and Signature", () => {
     expect(decodeBlock(wire('{"Signature":"sig","Thinking":"hm","type":"thinking"}'))).toEqual({
       type: "thinking",

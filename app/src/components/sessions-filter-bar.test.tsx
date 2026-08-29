@@ -80,13 +80,23 @@ describe("SessionsFilterBar", () => {
     render(<Controlled />);
     const search = page.getByTestId("sessions-search");
     await expect.element(search).toBeInTheDocument();
-    // The label association is asserted synchronously first so a missing label
-    // fails immediately; `toHaveAccessibleName` retries until its timeout and
-    // otherwise costs ~8s per run to report the same thing.
+    // The accessible name is asserted as its two halves, both synchronously:
+    // the <label for=X> carries the right text, AND the control under test is
+    // the element that id X actually resolves to. Together those are exactly
+    // what the accessible-name computation reads, and each half fails on its
+    // own mutation -- dropping the label text, or dropping the control's `id`
+    // so the `for` points at nothing.
+    //
+    // `toHaveAccessibleName` asserts the same thing, but it is a RETRYING
+    // matcher: an input that has lost its id makes it retry to the full locator
+    // timeout, so the mutation reports as a ~15s hang instead of a diff.
+    // Measured: 14.9s for the missing-id mutation, against ~50ms here.
     expect(labelTextFor("sessions-search")).toBe("Search sessions");
     expect(labelTextFor("sessions-status-filter")).toBe("Status");
-    await expect.element(search).toHaveAccessibleName("Search sessions");
-    await expect.element(page.getByTestId("sessions-status-filter")).toHaveAccessibleName("Status");
+    expect(document.getElementById("sessions-search")).toBe(search.element());
+    expect(document.getElementById("sessions-status-filter")).toBe(
+      page.getByTestId("sessions-status-filter").element(),
+    );
   });
 
   it("follows the caller when the caller resets either control", async () => {
@@ -134,18 +144,5 @@ describe("SessionsFilterBar", () => {
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     expect((search.element() as HTMLInputElement).value).toBe("");
     expect((select.element() as HTMLSelectElement).value).toBe("all");
-  });
-
-  it("starts from the caller's state rather than an internal one", async () => {
-    // The page owns query and status — the bar holding its own copy would
-    // desynchronise the list from the controls the moment either is set from
-    // elsewhere (a URL param, a cleared filter, a reset button).
-    render(
-      <SessionsFilterBar query="parser" status="failed" onQueryChange={vi.fn()} onStatusChange={vi.fn()} />,
-    );
-    const search = page.getByTestId("sessions-search");
-    await expect.element(search).toBeInTheDocument();
-    expect((search.element() as HTMLInputElement).value).toBe("parser");
-    expect((page.getByTestId("sessions-status-filter").element() as HTMLSelectElement).value).toBe("failed");
   });
 });

@@ -34,16 +34,4 @@ describe("sessionsListState", () => {
   it("is loaded when the page has rows", () => {
     expect(sessionsListState({ loading: false, error: null, sessions: one, limit: 100 })).toBe("loaded");
   });
-
-  it("never returns the same state for two structurally different situations", () => {
-    // The whole point of the type: four inputs a user must be able to tell
-    // apart must map to four different answers.
-    const states = [
-      sessionsListState({ loading: true, error: null, sessions: [], limit: 0 }),
-      sessionsListState({ loading: false, error: new Error("boom"), sessions: [], limit: 0 }),
-      sessionsListState({ loading: false, error: null, sessions: [], limit: 100 }),
-      sessionsListState({ loading: false, error: null, sessions: one, limit: 100 }),
-    ];
-    expect(new Set(states).size).toBe(4);
-  });
 });

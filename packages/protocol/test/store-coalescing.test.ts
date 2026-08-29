@@ -7,7 +7,10 @@
  * between iterations. So coalescing must collapse many folds into one notify
  * per frame — and because it coalesces STATE rather than a queue, no
  * intermediate value can be lost: the frame publishes whatever the view is at
- * the moment it fires, not the oldest thing that was waiting.
+ * the moment it fires, not the oldest thing that was waiting. That last clause
+ * is pinned by test/store.test.ts's "pumps the join CONTINUOUSLY, even while no
+ * frame has fired", which folds three chunks before a single flush and asserts
+ * the published row carries all three.
  */
 import { describe, expect, it, vi } from "vitest";
 import { SessionViewStore } from "../src/store.js";
@@ -43,19 +46,6 @@ describe("SessionViewStore: rAF coalescing", () => {
 
     scheduler.flush();
     expect(notified).toHaveBeenCalledTimes(1);
-    store.stop();
-  });
-
-  it("publishes the LATEST state, never a stale intermediate", async () => {
-    const { scheduler, live, store } = makeStore();
-    store.start();
-    await tick();
-    for (const chunk of ["a", "b", "c"]) {
-      live.push(textFrame(chunk, LOOP_A));
-      await tick();
-    }
-    scheduler.flush();
-    expect(store.snapshot().view.rows.at(-1)).toMatchObject({ text: "abc" });
     store.stop();
   });
 

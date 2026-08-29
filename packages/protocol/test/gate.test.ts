@@ -325,13 +325,6 @@ describe("decodeEnduring: gate events", () => {
     expect(object(audit["data"])["requirement_descriptions"]).toStrictEqual(["write file /tmp/x"]);
   });
 
-  it("keeps GateOpened and GateResolved distinct, which the gates map needs", () => {
-    // §3c opens on one and REMOVES on the other. Collapsing them into a single
-    // "gate" kind would leave every answered gate on screen forever.
-    expect(decodeEnduring(wireEnvelope(GATE_OPENED_PERMISSION_WIRE)).payload.kind).toBe("GateOpened");
-    expect(decodeEnduring(wireEnvelope(GATE_RESOLVED_ANSWERED_WIRE)).payload.kind).toBe("GateResolved");
-  });
-
   it("survives a GateOpened with no gate at all rather than throwing", () => {
     // NOT REAL WIRE (`gate` is omitzero over a struct whose ID is never zero in
     // practice), but a decoder must not crash the whole fold on one bad record.

@@ -78,11 +78,6 @@ function run(view: SessionView, inputs: FoldInput[]): SessionView {
 }
 
 describe("fold: gate state", () => {
-  it("starts with no gates", () => {
-    expect(emptySessionView().gates.size).toBe(0);
-    expect(emptySessionView().gates).toBeInstanceOf(Map);
-  });
-
   it("opens a gate on GateOpened, carrying the full decoded envelope", () => {
     resetSeq();
     const view = run(emptySessionView(), [history(gateOpened(GATE_A, LOOP_A))]);

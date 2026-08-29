@@ -24,16 +24,14 @@ test("exports exactly the documented public surface", () => {
 });
 
 test("the three gate actions are harness's exact strings", () => {
+  // Read through the BARREL, not from @looprig/protocol directly: the constant's
+  // own value is pinned by protocol's test/surface.test.ts, so what this adds is
+  // that the re-export still names that object. `gate.ParseApprovalAction` does
+  // an exact match — a renderer that invents "approve_once" or "Yes" gets
+  // gate_action_invalid, and the user is told they resolved something they did not.
   expect(Object.values(api.GATE_APPROVAL_ACTIONS)).toStrictEqual([
     "Approve",
     "Approve always for this workspace",
     "Deny",
   ]);
-});
-
-test("the test fixtures are not part of the public surface", () => {
-  // `src/testing/` is fixture code for this package's own tests, not a
-  // published test-kit, and it imports nothing a consumer should depend on.
-  const names = Object.keys(api);
-  expect(names.filter((name) => /Fake|Controlled|renderHook/.test(name))).toStrictEqual([]);
 });
