@@ -2,6 +2,7 @@ package contract_test
 
 import (
 	"bytes"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,17 +10,17 @@ import (
 	"testing"
 )
 
-// pinnedHarness resolves the harness module that go.mod pins: its directory in
+// pinnedCore resolves the core module that go.mod pins: its directory in
 // the module cache, and its version. Both come from one `go list -m`, so the
 // bytes asserted below and the version asserted against contract/VERSION can
 // never describe two different modules.
-func pinnedHarness(t *testing.T) (dir, version string) {
+func pinnedCore(t *testing.T) (dir, version string) {
 	t.Helper()
 	const sep = "\t"
-	const modulePath = "github.com/looprig/harness"
+	const modulePath = "github.com/looprig/core"
 	// This module lives inside the parent looprig/go.work workspace. Without
 	// GOWORK=off, `go` auto-detects go.work by walking up from this directory and
-	// resolves the harness module via the workspace's own checkout instead of the
+	// resolves the core module via the workspace's own checkout instead of the
 	// version this module's go.mod pins -- silently wrong, not an error. The
 	// checkout would also report an empty version, so contract/VERSION could
 	// never be asserted at all.
@@ -29,14 +30,14 @@ func pinnedHarness(t *testing.T) (dir, version string) {
 		out, err := cmd.Output()
 		// TrimRight, never TrimSpace: an EMPTY Dir is the signal that the module is
 		// not yet in the cache, and it arrives as a leading tab. TrimSpace would eat
-		// it, collapsing "\tv0.30.0\n" to "v0.30.0" so the Cut below reports no pair
+		// it, collapsing "\tv0.7.0\n" to "v0.7.0" so the Cut below reports no pair
 		// at all and the download branch never fires.
 		return strings.TrimRight(string(out), "\n"), err
 	}
 
 	out, err := run("list", "-m", "-f", "{{.Dir}}"+sep+"{{.Version}}", modulePath)
 	if err != nil {
-		t.Fatalf("locate harness module: %v", err)
+		t.Fatalf("locate core module: %v", err)
 	}
 	dir, version, ok := strings.Cut(out, sep)
 
@@ -62,84 +63,125 @@ func pinnedHarness(t *testing.T) (dir, version string) {
 	return dir, version
 }
 
-// harnessTestdata is the pinned harness version's serve testdata directory, so
+// coreSessionwire is the pinned core version's sessionwire/v1 directory, so
 // the assertion is against the exact version go.mod names.
-func harnessTestdata(t *testing.T) string {
+func coreSessionwire(t *testing.T) string {
 	t.Helper()
-	dir, _ := pinnedHarness(t)
-	return filepath.Join(dir, "pkg", "serve", "testdata")
+	dir, _ := pinnedCore(t)
+	return filepath.Join(dir, "sessionwire", "v1")
 }
 
-// TestContractVersionMatchesPinnedHarness pins contract/VERSION to the version
+// TestContractVersionMatchesPinnedCore pins contract/VERSION to the version
 // go.mod actually requires. The byte comparison below is the primary guard, but
-// it goes quiet whenever two harness releases happen to ship identical testdata:
+// it goes quiet whenever two Core releases happen to ship identical artifacts:
 // the vendored bytes are then correct while VERSION silently names the wrong
 // release, and the next reader trusts a stale provenance record. This is also
-// the assertion that catches a `make contract` run whose HARNESS_VERSION was
+// the assertion that catches a `make contract` run whose CORE_VERSION was
 // never moved with the go.mod bump.
-func TestContractVersionMatchesPinnedHarness(t *testing.T) {
+func TestContractVersionMatchesPinnedCore(t *testing.T) {
 	t.Parallel()
 
-	_, want := pinnedHarness(t)
+	_, want := pinnedCore(t)
 	raw, err := os.ReadFile("VERSION")
 	if err != nil {
 		t.Fatalf("read contract/VERSION (run `make contract`): %v", err)
 	}
 	if got := strings.TrimSpace(string(raw)); got != want {
-		t.Errorf("contract/VERSION = %q, pinned harness is %q (update HARNESS_VERSION in the Makefile and run `make contract`)", got, want)
+		t.Errorf("contract/VERSION = %q, pinned core is %q (update CORE_VERSION in the Makefile and run `make contract`)", got, want)
 	}
 }
 
-// TestContractMatchesPinnedHarness proves contract/ is a verbatim copy of the
-// pinned harness version's wire artifacts. This is the drift guard: bumping
-// harness without re-running `make contract` fails here, and a genuine wire change
-// surfaces as a reviewable fixture diff rather than a silent protocol mismatch at
-// runtime.
-func TestContractMatchesPinnedHarness(t *testing.T) {
+// TestMakefileCoreVersionMatchesPinnedCore keeps the refresh recipe on the same
+// published Core version as go.mod. VERSION alone cannot catch a stale
+// CORE_VERSION because the drift tests do not execute `make contract`.
+func TestMakefileCoreVersionMatchesPinnedCore(t *testing.T) {
 	t.Parallel()
 
-	upstream := harnessTestdata(t)
-	for _, dir := range []string{"schema", "fixtures"} {
-		entries, err := os.ReadDir(filepath.Join(upstream, dir))
-		if err != nil {
-			t.Fatalf("read upstream %s: %v", dir, err)
+	_, want := pinnedCore(t)
+	raw, err := os.ReadFile(filepath.Join("..", "Makefile"))
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+	const prefix = "CORE_VERSION := "
+	var matches []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if version, ok := strings.CutPrefix(line, prefix); ok {
+			matches = append(matches, version)
 		}
-		upstreamNames := make(map[string]struct{}, len(entries))
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			upstreamNames[e.Name()] = struct{}{}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("Makefile contains %d %q assignments, want exactly one", len(matches), strings.TrimSpace(prefix))
+	}
+	if got := strings.TrimSpace(matches[0]); got != want {
+		t.Errorf("Makefile CORE_VERSION = %q, pinned core is %q", got, want)
+	}
+}
 
-			want, err := os.ReadFile(filepath.Join(upstream, dir, e.Name()))
-			if err != nil {
-				t.Fatalf("read upstream %s/%s: %v", dir, e.Name(), err)
-			}
-			got, err := os.ReadFile(filepath.Join(dir, e.Name()))
-			if err != nil {
-				t.Errorf("missing vendored %s/%s (run `make contract`): %v", dir, e.Name(), err)
+// TestContractMatchesPinnedCore proves contract/ is a verbatim copy of the
+// pinned core version's sessionwire/v1 artifacts. This is the drift guard: bumping
+// core without re-running `make contract` fails here, and a genuine wire change
+// surfaces as a reviewable fixture diff rather than a silent protocol mismatch at
+// runtime.
+func TestContractMatchesPinnedCore(t *testing.T) {
+	t.Parallel()
+
+	upstream := coreSessionwire(t)
+	for _, dir := range []string{"schema", "fixtures"} {
+		upstreamDir := filepath.Join(upstream, dir)
+		if dir == "fixtures" {
+			upstreamDir = filepath.Join(upstream, "testdata", dir)
+		}
+		upstreamFiles := treeFiles(t, upstreamDir)
+		localFiles := treeFiles(t, dir)
+		if len(upstreamFiles) == 0 {
+			t.Fatalf("pinned core %s tree is empty; refusing a vacuous contract comparison", dir)
+		}
+		for name, want := range upstreamFiles {
+			got, ok := localFiles[name]
+			if !ok {
+				t.Errorf("missing vendored %s/%s (run `make contract`)", dir, name)
 				continue
 			}
 			if !bytes.Equal(got, want) {
-				t.Errorf("%s/%s differs from pinned harness (run `make contract`)", dir, e.Name())
+				t.Errorf("%s/%s differs from pinned core (run `make contract`)", dir, name)
 			}
 		}
 
-		// Reverse pass: a vendored file with no upstream counterpart means the
-		// file was removed or renamed upstream and contract/ silently kept a
-		// stale, no-longer-authoritative copy. The forward loop can never catch
-		// this, since it only walks upstream names.
-		local, err := os.ReadDir(dir)
-		if err != nil {
-			t.Fatalf("read local %s: %v", dir, err)
-		}
-		for _, e := range local {
-			if e.IsDir() {
-				continue
-			}
-			if _, ok := upstreamNames[e.Name()]; !ok {
-				t.Errorf("vendored %s/%s no longer exists upstream (removed or renamed; run `make contract`)", dir, e.Name())
+		// Reverse pass: a vendored path with no upstream counterpart means the
+		// file was removed or renamed upstream and contract/ retained a stale copy.
+		for name := range localFiles {
+			if _, ok := upstreamFiles[name]; !ok {
+				t.Errorf("vendored %s/%s no longer exists upstream (removed or renamed; run `make contract`)", dir, name)
 			}
 		}
 	}
+}
+
+// treeFiles reads every regular file below root, keyed by its slash-separated
+// relative path. Recursing is load-bearing: a new nested Core artifact must not
+// disappear merely because the current release happens to use flat trees.
+func treeFiles(t *testing.T, root string) map[string][]byte {
+	t.Helper()
+	files := make(map[string][]byte)
+	err := fs.WalkDir(os.DirFS(root), ".", func(name string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return &fs.PathError{Op: "walk", Path: name, Err: fs.ErrInvalid}
+		}
+		body, err := fs.ReadFile(os.DirFS(root), name)
+		if err != nil {
+			return err
+		}
+		files[name] = body
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read contract tree %s: %v", root, err)
+	}
+	return files
 }

@@ -19,11 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -222,8 +218,8 @@ func TestHandlerCSRFTokenRouteExists(t *testing.T) {
 // The table is DERIVED from handler.go's own controlRoutes, not written out
 // beside it: a sixth control route added to that list but registered without
 // CSRFGuard.Wrap is caught here automatically, and the failure names the
-// unguarded route. (TestControlRoutesMatchHarness, below, is the other half —
-// it catches a sixth route added to HARNESS but never added to that list.)
+// unguarded route. TestControlRoutesMatchLegacyGolden separately freezes the
+// deprecated adapter's route set.
 //
 // LENS: the "no token" rows are the real assertions — each fails if that one
 // route loses its guard. The "with token" rows are over-blocking checks: they
@@ -270,112 +266,22 @@ func TestHandlerCSRFProtectsControlRoutes(t *testing.T) {
 	}
 }
 
-// harnessRoutePattern matches a "METHOD /v1/..." route-constant string literal in
-// harness pkg/serve/mux.go.
-var harnessRoutePattern = regexp.MustCompile(`"([A-Z]+) (/v1/[^"]*)"`)
-
-// TestControlRoutesMatchHarness pins handler.go's controlRoutes to harness's own
-// route constants, read from the harness version go.mod PINS (never the workspace
-// sibling checkout — GOWORK=off, same technique as the contract drift guard).
-//
-// controlRoutes is a hand-copy of unexported constants in another module. wui's
-// mux forwards everything under /v1/ that it does not name explicitly, so a
-// state-changing route harness adds and this list does not learn about is served
-// WITHOUT CSRF — silently, with no test failing anywhere else. This test is what
-// makes that drift loud.
-//
-// It scans EVERY non-test .go file in pkg/serve, not just mux.go: harness keeps
-// its route constants in mux.go today, but a new plane added in a new file would
-// slip past a single-file scan, which is the exact drift this test exists to
-// catch. (Verified: the union over the whole package is precisely mux.go's ten
-// route constants.)
-//
-// LENS: a real assertion in both directions. It fails if harness gains a
-// state-changing route wui does not guard, and it fails if wui guards a pattern
-// harness does not actually serve (a typo'd pattern would otherwise sit in the
-// list looking protective while the real route fell through to /v1/).
-func TestControlRoutesMatchHarness(t *testing.T) {
+// TestControlRoutesMatchLegacyGolden freezes the deprecated Handler adapter's
+// protected route set. New Harness routes deliberately do not extend Handler;
+// callers needing them compose the API and guards explicitly.
+func TestControlRoutesMatchLegacyGolden(t *testing.T) {
 	t.Parallel()
 
-	serveDir := filepath.Join(pinnedHarnessDir(t), "pkg", "serve")
-	entries, err := os.ReadDir(serveDir)
-	if err != nil {
-		t.Fatalf("read harness %s: %v", serveDir, err)
+	want := []string{
+		"POST /v1/sessions",
+		"POST /v1/sessions/{sid}/restore",
+		"POST /v1/sessions/{sid}/input",
+		"POST /v1/sessions/{sid}/interrupt",
+		"POST /v1/sessions/{sid}/gates/{gid}",
 	}
-
-	seen := make(map[string]bool)
-	scanned := 0
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		src, err := os.ReadFile(filepath.Join(serveDir, name)) // #nosec G304 -- path derived from `go list -m`, not from user input
-		if err != nil {
-			t.Fatalf("read harness %s: %v", name, err)
-		}
-		scanned++
-		for _, m := range harnessRoutePattern.FindAllStringSubmatch(string(src), -1) {
-			method, path := m[1], m[2]
-			if !isStateChangingMethod(method) {
-				continue
-			}
-			seen[method+" "+path] = true
-		}
+	if !slices.Equal(controlRoutes, want) {
+		t.Fatalf("controlRoutes = %q, want frozen legacy routes %q", controlRoutes, want)
 	}
-	if scanned == 0 {
-		t.Fatalf("scanned no .go files under %s; the extraction is broken, not harness", serveDir)
-	}
-
-	harnessControl := make([]string, 0, len(seen))
-	for pattern := range seen {
-		harnessControl = append(harnessControl, pattern)
-	}
-	if len(harnessControl) == 0 {
-		t.Fatalf("found no state-changing route constants under %s (%d files scanned); the extraction is broken, not harness", serveDir, scanned)
-	}
-
-	got := append([]string(nil), controlRoutes...)
-	sort.Strings(got)
-	sort.Strings(harnessControl)
-
-	if strings.Join(got, "\n") != strings.Join(harnessControl, "\n") {
-		t.Fatalf("controlRoutes has drifted from harness pkg/serve/mux.go.\n  wui guards:\n    %s\n  harness serves (state-changing):\n    %s\nEvery state-changing harness route MUST appear in controlRoutes; one that does not is forwarded through the /v1/ subtree with no CSRF check.",
-			strings.Join(got, "\n    "), strings.Join(harnessControl, "\n    "))
-	}
-}
-
-// pinnedHarnessDir resolves the module cache directory of the harness version
-// go.mod pins. GOWORK=off is load-bearing: wui is a `use` entry in the parent
-// looprig/go.work, so without it a workspace run would resolve harness to the
-// sibling checkout and this test would assert against unreleased source.
-func pinnedHarnessDir(t *testing.T) string {
-	t.Helper()
-
-	const modulePath = "github.com/looprig/harness"
-	run := func(args ...string) (string, error) {
-		cmd := exec.Command("go", args...) // #nosec G204 -- fixed argv, no external input
-		cmd.Env = append(os.Environ(), "GOWORK=off")
-		out, err := cmd.Output()
-		return strings.TrimSpace(string(out)), err
-	}
-
-	dir, err := run("list", "-m", "-f", "{{.Dir}}", modulePath)
-	if err != nil {
-		t.Fatalf("go list -m %s: %v", modulePath, err)
-	}
-	if dir == "" {
-		// Nothing in this module IMPORTS harness yet, so the source may not be
-		// in the module cache. Download it rather than skipping: a skip here is
-		// a silent hole in a security assertion.
-		if _, err := run("mod", "download", modulePath); err != nil {
-			t.Fatalf("go mod download %s: %v", modulePath, err)
-		}
-		if dir, err = run("list", "-m", "-f", "{{.Dir}}", modulePath); err != nil || dir == "" {
-			t.Fatalf("go list -m %s after download: dir = %q err = %v", modulePath, dir, err)
-		}
-	}
-	return dir
 }
 
 // TestHandlerDoesNotBlanket403 is the regression guard for the defect design §4

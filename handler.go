@@ -13,8 +13,8 @@ package wui
 //     resolves as MORE specific than the "/v1/" subtree below, so it wins.
 //   - the five control patterns — each registered explicitly, wrapped in
 //     CSRFGuard.Wrap (see registerControlRoute), forwarding to api. The patterns
-//     are copied from harness pkg/serve/mux.go's own route constants; the copy is
-//     pinned to that source by handler_test.go's TestControlRoutesMatchHarness.
+//     are the deprecated Handler adapter's frozen legacy route set; new API
+//     routes are not added here.
 //   - /v1/                 — everything else under /v1 is forwarded to api
 //     unchanged (no prefix stripping: serve's own mux expects /v1/... paths).
 //     This pattern carries NO method restriction, so every method reaches api and
@@ -51,16 +51,13 @@ import (
 	"time"
 )
 
-// controlRoutes are the state-changing routes CSRFGuard protects, byte-identical
-// to harness pkg/serve/mux.go's own route constants (routeCreate, routeRestore,
-// routeInput, routeInterrupt, routeGate). They are duplicated here rather than
-// imported because pkg/serve's constants are unexported and wui's runtime surface
-// is stdlib only; handler_test.go's TestControlRoutesMatchHarness reads the pinned
-// harness source and fails if this list ever drifts from it.
+// controlRoutes are the deprecated Handler adapter's frozen legacy
+// state-changing routes. They remain here only to preserve compatibility for
+// existing Handler callers; new API routes are not added to this adapter.
 //
-// Completeness is a security property, not a convenience: wui forwards everything
-// under /v1/ that it does not name here, so a state-changing route missing from
-// this list is served with NO CSRF check at all.
+// Handler forwards everything under /v1/ that it does not name here without a
+// CSRF check. Callers needing a newer route set must compose the API and guards
+// explicitly instead of extending this frozen adapter.
 var controlRoutes = []string{
 	"POST /v1/sessions",
 	"POST /v1/sessions/{sid}/restore",
@@ -139,7 +136,7 @@ func Guard(next http.Handler, opts ...GuardOption) http.Handler {
 	return NewHostOriginGuard(cfg.extraAllowedHosts...).Wrap(next)
 }
 
-// Handler composes wui's complete browser surface over api (a harness
+// Handler composes wui's deprecated legacy browser surface over api (a harness
 // pkg/serve.Handler result): the SPA at /, api under /v1/, the CSRF token route,
 // per-route CSRF on the five state-changing control routes, and the Host/Origin
 // guard over all of it. See this file's package doc for the layering and why CSRF
@@ -154,6 +151,9 @@ func Guard(next http.Handler, opts ...GuardOption) http.Handler {
 // bounded: serve.Server refuses a bind only when it is non-loopback AND
 // unauthenticated, so a loopback bind — carbon serve's default — is unaffected. A
 // public bind of this handler needs serve.WithInsecurePublicBind().
+//
+// Deprecated: compose Assets, Guard, and API-specific controls explicitly for
+// new integrations. Handler's protected route set is frozen for compatibility.
 func Handler(api http.Handler, opts ...Option) http.Handler {
 	cfg := &config{}
 	for _, opt := range opts {

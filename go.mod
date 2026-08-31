@@ -8,17 +8,14 @@ tool (
 	honnef.co/go/tools/cmd/staticcheck
 )
 
-// harness is a test-time dependency: the contract drift guard (contract/) and
-// the fixture producers resolve the pinned harness module, and no non-test file
-// in this module may import it. Because nothing compiled imports harness,
-// `go mod tidy` DROPS this require -- use `go get` to move it, never tidy (see
-// CLAUDE.md).
+// Core is a test-time dependency: the contract drift guard resolves the pinned
+// module's sessionwire/v1 schemas and fixtures, and no non-test file imports it.
+// Because no compiled package imports Core, `go mod tidy` DROPS this require --
+// use `go get` to move it, never tidy (see CLAUDE.md).
 //
-// v0.30.0 is the version contract/ is vendored from; it carries the restore
-// response's `restored` field and the `restore_attached.json` fixture. Keep it
-// in step with HARNESS_VERSION in the Makefile -- contract/contract_test.go
-// fails if they part.
-require github.com/looprig/harness v0.30.0
+// v0.7.0 is the version contract/ is vendored from. Keep it in step with
+// CORE_VERSION in the Makefile; contract/contract_test.go fails if they part.
+require github.com/looprig/core v0.7.0
 
 require (
 	cloud.google.com/go v0.123.0 // indirect

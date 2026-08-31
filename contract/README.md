@@ -1,26 +1,22 @@
 # contract
 
-This directory is a vendored, version-pinned copy of harness's `pkg/serve` wire
-contract: the hand-authored JSON Schema documents (`schema/`) and golden fixtures
-(`fixtures/`) that describe the `serve` HTTP/SSE protocol. `VERSION` records the
-harness version it was copied from (see `HARNESS_VERSION` in the `Makefile`).
+This directory is a vendored, version-pinned copy of Core's `sessionwire/v1`
+wire artifacts: the JSON Schema documents in `schema/` and golden fixtures in
+`fixtures/`. `VERSION` records the Core version copied here; it matches
+`CORE_VERSION` in the `Makefile` and the direct Core requirement in `go.mod`.
 
-Vendoring these bytes verbatim, rather than reading harness's testdata at runtime,
-means both repos parse the exact same schema and fixtures — a wire change in
-harness has to be deliberately re-vendored here, rather than silently drifting out
-from under this module. It is also why `go.mod` requires harness and why wui is a
-tier-4 module rather than a tier-0 leaf, even though its Go *API* names no looprig
-type.
+Core is the authority for this contract. WUI keeps an exact local mirror so its
+browser protocol can be reviewed and tested without resolving a sibling checkout.
+The drift guard resolves the published version pinned by `go.mod` with
+`GOWORK=off`, then compares both mirrored trees byte-for-byte in both directions.
 
-harness authors the schemas; wui vendors them (design §8.2). harness is stdlib-only
-by policy and cannot ajv-validate, so its own test stays a shallow well-formedness
-guard and the real fixture-against-schema validation runs on wui's TypeScript side,
-where ajv already lives (`packages/protocol/test/contract.test.ts`).
+Nothing here is non-test Go source. The direct Core requirement exists only for
+this drift guard, so `go mod tidy` would remove it; use the documented `go get`
+workflow when moving the pin.
 
-Nothing here is Go source. `contract_test.go` is an external test package with no
-non-test siblings, so `contract/` compiles to nothing and no non-test file in this
-module imports harness — which is exactly the arrangement `CLAUDE.md` requires, and
-also why `go mod tidy` would drop the harness pin.
+Harness-era fixtures retained solely for deprecated `wui.Handler` compatibility
+live under `../legacy-contract/`. They are outside this Core mirror and outside
+the drift guard.
 
 ## Refreshing
 
@@ -28,23 +24,14 @@ also why `go mod tidy` would drop the harness pin.
 make contract
 ```
 
-This copies `pkg/serve/testdata/schema/*.json` and `pkg/serve/testdata/fixtures/*`
-from whichever harness module `go.mod` currently resolves to (via `go list -m`),
-overwriting `schema/`, `fixtures/` and `VERSION` in place. Move `HARNESS_VERSION`
-in the `Makefile` in the same commit as the `go.mod` bump; the guard below fails if
-they part.
+This copies the complete `sessionwire/v1/schema/` and
+`sessionwire/v1/testdata/fixtures/` trees from the pinned Core module, replacing
+both local trees and updating `VERSION`. Move `CORE_VERSION` and the direct
+`go.mod` requirement in the same commit.
 
 ## Drift guard
 
-`contract_test.go` asserts every file under `schema/` and `fixtures/` is
-byte-identical to the corresponding file in the *pinned* harness module (resolved
-fresh via `go list -m`, not cached), in both directions — a vendored file with no
-upstream counterpart fails too. It separately asserts `VERSION` names the pinned
-version, which is what catches a bump between two releases that happen to ship
-identical testdata. Bumping harness without re-running `make contract` fails here,
-turning a would-be silent protocol mismatch at runtime into a reviewable fixture
-diff at test time.
-
-The guard is mutation-tested: corrupting one vendored byte, deleting a vendored
-fixture, adding a vendored file with no upstream counterpart, and pointing
-`HARNESS_VERSION` at the wrong release each make it fail, naming the offending file.
+`contract_test.go` checks the pinned version and exact file bytes. A missing,
+changed, or extra local artifact fails with the affected path, and the version
+test catches a stale provenance record even when two releases contain identical
+artifacts.

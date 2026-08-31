@@ -36,9 +36,9 @@ This module is the browser presentation layer: a React SPA built to a static bun
 
 **The exported Go API names no looprig type** — `Assets`, `Guard` and `Handler` are `http.Handler` in, `http.Handler` out, so a consumer can adopt wui without adopting anything else. That is a statement about the *public surface*, not about `go.mod`: the module has real requires, and this file does not claim "stdlib only" as an absolute.
 
-`github.com/looprig/harness` is pinned because the **test surface** resolves it — the contract drift guard in `contract/` asserts the vendored wire contract against the harness version this module pins, and the fixture producers marshal real harness events. **No non-test file in this module may import harness.** wui imports harness; harness never imports wui. `github.com/looprig/core` and `github.com/looprig/inference` join it, on the same test-only footing, when the fixture producers land.
+`github.com/looprig/core` is pinned because the **test surface** resolves it — the contract drift guard in `contract/` asserts the vendored wire contract against the Core version this module pins. **No non-test file in this module may import Core.** The deprecated `Handler` adapter's Harness-era response vectors are frozen under `legacy-contract/`; WUI no longer resolves Harness source or carries a Harness module pin.
 
-Because nothing imports harness until the contract guard exists, **`go mod tidy` will silently drop the pin**. Resolve new tool dependencies with `go get -tool` and add module requires with `go get`; do not run `go mod tidy` in this module unless a compiled file imports every direct require.
+Because no compiled package imports Core, **`go mod tidy` will silently drop the pin**. Resolve new tool dependencies with `go get -tool` and add module requires with `go get`; do not run `go mod tidy` in this module unless a compiled file imports every direct require.
 
 **Prefer stdlib.** Always reach for the Go standard library first. If a need can be met with stdlib — even with a bit more code — use stdlib. On the Go side that bar has so far been met everywhere: the guards, the CSRF token and the embedded asset server are all stdlib.
 
@@ -50,7 +50,7 @@ Because nothing imports harness until the contract guard exists, **`go mod tidy`
 - `github.com/securego/gosec/v2` — security static analysis (dev/tool only)
 - `golang.org/x/vuln/cmd/govulncheck` — official Go vulnerability scanner (dev/tool only)
 - `honnef.co/go/tools/cmd/staticcheck` — extended static analysis (dev/tool only)
-- `github.com/looprig/harness` — test-only; the pinned wire contract the vendored `contract/` directory is asserted against, and the source of the event fixtures
+- `github.com/looprig/core` — test-only; the pinned `sessionwire/v1` schemas and fixtures mirrored under `contract/`
 
 npm, across the three workspaces (`packages/protocol`, `packages/react`, `app`). The list is split by what a consumer actually receives: **runtime** packages are reachable from browser code and land in the embedded bundle; **build/dev** packages never do. The `@tanstack/react-router` through fontsource entries were named by the wui implementation plan's Phase 5; the rest arrived with later phases and are recorded here after the fact rather than at approval time, which is the drift this section exists to prevent.
 
@@ -149,7 +149,7 @@ func TestFoo(t *testing.T) {
 
 Standalone verification is `GOWORK=off go test ./...`. Both it and `make check` must pass with **no Node toolchain installed**: `dist/index.html` is a committed placeholder precisely so `//go:embed all:dist` compiles without a build. Use `all:dist`, never a bare `dist` — without the prefix, entries whose names begin with `_` or `.` are silently skipped.
 
-This module **is** a `use` entry in the parent `looprig/go.work`, as the workspace `AGENTS.md` requires ("Keep root `go.work`, `repositories.mk`, and this graph synchronized"). That does mean a workspace build resolves `github.com/looprig/harness` to the sibling checkout rather than the pinned published version — so the contract drift guard defeats the workspace explicitly, setting `GOWORK=off` on the `go list` it uses to locate the pinned module. `client/contract/contract_test.go` is the established precedent for exactly this. Every Makefile target sets `GOWORK=off` for the same reason: standalone verification must test what `go.mod` actually pins.
+This module **is** a `use` entry in the parent `looprig/go.work`, as the workspace `AGENTS.md` requires ("Keep root `go.work`, `repositories.mk`, and this graph synchronized"). That means a workspace build resolves `github.com/looprig/core` to the sibling checkout rather than the pinned published version, so the contract drift guard defeats the workspace explicitly by setting `GOWORK=off` on the `go list` it uses to locate the pinned module. Every Makefile target sets `GOWORK=off` for the same reason: standalone verification must test what `go.mod` actually pins.
 
 ## Code Rules
 

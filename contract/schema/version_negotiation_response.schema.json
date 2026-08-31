@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/sessionwire/v1/version_negotiation_response.schema.json",
+  "title": "VersionNegotiationResponse",
+  "description": "Forward-compatible selected sessionwire version.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["version"],
+  "properties": {
+    "version": {"const": 1}
+  }
+}

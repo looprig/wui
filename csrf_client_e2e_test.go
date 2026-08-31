@@ -57,7 +57,7 @@ import (
 	"time"
 )
 
-// e2eSessionID is the session id every fixture in contract/fixtures/ is minted
+// e2eSessionID is the session id every retained legacy fixture is minted
 // for; the driver script below uses it for every per-session control route.
 const e2eSessionID = "00000000-0000-0000-0000-000000000000"
 
@@ -140,9 +140,9 @@ func e2eAPI(t *testing.T, reached *requestLog) http.Handler {
 
 func readE2EFixture(t *testing.T, name string) []byte {
 	t.Helper()
-	body, err := os.ReadFile(filepath.Join("contract", "fixtures", filepath.Base(name)))
+	body, err := os.ReadFile(filepath.Join("legacy-contract", "fixtures", filepath.Base(name)))
 	if err != nil {
-		t.Fatalf("read contract fixture %q: %v", name, err)
+		t.Fatalf("read legacy contract fixture %q: %v", name, err)
 	}
 	return body
 }
