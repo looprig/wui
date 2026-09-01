@@ -53,7 +53,10 @@ rejects symlinks and non-regular output, then transactionally replaces and stage
 `dist/` and runs the Go race/build gates against that embed. Any publication or
 gate failure, plus handled `SIGHUP`, `SIGINT`, or `SIGTERM`, restores the exact
 committed snapshot and index; signal exits retain their conventional nonzero
-status. `SIGKILL` and power loss cannot run rollback. After either, run `make
+status. Build and gate commands run in release-owned process groups: handled
+signals stop the complete group, escalating resistant descendants after a bounded
+grace period, before rollback or temporary-output cleanup begins. `SIGKILL` sent
+to the release process itself and power loss cannot run rollback. After either, run `make
 dist-reset` to remove interrupted output and restore the committed snapshot before
 retrying. The target refuses caller changes found under `dist/` both before builds
 and immediately before publication; it does not claim to lock out editor writes.

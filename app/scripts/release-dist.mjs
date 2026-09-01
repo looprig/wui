@@ -9,6 +9,9 @@ import { checkDist } from "./check-dist.mjs";
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const dist = join(repository, "dist");
 const signalExitCode = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+const handledSignals = Object.keys(signalExitCode);
+const terminationGraceMilliseconds = 500;
+const killWaitMilliseconds = 5_000;
 
 class ReleaseSignalError extends Error {
   constructor(signal) {
@@ -47,20 +50,110 @@ function runChecked(command, args, label, options = {}) {
   return result;
 }
 
-function runCheckedAsync(command, args, label, options, setActiveChild) {
-  return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, args, { cwd: repository, stdio: "inherit", ...options });
-    setActiveChild(child);
-    child.once("error", (error) => {
-      setActiveChild(undefined);
-      rejectPromise(error);
+function delay(milliseconds) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+function processGroupExists(processGroupId) {
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    if (error?.code === "EPERM") return true;
+    throw error;
+  }
+}
+
+function signalProcessGroup(processGroupId, signal) {
+  try {
+    process.kill(-processGroupId, signal);
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+}
+
+async function waitForProcessGroupExit(processGroupId, timeoutMilliseconds) {
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (processGroupExists(processGroupId)) {
+    if (Date.now() >= deadline) return false;
+    await delay(20);
+  }
+  return true;
+}
+
+async function terminateProcessGroup(processGroupId, signal) {
+  signalProcessGroup(processGroupId, signal);
+  if (await waitForProcessGroupExit(processGroupId, terminationGraceMilliseconds)) return;
+  signalProcessGroup(processGroupId, "SIGKILL");
+  if (!await waitForProcessGroupExit(processGroupId, killWaitMilliseconds)) {
+    throw new Error(`owned process group ${processGroupId} survived SIGKILL`);
+  }
+}
+
+class ManagedCommands {
+  constructor() {
+    this.active = undefined;
+    this.receivedSignal = undefined;
+    this.termination = undefined;
+    this.handlers = new Map(handledSignals.map((signal) => [signal, () => this.interrupt(signal)]));
+    for (const [signal, handler] of this.handlers) process.on(signal, handler);
+  }
+
+  interrupt(signal) {
+    if (this.receivedSignal !== undefined) return;
+    this.receivedSignal = signal;
+    if (this.active !== undefined && this.termination === undefined) {
+      this.termination = terminateProcessGroup(this.active.processGroupId, signal);
+    }
+  }
+
+  throwIfInterrupted() {
+    if (this.receivedSignal !== undefined) throw new ReleaseSignalError(this.receivedSignal);
+  }
+
+  async run(command, args, label, options = {}) {
+    this.throwIfInterrupted();
+    const child = spawn(command, args, {
+      cwd: repository,
+      stdio: "inherit",
+      detached: true,
+      ...options,
     });
-    child.once("close", (code, signal) => {
-      setActiveChild(undefined);
-      if (code === 0) resolvePromise();
-      else rejectPromise(new Error(`${label} exited with ${signal ?? `status ${code}`}`));
+    const completion = new Promise((resolvePromise) => {
+      child.once("error", (error) => resolvePromise({ error }));
+      child.once("close", (code, signal) => resolvePromise({ code, signal }));
     });
-  });
+    const processGroupId = child.pid;
+    if (processGroupId === undefined) {
+      const result = await completion;
+      throw result.error ?? new Error(`could not start ${label}`);
+    }
+    this.active = { child, processGroupId };
+    if (this.receivedSignal !== undefined && this.termination === undefined) {
+      this.termination = terminateProcessGroup(processGroupId, this.receivedSignal);
+    }
+    const result = await completion;
+    if (this.termination === undefined && processGroupExists(processGroupId)) {
+      this.termination = terminateProcessGroup(processGroupId, "SIGTERM");
+    }
+    if (this.termination !== undefined) await this.termination;
+    this.active = undefined;
+    this.termination = undefined;
+    this.throwIfInterrupted();
+    if (result.error !== undefined) throw result.error;
+    if (result.code !== 0) {
+      throw new Error(`${label} exited with ${result.signal ?? `status ${result.code}`}`);
+    }
+  }
+
+  dispose() {
+    for (const [signal, handler] of this.handlers) process.off(signal, handler);
+  }
+
+  hasLiveProcessGroup() {
+    return this.active !== undefined && processGroupExists(this.active.processGroupId);
+  }
 }
 
 function assertDistClean() {
@@ -83,11 +176,9 @@ function restoreCommittedDist() {
   );
 }
 
-function build(command, args, output) {
+async function build(commands, command, args, output) {
   const expanded = args.map((argument) => argument === "{out}" ? output : argument);
-  const result = spawnSync(command, expanded, { cwd: repository, stdio: "inherit" });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`bundle build exited with status ${result.status}`);
+  await commands.run(command, expanded, "bundle build");
   const classification = checkDist(output);
   if (!classification.ok) {
     throw new Error(`bundle build is not embeddable: ${JSON.stringify(classification)}`);
@@ -98,31 +189,27 @@ export async function stageReproducibleDist(command, args) {
   if (command === undefined || !args.includes("{out}")) {
     throw new TypeError("usage: release-dist.mjs COMMAND ... {out} ...");
   }
-  const temporary = mkdtempSync(join(tmpdir(), "looprig-wui-release-dist-"));
-  const first = join(temporary, "first");
-  const second = join(temporary, "second");
+  const commands = new ManagedCommands();
+  let temporary;
   try {
+    temporary = mkdtempSync(join(tmpdir(), "looprig-wui-release-dist-"));
+    const first = join(temporary, "first");
+    const second = join(temporary, "second");
     assertDistClean();
-    build(command, args, first);
-    build(command, args, second);
+    await build(commands, command, args, first);
+    await build(commands, command, args, second);
     const firstManifest = manifest(first);
     const secondManifest = manifest(second);
     if (JSON.stringify(firstManifest) !== JSON.stringify(secondManifest)) {
       throw new Error("release bundle is not reproducible: two isolated builds produced different manifests");
     }
+    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+    commands.throwIfInterrupted();
     assertDistClean();
 
     let publicationStarted = false;
-    let activeChild;
-    let receivedSignal;
-    const signals = ["SIGHUP", "SIGINT", "SIGTERM"];
-    const handlers = new Map(signals.map((signal) => [signal, () => {
-      if (receivedSignal !== undefined) return;
-      receivedSignal = signal;
-      activeChild?.kill(signal);
-    }]));
-    for (const [signal, handler] of handlers) process.on(signal, handler);
     try {
+      commands.throwIfInterrupted();
       publicationStarted = true;
       rmSync(dist, { recursive: true, force: true });
       cpSync(first, dist, { recursive: true, force: true });
@@ -137,38 +224,43 @@ export async function stageReproducibleDist(command, args) {
         throw new Error("installed release bundle is still the placeholder");
       }
       runChecked("git", ["add", "-f", "--all", "--", "dist"], "git add dist");
-      await runCheckedAsync(
+      await commands.run(
         "go",
         ["test", "-race", "-count=1", "./..."],
         "Go race gate",
         { env: { ...process.env, GOWORK: "off" } },
-        (child) => { activeChild = child; },
       );
-      await runCheckedAsync(
+      await commands.run(
         "go",
         ["build", "./..."],
         "Go build gate",
         { env: { ...process.env, GOWORK: "off" } },
-        (child) => { activeChild = child; },
       );
       runChecked("git", ["diff", "--cached", "--stat", "--", "dist"], "git staged dist summary");
       await new Promise((resolvePromise) => setImmediate(resolvePromise));
-      if (receivedSignal !== undefined) throw new ReleaseSignalError(receivedSignal);
+      commands.throwIfInterrupted();
     } catch (error) {
       if (publicationStarted) {
+        if (commands.hasLiveProcessGroup()) {
+          throw new AggregateError(
+            [error],
+            "release stopped without rollback because an owned process group could still mutate dist",
+          );
+        }
         try {
           restoreCommittedDist();
         } catch (rollbackError) {
           throw new AggregateError([error, rollbackError], "release publication and dist rollback both failed");
         }
       }
-      if (receivedSignal !== undefined) throw new ReleaseSignalError(receivedSignal);
+      commands.throwIfInterrupted();
       throw error;
-    } finally {
-      for (const [signal, handler] of handlers) process.off(signal, handler);
     }
   } finally {
-    rmSync(temporary, { recursive: true, force: true });
+    if (temporary !== undefined && !commands.hasLiveProcessGroup()) {
+      rmSync(temporary, { recursive: true, force: true });
+    }
+    commands.dispose();
   }
 }
 

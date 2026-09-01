@@ -81,6 +81,9 @@ function installFakeReleaseTools(
   failures: {
     gate?: boolean;
     gateSleep?: boolean;
+    gateGrandchild?: boolean;
+    gateExitRace?: boolean;
+    buildSleep?: boolean;
     gitAdd?: boolean;
     duringBuildEdit?: "tracked" | "ignored" | "staged";
   } = {},
@@ -104,6 +107,10 @@ const outIndex = args.indexOf("--outDir");
 const out = resolve(outIndex === -1 ? "dist" : args[outIndex + 1]);
 rmSync(out, { recursive: true, force: true });
 mkdirSync(resolve(out, "assets"), { recursive: true });
+if (process.env.BUNDLE_TEST_BUILD_SLEEP === "1" && count === 1) {
+  writeFileSync(process.env.BUNDLE_TEST_BUILD_READY, "ready");
+  setInterval(() => {}, 1000);
+}
 const marker = process.env.BUNDLE_TEST_MODE === "nondeterministic" ? String(count) : "stable";
 const index = process.env.BUNDLE_TEST_MODE === "placeholder"
   ? "placeholder"
@@ -135,7 +142,24 @@ if (mode === "fifo") {
 `);
   chmodSync(npm, 0o755);
   const go = join(bin, "go");
-  writeFileSync(go, '#!/bin/sh\necho "$@" >> "$BUNDLE_TEST_GO_CALLS"\nif [ "$BUNDLE_TEST_GATE_SLEEP" = "1" ] && [ "$1" = "test" ]; then echo ready > "$BUNDLE_TEST_GATE_READY"; sleep 30; fi\nif [ "$BUNDLE_TEST_GATE_FAIL" = "1" ] && [ "$1" = "test" ]; then exit 42; fi\nexit 0\n');
+  writeFileSync(go, `#!/usr/bin/env node
+import { appendFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+appendFileSync(process.env.BUNDLE_TEST_GO_CALLS, process.argv.slice(2).join(" ") + "\\n");
+if (process.env.BUNDLE_TEST_GATE_SLEEP === "1" && process.argv[2] === "test") {
+  if (process.env.BUNDLE_TEST_GATE_GRANDCHILD === "1") {
+    const source = 'import { mkdirSync, writeFileSync } from "node:fs"; process.on("SIGINT", () => {}); process.on("SIGTERM", () => {}); process.on("SIGHUP", () => {}); setTimeout(() => { mkdirSync(process.env.BUNDLE_TEST_LATE_TEMP, { recursive: true }); writeFileSync(process.env.BUNDLE_TEST_LATE_TEMP + "/written", "late"); writeFileSync("dist/late-grandchild", "late"); }, 800); setInterval(() => {}, 1000);';
+    spawn(process.execPath, ["--input-type=module", "-e", source], { stdio: "ignore", env: process.env });
+  }
+  writeFileSync(process.env.BUNDLE_TEST_GATE_READY, "ready");
+  if (process.env.BUNDLE_TEST_GATE_EXIT_RACE === "1") {
+    writeFileSync(process.env.BUNDLE_TEST_GATE_LEADER_EXITED, "exiting");
+    process.exit(0);
+  }
+  setInterval(() => {}, 1000);
+}
+if (process.env.BUNDLE_TEST_GATE_FAIL === "1" && process.argv[2] === "test") process.exit(42);
+`);
   chmodSync(go, 0o755);
   const realGit = run("which", ["git"], clone).trim();
   const git = join(bin, "git");
@@ -155,7 +179,13 @@ process.exit(result.status ?? 1);
     BUNDLE_TEST_GO_CALLS: join(clone, ".go-calls"),
     BUNDLE_TEST_GATE_FAIL: failures.gate ? "1" : "0",
     BUNDLE_TEST_GATE_SLEEP: failures.gateSleep ? "1" : "0",
+    BUNDLE_TEST_GATE_GRANDCHILD: failures.gateGrandchild ? "1" : "0",
+    BUNDLE_TEST_GATE_EXIT_RACE: failures.gateExitRace ? "1" : "0",
     BUNDLE_TEST_GATE_READY: join(clone, ".gate-ready"),
+    BUNDLE_TEST_GATE_LEADER_EXITED: join(clone, ".gate-leader-exited"),
+    BUNDLE_TEST_BUILD_SLEEP: failures.buildSleep ? "1" : "0",
+    BUNDLE_TEST_BUILD_READY: join(clone, ".build-ready"),
+    BUNDLE_TEST_LATE_TEMP: join(clone, ".late-temporary-write"),
     BUNDLE_TEST_GIT_ADD_FAIL: failures.gitAdd ? "1" : "0",
     BUNDLE_TEST_DURING_BUILD_EDIT: failures.duringBuildEdit ?? "",
   };
@@ -176,7 +206,7 @@ async function waitForFile(path: string): Promise<void> {
 
 async function interruptRelease(clone: string, signal: "SIGINT" | "SIGTERM") {
   const expected = manifest(clone);
-  const env = installFakeReleaseTools(clone, "deterministic", { gateSleep: true });
+  const env = installFakeReleaseTools(clone, "deterministic", { gateSleep: true, gateGrandchild: true });
   const temporaryRoot = join(clone, ".release-temporary");
   mkdirSync(temporaryRoot);
   env.TMPDIR = temporaryRoot;
@@ -186,18 +216,65 @@ async function interruptRelease(clone: string, signal: "SIGINT" | "SIGTERM") {
       "app/scripts/release-dist.mjs",
       "npm", "run", "build", "--workspace", "app", "--", "--outDir", "{out}", "--emptyOutDir",
     ],
-    { cwd: clone, env, detached: true, stdio: ["ignore", "pipe", "pipe"] },
+    { cwd: clone, env, stdio: "ignore" },
   );
-  let output = "";
-  child.stdout.on("data", (chunk) => { output += String(chunk); });
-  child.stderr.on("data", (chunk) => { output += String(chunk); });
   await waitForFile(env.BUNDLE_TEST_GATE_READY!);
-  process.kill(-child.pid!, signal);
+  child.kill(signal);
   const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.once("error", reject);
     child.once("close", (code, closedBy) => resolve({ code, signal: closedBy }));
   });
-  return { env, expected, output, result, temporaryRoot };
+  return { env, expected, result, temporaryRoot };
+}
+
+async function interruptFirstBuild(clone: string, signal: "SIGINT" | "SIGTERM") {
+  const expected = manifest(clone);
+  const env = installFakeReleaseTools(clone, "deterministic", { buildSleep: true });
+  const temporaryRoot = join(clone, ".release-temporary");
+  mkdirSync(temporaryRoot);
+  env.TMPDIR = temporaryRoot;
+  const child = spawn(
+    "node",
+    [
+      "app/scripts/release-dist.mjs",
+      "npm", "run", "build", "--workspace", "app", "--", "--outDir", "{out}", "--emptyOutDir",
+    ],
+    { cwd: clone, env, stdio: "ignore" },
+  );
+  await waitForFile(env.BUNDLE_TEST_BUILD_READY!);
+  child.kill(signal);
+  const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, closedBy) => resolve({ code, signal: closedBy }));
+  });
+  return { env, expected, result, temporaryRoot };
+}
+
+async function interruptAfterGateLeaderExit(clone: string) {
+  const expected = manifest(clone);
+  const env = installFakeReleaseTools(clone, "deterministic", {
+    gateSleep: true,
+    gateGrandchild: true,
+    gateExitRace: true,
+  });
+  const temporaryRoot = join(clone, ".release-temporary");
+  mkdirSync(temporaryRoot);
+  env.TMPDIR = temporaryRoot;
+  const child = spawn(
+    "node",
+    [
+      "app/scripts/release-dist.mjs",
+      "npm", "run", "build", "--workspace", "app", "--", "--outDir", "{out}", "--emptyOutDir",
+    ],
+    { cwd: clone, env, stdio: "ignore" },
+  );
+  await waitForFile(env.BUNDLE_TEST_GATE_LEADER_EXITED!);
+  child.kill("SIGTERM");
+  const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, closedBy) => resolve({ code, signal: closedBy }));
+  });
+  return { env, expected, result, temporaryRoot };
 }
 
 describe("bundle release workflow", () => {
@@ -343,11 +420,42 @@ describe("bundle release workflow", () => {
   );
 
   it.each(["SIGINT", "SIGTERM"] as const)(
-    "rolls back publication and cleans temporary outputs on %s",
+    "terminates its gate process group before rollback on direct %s",
     async (signal) => {
       const clone = cloneWithCurrentWorkflow();
 
       const interrupted = await interruptRelease(clone, signal);
+
+      expectPristineDist(clone, interrupted.expected);
+      expect(readdirSync(interrupted.temporaryRoot).filter((entry) => entry.startsWith("looprig-wui-release-dist-")))
+        .toStrictEqual([]);
+      expect(interrupted.result).toStrictEqual({ code: signal === "SIGINT" ? 130 : 143, signal: null });
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expectPristineDist(clone, interrupted.expected);
+      expect(existsSync(interrupted.env.BUNDLE_TEST_LATE_TEMP!)).toBe(false);
+    },
+    20_000,
+  );
+
+  it("retains ownership when a gate leader exits as interruption arrives", async () => {
+    const clone = cloneWithCurrentWorkflow();
+
+    const interrupted = await interruptAfterGateLeaderExit(clone);
+
+    expect(interrupted.result).toStrictEqual({ code: 143, signal: null });
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expectPristineDist(clone, interrupted.expected);
+    expect(existsSync(interrupted.env.BUNDLE_TEST_LATE_TEMP!)).toBe(false);
+    expect(readdirSync(interrupted.temporaryRoot).filter((entry) => entry.startsWith("looprig-wui-release-dist-")))
+      .toStrictEqual([]);
+  }, 20_000);
+
+  it.each(["SIGINT", "SIGTERM"] as const)(
+    "cleans temporary output when directly interrupted during build one with %s",
+    async (signal) => {
+      const clone = cloneWithCurrentWorkflow();
+
+      const interrupted = await interruptFirstBuild(clone, signal);
 
       expectPristineDist(clone, interrupted.expected);
       expect(readdirSync(interrupted.temporaryRoot).filter((entry) => entry.startsWith("looprig-wui-release-dist-")))
