@@ -5,14 +5,21 @@ deprecated `wui.Handler` compatibility test. They are frozen legacy vectors,
 not an active wire-contract authority, and new Harness routes or fixtures are
 not added here.
 
-Each file under `fixtures/` is legacy:
+Each file under `fixtures/` is legacy. This table is not prose: it is a fourth
+list of the same fact, and `../legacy_contract_test.go` parses it and requires
+it to agree with the route table, the digest table, and the directory listing.
+The status column is here because it is part of the frozen wire shape and the
+Go guard had no other record of it — `POST /v1/sessions` answering `200` instead
+of `201` was previously caught only by the Node driver, which skips.
 
-- `create_idle.json`
-- `gate_accepted.json`
-- `input.json`
-- `interrupt.json`
-- `restore.json`
-- `session_list.json`
+| Fixture | Deprecated route | Status |
+| --- | --- | --- |
+| `create_idle.json` | `POST /v1/sessions` | 201 |
+| `gate_accepted.json` | `POST /v1/sessions/{sid}/gates/{gid}` | 202 |
+| `input.json` | `POST /v1/sessions/{sid}/input` | 202 |
+| `interrupt.json` | `POST /v1/sessions/{sid}/interrupt` | 202 |
+| `restore.json` | `POST /v1/sessions/{sid}/restore` | 200 |
+| `session_list.json` | `GET /v1/sessions` | 200 |
 
 ## Guard
 

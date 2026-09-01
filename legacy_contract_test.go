@@ -4,10 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"testing"
 )
 
@@ -109,6 +112,64 @@ func TestLegacyFixtureDirectoryIsExactlyTheRouteTable(t *testing.T) {
 	}
 	if !equalStrings(fromDisk, fromDigests) {
 		t.Errorf("%s holds %v; the frozen digest table records %v", legacyFixtureDir, fromDisk, fromDigests)
+	}
+}
+
+// legacyREADMEPath documents the same six vectors a fourth time, as a table.
+// A hand-written list nothing compares is a list that goes stale, and this one
+// was the last of the four left uncompared.
+const legacyREADMEPath = "legacy-contract/README.md"
+
+// legacyREADMERow matches one `| `fixture.json` | `METHOD /path` | 201 |` row.
+var legacyREADMERow = regexp.MustCompile("(?m)^\\| `([^`]+)` \\| `([^`]+)` \\| (\\d{3}) \\|$")
+
+// TestLegacyREADMEMatchesTheRouteTable compares the README's table against the
+// route table, INCLUDING the status column.
+//
+// The status column is the point. Nothing in Go asserted `route.status` at all:
+// changing `POST /v1/sessions` from StatusCreated to StatusOK left every test
+// in this file green, because e2eAPI is the only reader and
+// csrf_client_e2e_test.go SKIPS without a Node toolchain -- so the one field
+// the deprecated adapter conveys its result in, for the one route that has no
+// response body worth speaking of, was guarded only in the configuration these
+// Node-free tests exist because CI does not have.
+//
+// The README is the right place to record it rather than a second Go literal:
+// a golden in the same file as its subject is one edit away from agreeing with
+// a mistake, and this directory's README is the document a reader of the
+// frozen vectors actually opens.
+func TestLegacyREADMEMatchesTheRouteTable(t *testing.T) {
+	t.Parallel()
+
+	readme, err := os.ReadFile(legacyREADMEPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", legacyREADMEPath, err)
+	}
+	matches := legacyREADMERow.FindAllStringSubmatch(string(readme), -1)
+	if len(matches) == 0 {
+		t.Fatalf("%s has no `| fixture | route | status |` rows; the table documenting the frozen vectors is gone", legacyREADMEPath)
+	}
+
+	fromREADME := make([]string, 0, len(matches))
+	for _, match := range matches {
+		status, err := strconv.Atoi(match[3])
+		if err != nil {
+			t.Fatalf("%s row %q: %v", legacyREADMEPath, match[0], err)
+		}
+		fromREADME = append(fromREADME, fmt.Sprintf("%s %s %d", match[1], match[2], status))
+	}
+	sort.Strings(fromREADME)
+
+	fromRoutes := make([]string, 0, len(legacyRoutes))
+	for _, route := range legacyRoutes {
+		fromRoutes = append(fromRoutes, fmt.Sprintf("%s %s %d", route.fixture, route.pattern, route.status))
+	}
+	sort.Strings(fromRoutes)
+
+	if !equalStrings(fromREADME, fromRoutes) {
+		t.Errorf("%s documents\n  %v\nbut the deprecated route table serves\n  %v\n"+
+			"Fixture, route and STATUS must agree. These vectors are frozen and nothing regenerates them.",
+			legacyREADMEPath, fromREADME, fromRoutes)
 	}
 }
 
