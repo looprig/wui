@@ -48,10 +48,12 @@ The Go module builds with no Node toolchain installed because a release bundle i
 committed, so the embed target always exists. That committed bundle is deliberately
 frozen between releases and may lag `app/` source during development. `make
 release-dist` is the only release path: it performs a clean dependency install,
-rebuilds and stages `dist/`, and runs the Go race suite against the staged embed.
+builds into two isolated output directories, refuses byte-different manifests,
+then replaces and stages `dist/` and runs the Go race suite against that embed.
 Use `make dist-reset` after an ordinary local app build to return to the committed
-release snapshot. Two consecutive Vite builds from the same source must produce the
-same hashed entry asset and `index.html`; do not commit a machine-dependent rewrite.
+release snapshot. Two consecutive isolated Vite builds from the same source must
+produce identical path-and-byte manifests; the target enforces that before it
+touches the committed snapshot or index.
 
 ```sh
 make check                 # the full gate: fmt, vet, staticcheck, gosec, vuln, test, build

@@ -99,11 +99,10 @@ contract:
 # handler actually serves it, and only then is the tree taggable. This is a
 # target rather than a documented ritual precisely so it cannot be forgotten.
 #
-# `make dist-reset` returns to the development state.
+# `make dist-reset` restores the exact bundle recorded by the current commit.
 release-dist:
 	npm ci
-	npm run build
-	git add -f dist/index.html dist/assets
+	node app/scripts/release-dist.mjs npm run build --workspace app -- --outDir {out} --emptyOutDir
 	@echo "--- staged for release ---"
 	@git diff --cached --stat -- dist | tail -3
 	@grep -q 'placeholder' dist/index.html && { echo "REFUSING: dist/index.html is still the placeholder"; exit 1; } || true
@@ -111,9 +110,8 @@ release-dist:
 	@echo "OK: built SPA staged and the Go suite passes against it. Commit, then tag."
 
 dist-reset:
-	git rm -r --cached --ignore-unmatch -q dist/assets
-	rm -rf dist/assets
-	git checkout -- dist/index.html
-	@echo "OK: back to the development state (placeholder only)."
+	git clean -fdx -- dist
+	git restore --source=HEAD --staged --worktree -- dist
+	@echo "OK: restored the complete committed dist snapshot."
 
 .PHONY: release-dist dist-reset
