@@ -12,8 +12,97 @@
  * (`isRecord`, `str`) that exist for `enduring.ts`/`gate.ts`/`fold.ts` and have
  * no business being public API on a package root.
  */
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import * as protocol from "../src/index.js";
+
+const packageRoot = fileURLToPath(new URL("..", import.meta.url));
+const workspaceRoot = resolve(packageRoot, "../..");
+const forbiddenPackageRoots = new Set([
+  "@looprig/harness",
+  "@looprig/react",
+  "@looprig/svelte",
+  "harness",
+  "react",
+  "react-dom",
+  "svelte",
+]);
+
+function packageRootOf(specifier: string): string {
+  const parts = specifier.split("/");
+  return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : (parts[0] ?? "");
+}
+
+function moduleSpecifiers(sourcePath: string): string[] {
+  const source = ts.createSourceFile(
+    sourcePath,
+    readFileSync(sourcePath, "utf8"),
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
+  const found: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (
+      (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+      node.moduleSpecifier &&
+      ts.isStringLiteral(node.moduleSpecifier)
+    ) {
+      found.push(node.moduleSpecifier.text);
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const [argument] = node.arguments;
+      if (argument !== undefined && ts.isStringLiteral(argument)) found.push(argument.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
+}
+
+function resolveRelativeModule(importer: string, specifier: string): string {
+  const candidate = resolve(dirname(importer), specifier.replace(/\.js$/, ".ts"));
+  if (!existsSync(candidate)) throw new Error(`unresolved public module ${specifier} from ${importer}`);
+  return candidate;
+}
+
+function forbiddenImports(entrypoint: string): string[] {
+  const pending = [entrypoint];
+  const visited = new Set<string>();
+  const violations: string[] = [];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined || visited.has(current)) continue;
+    visited.add(current);
+    for (const specifier of moduleSpecifiers(current)) {
+      if (specifier.startsWith(".")) {
+        pending.push(resolveRelativeModule(current, specifier));
+      } else if (forbiddenPackageRoots.has(packageRootOf(specifier))) {
+        violations.push(`${relative(dirname(entrypoint), current)} -> ${specifier}`);
+      }
+    }
+  }
+  return violations.sort();
+}
+
+function writeSource(root: string, path: string, source: string): void {
+  const target = join(root, path);
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, source);
+}
 
 describe("@looprig/protocol public surface", () => {
   it("exports the transcript row projection", () => {
@@ -143,12 +232,166 @@ describe("@looprig/protocol public surface", () => {
   });
 
   it("has no framework dependencies", async () => {
-    const { readFile } = await import("node:fs/promises");
     const manifest = JSON.parse(
-      await readFile(new URL("../package.json", import.meta.url), "utf8"),
-    ) as { dependencies?: Record<string, string> };
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { dependencies?: Record<string, string>; scripts?: Record<string, string> };
     // design §1: "Zero framework deps. A Vue or Solid author installs that one
     // package." That is the package's whole reason to exist.
     expect(Object.keys(manifest.dependencies ?? {}).sort()).toStrictEqual(["ajv", "json-schema-to-ts"]);
+    expect(manifest.dependencies).toStrictEqual({ ajv: "8.20.0", "json-schema-to-ts": "3.1.1" });
+    expect(manifest.scripts?.prepack).toBe(
+      "npm run build && npm run typecheck && npm run test:package",
+    );
+    expect(forbiddenImports(join(packageRoot, "src/index.ts"))).toStrictEqual([]);
   });
+
+  it("declares the private candidate's complete publish boundary", () => {
+    const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(manifest).toMatchObject({
+      name: "@looprig/protocol",
+      version: "0.1.0",
+      private: true,
+      type: "module",
+      files: ["dist"],
+      main: "./dist/index.js",
+      types: "./dist/index.d.ts",
+      exports: { ".": { types: "./dist/index.d.ts", default: "./dist/index.js" } },
+      sideEffects: false,
+      engines: { node: ">=22" },
+      license: "MIT",
+      repository: {
+        type: "git",
+        url: "git+https://github.com/looprig/wui.git",
+        directory: "packages/protocol",
+      },
+      publishConfig: { access: "restricted" },
+    });
+  });
+
+  it.each([
+    {
+      name: "deep React import",
+      files: {
+        "index.ts": 'export * from "./leaf.js";\n',
+        "leaf.ts": 'import { jsx } from "react/jsx-runtime"; export { jsx };\n',
+      },
+      want: "leaf.ts -> react/jsx-runtime",
+    },
+    {
+      name: "type-only Svelte import",
+      files: {
+        "index.ts": 'import type { Readable } from "svelte/store"; export type Public = Readable<string>;\n',
+      },
+      want: "index.ts -> svelte/store",
+    },
+    {
+      name: "transitive Harness re-export",
+      files: {
+        "index.ts": 'export * from "./bridge.js";\n',
+        "bridge.ts": 'export * from "./leaf.js";\n',
+        "leaf.ts": 'export { privateAPI } from "@looprig/harness/private";\n',
+      },
+      want: "leaf.ts -> @looprig/harness/private",
+    },
+  ])("rejects a $name from the public module graph", ({ files, want }) => {
+    const fixture = mkdtempSync(join(tmpdir(), "looprig-protocol-surface-"));
+    try {
+      for (const [path, source] of Object.entries(files)) writeSource(fixture, path, source);
+      expect(forbiddenImports(join(fixture, "index.ts"))).toContain(want);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("installs the packed artifact into a standalone consumer that typechecks and runs", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "looprig-protocol-consumer-"));
+    const packDir = join(fixture, "pack");
+    const consumerDir = join(fixture, "consumer");
+    const npmCache = process.env.npm_config_cache ?? join(tmpdir(), "looprig-protocol-npm-cache");
+    mkdirSync(packDir);
+    mkdirSync(consumerDir);
+    const run = (command: string, args: string[], cwd: string): string => {
+      try {
+        return execFileSync(command, args, {
+          cwd,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            npm_config_cache: npmCache,
+            npm_config_dry_run: "false",
+            ...(cwd === consumerDir ? { npm_config_workspaces: "false" } : {}),
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (error) {
+        const failure = error as { stdout?: string; stderr?: string; message?: string };
+        throw new Error(
+          `${failure.message ?? `${command} failed`}\nstdout:\n${failure.stdout ?? ""}\nstderr:\n${failure.stderr ?? ""}`,
+        );
+      }
+    };
+
+    try {
+      run("npm", ["run", "build", "--workspace", "@looprig/protocol"], workspaceRoot);
+      const packed = JSON.parse(
+        run(
+          "npm",
+          ["pack", "--workspace", "@looprig/protocol", "--ignore-scripts", "--json", "--pack-destination", packDir],
+          workspaceRoot,
+        ),
+      ) as Array<{ filename: string; files: Array<{ path: string }> }>;
+      const artifact = packed[0];
+      if (artifact === undefined) throw new Error("npm pack returned no artifact");
+      const expectedFiles = readdirSync(join(packageRoot, "src"), { recursive: true })
+        .filter((path): path is string => typeof path === "string" && path.endsWith(".ts"))
+        .flatMap((path) => {
+          const stem = path.slice(0, -3);
+          return [".d.ts", ".d.ts.map", ".js", ".js.map"].map((suffix) => `dist/${stem}${suffix}`);
+        });
+      expect(artifact.files.map(({ path }) => path).sort()).toStrictEqual(
+        [...expectedFiles, "package.json"].sort(),
+      );
+
+      const tarball = join(packDir, artifact.filename);
+      writeFileSync(
+        join(consumerDir, "package.json"),
+        JSON.stringify({
+          private: true,
+          type: "module",
+          dependencies: { "@looprig/protocol": `file:${tarball}` },
+        }),
+      );
+      writeFileSync(
+        join(consumerDir, "tsconfig.json"),
+        JSON.stringify({ compilerOptions: { strict: true, module: "NodeNext", moduleResolution: "NodeNext", noEmit: true } }),
+      );
+      writeFileSync(
+        join(consumerDir, "consumer.ts"),
+        'import type { ContentBlock } from "@looprig/protocol";\nconst block: ContentBlock = { type: "text", text: "packed" };\nif (block.type !== "text") throw new Error("unexpected block");\n',
+      );
+      writeFileSync(
+        join(consumerDir, "consumer.mjs"),
+        'import { textBlock } from "@looprig/protocol";\nif (textBlock("packed").Text !== "packed") throw new Error("runtime import failed");\n',
+      );
+      run("npm", ["install", "--ignore-scripts", "--prefer-offline", "--no-audit", "--no-fund"], consumerDir);
+      const installedPackage = realpathSync(join(consumerDir, "node_modules/@looprig/protocol"));
+      const consumerRelativePath = relative(realpathSync(consumerDir), installedPackage);
+      expect(consumerRelativePath).not.toMatch(/^\.\.(?:\/|$)/);
+      expect(installedPackage).not.toContain(workspaceRoot);
+      const installedManifest = JSON.parse(
+        readFileSync(join(installedPackage, "package.json"), "utf8"),
+      ) as { exports?: { "."?: { types?: string; default?: string } } };
+      expect(installedManifest.exports?.["."]).toStrictEqual({
+        types: "./dist/index.d.ts",
+        default: "./dist/index.js",
+      });
+      run(join(workspaceRoot, "node_modules/.bin/tsc"), ["-p", "tsconfig.json"], consumerDir);
+      run(process.execPath, ["consumer.mjs"], consumerDir);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

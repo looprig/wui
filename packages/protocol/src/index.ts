@@ -1,13 +1,14 @@
 /**
  * The public surface of `@looprig/protocol`.
  *
- * This package is the framework-neutral TypeScript boundary over harness's
- * `pkg/serve` wire contract, and it is the ONE package a non-React consumer
- * installs — `packages/react` is only the reference adapter, so a Vue or Solid
- * author must be able to reach every capability from this barrel and never need
- * a deep import into `src/`. It has no framework dependencies, which is the
- * package's whole reason to exist (design §1). `test/surface.test.ts` pins
- * every name below.
+ * This package is the framework-neutral TypeScript boundary over Core's
+ * `sessionwire/v1` contract and the legacy live transport. It is the ONE
+ * package a non-React consumer installs — `packages/react` is only the
+ * reference adapter, so a Vue or Solid author must be able to reach every
+ * capability from this barrel and never need a deep import into `src/`. It has
+ * no framework dependencies, which is the package's whole reason to exist
+ * (design §1). `test/surface.test.ts` pins the supported names below and walks
+ * the public module graph for forbidden framework imports.
  *
  * The layers, bottom up:
  *

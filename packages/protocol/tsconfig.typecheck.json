@@ -8,7 +8,7 @@
   // "include") because tsconfig.json's rootDir "src" would make `tsc -p
   // tsconfig.json` (the build script) fail with TS6059 the moment test/
   // is added to its include — build and typecheck have different scopes on
-  // purpose: build only ever emits sdk/core's published src, typecheck
+  // purpose: build only ever emits the protocol package's published src, typecheck
   // additionally verifies (with --noEmit, nothing here is ever emitted) that
   // the test suite itself still type-checks.
   "extends": "./tsconfig.json",
