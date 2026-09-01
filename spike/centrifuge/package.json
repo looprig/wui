@@ -1,0 +1,13 @@
+{
+  "name": "@looprig/centrifuge-compatibility-spike",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:5.7.2": "node client.mjs centrifuge-5-7-2",
+    "test:5.6.0": "node client.mjs centrifuge-5-6-0"
+  },
+  "dependencies": {
+    "centrifuge-5-6-0": "npm:centrifuge@5.6.0",
+    "centrifuge-5-7-2": "npm:centrifuge@5.7.2"
+  }
+}
