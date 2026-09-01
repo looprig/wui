@@ -165,6 +165,8 @@ func TestFoo(t *testing.T) {
 
 **Fuzzing** — For any function that parses external input, write a fuzz target: `go test -fuzz=FuzzXxx ./pkg -fuzztime=30s`.
 
+**The npm suites** — `npm test --workspaces` is CI's node gate. `@looprig/react` (22 files) and `app` (28 files) are ordinary vitest runs. `@looprig/protocol`'s `test` script is **`scripts/known-drift-gate.mjs`**, not bare vitest: it runs the whole suite and then fails unless the set of failing FILES is exactly the set recorded in `packages/protocol/test/known-drift.json`. Ten files fail there today — U0.1 re-sourced `contract/` from Core `sessionwire/v1` while the TypeScript schema mirror still describes the Harness-era contract, which the Wave 2 checkpoint permits and Wave 4C reconciles. Every test still runs; a regression in any of the other 26 files fails CI, and an allowance for a file that has started passing (or has been deleted) fails CI too, so the exemption cannot quietly become permanent. `npm run test:raw --workspace @looprig/protocol` is the ungated vitest run.
+
 **Checks** — `make check` is the full gate and the CI entry point: `fmt-check`, `vet`, `staticcheck`, `gosec`, `go mod verify`, `govulncheck`, `go test -race` and `go build`, every one of them under `GOWORK=off`. Run it before every commit.
 
 Standalone verification is `GOWORK=off go test ./...`. Both it and `make check` must pass with **no Node toolchain installed**: `dist/index.html` is a committed placeholder precisely so `//go:embed all:dist` compiles without a build. Use `all:dist`, never a bare `dist` — without the prefix, entries whose names begin with `_` or `.` are silently skipped.

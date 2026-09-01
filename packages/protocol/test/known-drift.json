@@ -1,0 +1,40 @@
+{
+  "$comment": [
+    "The wire-contract drift task U0.1 deliberately left behind, and the exact",
+    "set of test files it left failing. Read scripts/known-drift-gate.mjs for",
+    "how this file is used; read it before adding an entry.",
+    "",
+    "Task U0.1 (2026-08-31, commit 6bf58f0) re-sourced wui/contract/ from",
+    "published Core v0.7.0 sessionwire/v1 -- 33 schemas, 33 fixtures -- and",
+    "removed Harness from the module graph. @looprig/protocol's TypeScript",
+    "schema mirror still describes the Harness-era wire contract, so it",
+    "disagrees with the newly mirrored Core contract. The Wave 2 checkpoint",
+    "permits that drift; reconciling it is Wave 4C protocol work and is blocked",
+    "on Factory contract fixtures that do not exist yet.",
+    "",
+    "This is an allowance for a KNOWN, DATED, BOUNDED failure, not a way to",
+    "stop running the suite. Every test in every one of these files still runs",
+    "in CI. The gate fails if any file NOT listed here fails, and it fails if a",
+    "file listed here stops failing -- retiring an entry is a deliberate edit in",
+    "the same commit that fixes the drift.",
+    "",
+    "File granularity, not failure counts: three of these files drive real HTTP",
+    "servers with timeouts, so their failure counts are machine-dependent and a",
+    "recorded count would make CI flaky rather than strict."
+  ],
+  "recordedOn": "2026-08-31",
+  "reason": "U0.1 Core sessionwire/v1 re-source; reconciliation is Wave 4C protocol work, blocked on Factory contract fixtures",
+  "retireIn": "Wave 4C (runbook 06, WUI protocol reconciliation)",
+  "files": [
+    "test/conformance.test.ts",
+    "test/contract.test.ts",
+    "test/enduring.test.ts",
+    "test/errors.test.ts",
+    "test/fold-contract-fixtures.test.ts",
+    "test/host-transport-csrf.test.ts",
+    "test/messages.test.ts",
+    "test/serve-transport.test.ts",
+    "test/sse.test.ts",
+    "test/transport.test.ts"
+  ]
+}

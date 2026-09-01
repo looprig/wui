@@ -45,12 +45,29 @@ jobs:
       # it, because the script IS present. `--with-deps` installs the shared
       # libraries a bare ubuntu-latest runner lacks.
       - run: npx playwright install --with-deps chromium
-      # The npm workspaces carry the OTHER half of the wire-contract drift
-      # guard: contract/contract_test.go proves contract/ matches the pinned
-      # harness bytes, and packages/protocol validates those same bytes against
-      # the schemas with ajv (harness is stdlib-only and cannot). Without this
-      # job that half never runs in CI -- and a suite CI never runs is
-      # indistinguishable from a passing one, which is the exact failure the
-      # deferred-ports tripwire existed to prevent.
+      # The npm workspaces carry the other half of the wire-contract story, and
+      # what that half currently IS is worth stating precisely, because the
+      # comment this replaces went on describing the previous arrangement after
+      # it stopped being true.
+      #
+      # As of U0.1, contract/contract_test.go proves contract/ matches the bytes
+      # of the pinned CORE module's sessionwire/v1 -- not harness, which is no
+      # longer in this module's graph at all. @looprig/protocol does NOT yet
+      # validate those Core bytes with ajv: its TypeScript schema mirror still
+      # describes the Harness-era contract, so the two disagree. That
+      # disagreement is deliberate, permitted by the Wave 2 checkpoint, and
+      # recorded file-by-file in packages/protocol/test/known-drift.json;
+      # reconciling it is Wave 4C protocol work, blocked on Factory contract
+      # fixtures that do not exist yet.
+      #
+      # The suite still RUNS here, every test of it. @looprig/protocol's `test`
+      # script is scripts/known-drift-gate.mjs, which fails on any failing file
+      # the recorded allowance does not cover and on any allowance that has gone
+      # stale. Dropping the workspace would leave a suite CI never runs, which
+      # is indistinguishable from a passing one -- the exact failure the
+      # deferred-ports tripwire existed to prevent -- and a blanket
+      # continue-on-error is that same failure wearing a different hat: it would
+      # hide every future regression in the 26 healthy files for as long as the
+      # drift lasts.
       - run: npm run typecheck --workspaces --if-present
       - run: npm test --workspaces --if-present
