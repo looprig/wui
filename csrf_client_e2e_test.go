@@ -129,12 +129,11 @@ func e2eAPI(t *testing.T, reached *requestLog) http.Handler {
 			_, _ = w.Write(body)
 		}
 	}
-	mux.Handle("POST /v1/sessions", serve("create_idle.json", http.StatusCreated))
-	mux.Handle("GET /v1/sessions", serve("session_list.json", http.StatusOK))
-	mux.Handle("POST /v1/sessions/{sid}/restore", serve("restore.json", http.StatusOK))
-	mux.Handle("POST /v1/sessions/{sid}/input", serve("input.json", http.StatusAccepted))
-	mux.Handle("POST /v1/sessions/{sid}/interrupt", serve("interrupt.json", http.StatusAccepted))
-	mux.Handle("POST /v1/sessions/{sid}/gates/{gid}", serve("gate_accepted.json", http.StatusAccepted))
+	// One table, shared with legacy_contract_test.go's freeze guard, so this
+	// handler and the guard can never describe different fixture sets.
+	for _, route := range legacyRoutes {
+		mux.Handle(route.pattern, serve(route.fixture, route.status))
+	}
 	return mux
 }
 
@@ -321,7 +320,7 @@ func lookE2ETool(t *testing.T, name string) string {
 	t.Helper()
 	path, err := exec.LookPath(name)
 	if err != nil {
-		t.Skipf("skipping cross-language CSRF end-to-end test: %q not on PATH (%v); the Go and TypeScript halves are each covered separately, but nothing checks they agree without it", name, err)
+		t.Skipf("skipping cross-language CSRF end-to-end test: %q not on PATH (%v); the Go and TypeScript halves are each covered separately, but nothing checks they agree without it. The frozen legacy-contract/ vectors this test reads are NOT left unguarded by the skip -- legacy_contract_test.go asserts their bytes with no Node toolchain.", name, err)
 	}
 	return path
 }
@@ -339,7 +338,7 @@ func buildProtocolPackage(t *testing.T, npmBin string) string {
 	// compile-time constant; no external input reaches this argv.
 	cmd := exec.CommandContext(ctx, npmBin, "run", "build", "--workspace", protocolPackage)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Skipf("skipping cross-language CSRF end-to-end test: building %s failed (%v); dependencies are probably not installed (npm ci). Output:\n%s", protocolPackage, err, out)
+		t.Skipf("skipping cross-language CSRF end-to-end test: building %s failed (%v); dependencies are probably not installed (npm ci). The frozen legacy-contract/ vectors remain guarded by legacy_contract_test.go, which needs no Node. Output:\n%s", protocolPackage, err, out)
 	}
 
 	dist, err := filepath.Abs(filepath.Join("packages", "protocol", "dist", "index.js"))
