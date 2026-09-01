@@ -55,6 +55,45 @@ function packageRootOf(specifier: string): string {
   return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : (parts[0] ?? "");
 }
 
+/**
+ * Every module specifier the source names, by SPELLING -- syntax only, no type
+ * checker. The list below is what this walker claims to cover; it is NOT a
+ * claim to cover every construct in TypeScript, and the previous version of
+ * this comment ("the walker's job is to describe the language") was exactly
+ * that unqualified claim. It was wrong twice: `import("react")` in TYPE
+ * position was invisible until a review found it, and then
+ * import(`react`) -- a no-substitution TEMPLATE literal, semantically
+ * identical to the string form -- was invisible to the fix, because
+ * `ts.isStringLiteral` is FALSE for a NoSubstitutionTemplateLiteral. Placed in
+ * src/types.ts it shipped a real, undeclared runtime `react` import in
+ * `dist/types.js` and both surface tests passed.
+ *
+ * So: covered spellings, each with a fixture case in the `rejects a $name`
+ * table below, and each accepted in BOTH the quoted and the backtick form
+ * wherever the grammar allows a template literal.
+ *
+ *   1. `import ... from "x"` / `export ... from "x"` (incl. `import type`)
+ *   2. `import("x")` dynamic import, value position
+ *   3. `import("x").T` / `typeof import("x")`, type position
+ *   4. `import x = require("x")`
+ *   5. `require("x")` -- CJS. Unreachable from this ESM package's own sources,
+ *      kept because the walker also runs over fixtures and costs nothing.
+ *   6. `declare module "x" { ... }` -- an ambient module declaration or
+ *      augmentation names a package as surely as an import does.
+ *   7. `/// <reference types="x" />` -- how a `.d.ts` acquires `@types/*`.
+ *      This is the one with real teeth of the three added late: it is a
+ *      DEPENDENCY EDGE that never appears in any import statement. Note it is
+ *      a no-op on its own -- `tsc` PRUNES an unused triple-slash reference from
+ *      the emitted `.d.ts` -- so it only ships once the referenced global is
+ *      actually used, which is precisely when it matters.
+ *
+ * Known NOT covered, stated rather than implied: anything requiring the type
+ * checker or module resolution (a specifier built by string concatenation, a
+ * path alias, `import.meta.resolve(...)`, a bare `require` reached through an
+ * alias), and `/// <reference path="..." />`, which names a FILE and not a
+ * package. If a construct is added to the language, it belongs on one of these
+ * two lists and in the fixture table.
+ */
 function moduleSpecifiers(sourcePath: string): string[] {
   const source = ts.createSourceFile(
     sourcePath,
@@ -64,16 +103,35 @@ function moduleSpecifiers(sourcePath: string): string[] {
     ts.ScriptKind.TS,
   );
   const found: string[] = [];
+  // `/// <reference types="react" />` -- spelling 7. Parsed by the scanner, not
+  // reachable from the AST walk, so it is read off the SourceFile directly.
+  for (const directive of source.typeReferenceDirectives) found.push(directive.fileName);
+  // A module specifier is a StringLiteral OR a NoSubstitutionTemplateLiteral
+  // everywhere one can be written. Every branch below goes through here so a
+  // spelling cannot be covered in one position and blind in another, which is
+  // how the last gap survived a fix aimed at the place the bug was noticed.
+  const specifierText = (node: ts.Node | undefined): string | undefined => {
+    let current = node;
+    while (current !== undefined && ts.isParenthesizedExpression(current)) current = current.expression;
+    if (current === undefined) return undefined;
+    return ts.isStringLiteral(current) || ts.isNoSubstitutionTemplateLiteral(current)
+      ? current.text
+      : undefined;
+  };
+  const push = (text: string | undefined): void => {
+    if (text !== undefined) found.push(text);
+  };
   const visit = (node: ts.Node): void => {
-    if (
-      (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
-      node.moduleSpecifier &&
-      ts.isStringLiteral(node.moduleSpecifier)
-    ) {
-      found.push(node.moduleSpecifier.text);
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier) {
+      push(specifierText(node.moduleSpecifier));
     } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
-      const [argument] = node.arguments;
-      if (argument !== undefined && ts.isStringLiteral(argument)) found.push(argument.text);
+      push(specifierText(node.arguments[0]));
+    } else if (
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === "require"
+    ) {
+      push(specifierText(node.arguments[0]));
     } else if (ts.isImportTypeNode(node)) {
       // `type X = import("react").ReactNode` -- an import that appears in the
       // TYPE position and has no import statement at all. This is the form a
@@ -84,16 +142,17 @@ function moduleSpecifiers(sourcePath: string): string[] {
       // test happened to fail, but only because that fixture does not install
       // React's types -- a reason that evaporates for any forbidden package
       // whose types a consumer already has transitively.
-      if (ts.isLiteralTypeNode(node.argument) && ts.isStringLiteral(node.argument.literal)) {
-        found.push(node.argument.literal.text);
-      }
+      if (ts.isLiteralTypeNode(node.argument)) push(specifierText(node.argument.literal));
     } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
       // `import x = require("react")`. Not reachable from this package's own
-      // sources (ESM + isolatedModules), but the walker's job is to describe
-      // the language, not this month's source tree.
-      if (ts.isStringLiteral(node.moduleReference.expression)) {
-        found.push(node.moduleReference.expression.text);
-      }
+      // sources (ESM + isolatedModules), but a fixture can spell it.
+      push(specifierText(node.moduleReference.expression));
+    } else if (ts.isModuleDeclaration(node) && ts.isStringLiteral(node.name)) {
+      // `declare module "react" { ... }`. A string-named module declaration is
+      // an ambient declaration of, or an augmentation to, THAT package.
+      // `declare global` and `namespace X` have Identifier names and are not
+      // module specifiers, so the isStringLiteral guard is load-bearing.
+      push(node.name.text);
     }
     ts.forEachChild(node, visit);
   };
@@ -107,10 +166,12 @@ function resolveRelativeModule(importer: string, specifier: string): string {
   return candidate;
 }
 
-function forbiddenImports(entrypoint: string): string[] {
-  const pending = [entrypoint];
+/** Walks the relative-import graph from `roots`, returning every file reached and every specifier outside the allowlist. */
+function walkModuleGraph(roots: string[]): { visited: Set<string>; violations: string[] } {
+  const pending = [...roots];
   const visited = new Set<string>();
   const violations: string[] = [];
+  const base = dirname(roots[0] ?? "");
   while (pending.length > 0) {
     const current = pending.pop();
     if (current === undefined || visited.has(current)) continue;
@@ -119,11 +180,23 @@ function forbiddenImports(entrypoint: string): string[] {
       if (specifier.startsWith(".")) {
         pending.push(resolveRelativeModule(current, specifier));
       } else if (!allowedPackageRoots.has(packageRootOf(specifier))) {
-        violations.push(`${relative(dirname(entrypoint), current)} -> ${specifier}`);
+        violations.push(`${relative(base, current)} -> ${specifier}`);
       }
     }
   }
-  return violations.sort();
+  return { visited, violations: violations.sort() };
+}
+
+function forbiddenImports(...roots: string[]): string[] {
+  return walkModuleGraph(roots).violations;
+}
+
+/** Every `.ts` file under `src/` -- i.e. exactly what `tsc -p tsconfig.json` emits into `dist/`, which `files: ["dist"]` publishes in full. */
+function srcFiles(): string[] {
+  return readdirSync(join(packageRoot, "src"), { recursive: true })
+    .filter((path): path is string => typeof path === "string" && path.endsWith(".ts"))
+    .map((path) => join(packageRoot, "src", path))
+    .sort();
 }
 
 function writeSource(root: string, path: string, source: string): void {
@@ -259,6 +332,20 @@ describe("@looprig/protocol public surface", () => {
     }
   });
 
+  it("needs no deep import: every emitted module is reachable from the barrel", () => {
+    // The OTHER half of the split above. Reachability is not a publish
+    // boundary (see "has no framework dependencies"), but it is exactly design
+    // §1's "a Vue or Solid author must never need a deep import into src/":
+    // a module tsc emits that the barrel cannot reach is either dead weight in
+    // the tarball or a capability only a deep import can get at.
+    const { visited } = walkModuleGraph([resolve(packageRoot, "src/index.ts")]);
+    const unreachable = srcFiles()
+      .map((file) => resolve(file))
+      .filter((file) => !visited.has(file))
+      .map((file) => relative(packageRoot, file));
+    expect(unreachable).toStrictEqual([]);
+  });
+
   it("has no framework dependencies", async () => {
     const manifest = JSON.parse(
       readFileSync(new URL("../package.json", import.meta.url), "utf8"),
@@ -289,7 +376,14 @@ describe("@looprig/protocol public surface", () => {
     expect(manifest.scripts?.prepack).toBe(
       "npm run build && npm run typecheck && npm run test:package",
     );
-    expect(forbiddenImports(join(packageRoot, "src/index.ts"))).toStrictEqual([]);
+    // The subject is EVERY file tsc emits, not only what the barrel reaches.
+    // `files: ["dist"]` publishes all of src/, so a module that imports react
+    // and is never re-exported from index.ts still ships inside the tarball --
+    // and the packed-consumer test cannot catch it either, because that test
+    // derives its expected file list from readdirSync(src), so dist/orphan.*
+    // is EXPECTED there. Reachability is the wrong scope for a publish
+    // boundary; the emit set is the right one.
+    expect(forbiddenImports(...srcFiles())).toStrictEqual([]);
   });
 
   it("declares the private candidate's complete publish boundary", () => {
@@ -345,6 +439,63 @@ describe("@looprig/protocol public surface", () => {
       name: "import-equals require",
       files: {
         "index.ts": 'import react = require("react");\nexport const r = react;\n',
+      },
+      want: "index.ts -> react",
+    },
+    {
+      // A no-substitution TEMPLATE literal. Semantically identical to the
+      // string form, and `ts.isStringLiteral` is FALSE for it, so the previous
+      // walker read straight past this in every position at once. Placed in
+      // the real src/types.ts it shipped `import(`react`)` in dist/types.js.
+      name: "backtick dynamic import",
+      files: {
+        "index.ts": "export const lazyReact = () => import(`react`);\n",
+      },
+      want: "index.ts -> react",
+    },
+    {
+      name: "backtick import() type",
+      files: {
+        "index.ts": "export type Public = import(`react`).ReactNode;\n",
+      },
+      want: "index.ts -> react",
+    },
+    {
+      name: "backtick import-equals require",
+      files: {
+        "index.ts": "import react = require(`react`);\nexport const r = react;\n",
+      },
+      want: "index.ts -> react",
+    },
+    {
+      name: "parenthesized dynamic import specifier",
+      files: {
+        "index.ts": 'export const lazyReact = () => import(("react"));\n',
+      },
+      want: "index.ts -> react",
+    },
+    {
+      name: "CJS require call",
+      files: {
+        "index.ts": 'const react = require("react");\nexport { react };\n',
+      },
+      want: "index.ts -> react",
+    },
+    {
+      // An augmentation names the package it augments; it is a dependency edge
+      // with no import statement anywhere.
+      name: "ambient module augmentation",
+      files: {
+        "index.ts": 'declare module "react" {\n  export const patched: boolean;\n}\nexport const x = 1;\n',
+      },
+      want: "index.ts -> react",
+    },
+    {
+      // How a .d.ts acquires @types/*. Pruned from the emit while unused, real
+      // the moment the global it brings in is referenced -- as here.
+      name: "triple-slash types reference",
+      files: {
+        "index.ts": '/// <reference types="react" />\nexport const node: React.ReactNode = null;\n',
       },
       want: "index.ts -> react",
     },
@@ -463,9 +614,18 @@ describe("@looprig/protocol public surface", () => {
       // TARBALL -- which carries none of them; the file list asserted above is
       // dist/ plus package.json -- at the version the COMMITTED LOCKFILE pins.
       //
-      // The lockfile half is what makes this more than a tautology. A consumer
-      // resolves the manifest, so "declared version == installed version" holds
-      // for any exact pin, including one typed in by hand. The workspace's own
+      // BOTH halves carry weight, and an earlier version of this comment
+      // called the first one "a tautology -- npm installs what the manifest
+      // says", which is wrong. `toBe(version)` compares an installed
+      // package.json's `version` field against the SPECIFIER; those are equal
+      // only for a specifier that is an exact pin AND actually resolved.
+      // `ajv: "^8.20.0"` fails it with `ajv did not resolve for a tarball
+      // consumer: expected '8.20.0' to be '^8.20.0'`, and so does any alias,
+      // `npm:`, git, `file:` or `workspace:` specifier -- on the PACKED
+      // manifest, which is the one a consumer gets and is not the one the
+      // "has no framework dependencies" regex reads.
+      //
+      // The lockfile half is the second, independent fact. The workspace's own
       // reproducibility rests on package-lock.json, not on the manifest: the
       // exact top-level pins say nothing about `centrifuge`'s own ranged
       // `events ^3.3.0` and `protobufjs ^7.6.0`. A manifest pin moved without
