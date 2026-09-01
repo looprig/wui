@@ -17,34 +17,61 @@
  * cause is how a permanent exemption is born; retiring an entry is a one-line
  * edit in the commit that fixes the drift.
  *
- * TWO floors, because the first version of this script had neither and the
- * failure its own docstring names came back one level down.
+ * THREE floors. Each one was added because the floor above it turned out to
+ * have nothing underneath, which is the single defect this script has now been
+ * revised three times to fix. The pattern each time: a thing was PRINTED, or
+ * CLAIMED in a comment, and asserted nowhere.
  *
- * FLOOR 1 -- WHICH FILES RAN. The script derived `seen`, printed "26 of 36 test
- * files pass", and asserted NOTHING about it. `git mv test/surface.test.ts
- * test/surface.spec.ts` puts the file outside vitest.config.ts's
- * `include: ["test/**\/*.test.ts"]`; the run reports `10 failed | 25 passed
- * (35)` and this gate exits 0. The entire export-surface guard stops running
- * and nothing says so. So test/known-drift.json records `suiteFiles`, the full
- * expected file-NAME set, and any mismatch in either direction fails. Names,
- * not a count, and names because they are machine-independent -- unlike the
- * per-test counts inside the three HTTP files.
+ * FLOOR 0 -- WHICH FILES ARE ALLOWED TO BE FILE-GRANULAR. `fileGranular` in
+ * test/known-drift.json names the three files exempt from FLOOR 2, and the
+ * partition is checked in BOTH directions: an entry inside that list must carry
+ * `granularityReason` and must not carry `failingTests`, and an entry outside
+ * it must carry `failingTests` and must not carry `granularityReason`.
+ *
+ * The earlier shape check only demanded exactly ONE of the two fields, which a
+ * free-text string satisfies. Swapping test/contract.test.ts's 58-name set for
+ * `granularityReason: "flaky"` exited 0 and printed "6 gated to an exact
+ * failing-test-name set and 4 stay file-granular" as though that were the
+ * design. Every future regression across that file's 62 tests would have been
+ * invisible for the rest of the allowance -- the exact state FLOOR 2 exists to
+ * end, reachable by editing the JSON alone. So the 7/3 partition is now the
+ * pinned fact, not an emergent property of which fields happen to be present.
+ *
+ * FLOOR 1 -- WHICH FILES RAN, AND HOW MANY TESTS EACH COLLECTED. The first
+ * version derived `seen`, printed "26 of 36 test files pass", and asserted
+ * NOTHING about it: `git mv test/surface.test.ts test/surface.spec.ts` puts the
+ * file outside vitest.config.ts's `include: ["test/**\/*.test.ts"]`, the run
+ * reports `10 failed | 25 passed (35)`, and the gate exits 0 with the whole
+ * export-surface guard silently not running.
+ *
+ * Pinning the file NAMES fixed that and left the same hole one level in: a
+ * `describe` dropped in a merge-conflict resolution, or a deleted `it`, leaves
+ * the file running and passing and the gate green. Deleting one passing `it`
+ * from test/blocks.test.ts (24 -> 23) exited 0. So `suiteFiles` maps every
+ * expected test file to the number of tests it collects, and both the name sets
+ * and the per-file counts must match.
+ *
+ * The flakiness argument that protects the three HTTP files (below) does not
+ * reach these counts: how many tests a file COLLECTS is a property of its
+ * source, not of any server or timeout. Verified across independent full runs
+ * -- all 36 counts identical, including the three HTTP files, whose per-test
+ * OUTCOMES do vary.
  *
  * FLOOR 2 -- WHICH TESTS FAIL INSIDE A DRIFTED FILE. File granularity alone
  * means a new failing `it` in an already-drifted file is invisible: a fresh
- * broken test in test/errors.test.ts took the run to 155 failures and this gate
- * still exited 0. That is defensible ONLY for the three files that drive real
- * HTTP servers under timeouts (transport, host-transport-csrf,
- * serve-transport: 85-90s each, machine-dependent counts) -- and it was applied
- * to all ten, including seven that run in 3-24ms with counts reproduced
- * identically across independent runs. So the seven fast files record the exact
- * SET OF FAILING TEST NAMES plus the total number of tests collected, and the
- * three slow ones keep file granularity and must say why, per file, in
- * `granularityReason`. A file may not have both and may not have neither.
+ * broken test in test/errors.test.ts took the run to 155 failures and an
+ * earlier version of this gate still exited 0. That is defensible ONLY for the
+ * three files that drive real HTTP servers under timeouts (transport,
+ * host-transport-csrf, serve-transport: 85-90s each, machine-dependent per-test
+ * outcomes) -- and it had been applied to all ten, including seven that run in
+ * 3-24ms with failing sets reproduced identically across independent runs. The
+ * seven record the exact SET OF FAILING TEST NAMES; the three record why they
+ * do not, per file, and FLOOR 0 pins which three they are.
  *
- * The residual cost, stated: inside the three HTTP files a new failure is still
- * indistinguishable from the drift, and for the 26 healthy files this script
- * asserts only that the file ran and passed, not how many tests it contains.
+ * The residual cost, and it is now the only one: inside those three HTTP files
+ * a new failure is not distinguished from the drift. Everything else -- which
+ * files run, how many tests each contains, and which tests fail in the other
+ * seven -- is asserted.
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, mkdtempSync, rmSync } from "node:fs";
@@ -65,30 +92,47 @@ if (vitestBin === undefined) {
 }
 const drift = JSON.parse(readFileSync(join(packageRoot, "test/known-drift.json"), "utf8"));
 const allowed = new Map(Object.entries(drift.files));
-const suiteFiles = new Set(drift.suiteFiles);
+// file -> number of tests it is expected to COLLECT, for every file in the suite.
+const suiteFiles = new Map(Object.entries(drift.suiteFiles));
+const fileGranular = new Set(drift.fileGranular);
 
-/** Sorted `a` minus `b`. */
+/** Sorted `a` minus `b`, for anything with `.has` and anything iterable. */
 const missingFrom = (a, b) => [...a].filter((item) => !b.has(item)).sort();
 
-// Shape check first: an entry that carries neither a failing-test-name set nor
-// a stated reason for staying file-granular would be a silent downgrade back to
-// the granularity FLOOR 2 exists to end, and it would look like a passing gate.
-for (const [file, entry] of allowed) {
-  const hasNames = Array.isArray(entry.failingTests);
-  const hasReason = typeof entry.granularityReason === "string" && entry.granularityReason.length > 0;
-  if (hasNames === hasReason) {
-    console.error(
-      `\nFAIL: test/known-drift.json entry ${file} must have EXACTLY one of` +
-        ` "failingTests" (the exact set of failing test names) or "granularityReason"` +
-        ` (why this file stays file-granular). It has ${hasNames && hasReason ? "both" : "neither"}.\n`,
+// FLOOR 0, and it runs before vitest so a malformed allowance fails in a second
+// rather than 90. The partition is the pinned fact: which files are exempt from
+// FLOOR 2 is stated once, in `fileGranular`, and every entry is checked against
+// it in both directions. "Exactly one of the two fields" is NOT enough -- a
+// free-text `granularityReason` satisfies that, so an entry could be downgraded
+// out of per-test gating by editing this JSON alone.
+{
+  const shape = [];
+  const orphanExemptions = missingFrom(fileGranular, allowed);
+  if (orphanExemptions.length > 0) {
+    shape.push(
+      `"fileGranular" names ${orphanExemptions.length} file(s) with no entry in "files":`,
+      ...orphanExemptions.map((file) => `  - ${file}`),
     );
-    process.exit(1);
   }
-  if (hasNames && typeof entry.tests !== "number") {
-    console.error(
-      `\nFAIL: test/known-drift.json entry ${file} records failing test names but no "tests"` +
-        ` count. Without it a file that stops COLLECTING its passing tests still matches.\n`,
-    );
+  for (const [file, entry] of allowed) {
+    const hasNames = Array.isArray(entry.failingTests);
+    const hasReason = typeof entry.granularityReason === "string" && entry.granularityReason.length > 0;
+    if (fileGranular.has(file)) {
+      if (!hasReason) shape.push(`  - ${file} is in "fileGranular" but has no "granularityReason"`);
+      if (hasNames) shape.push(`  - ${file} is in "fileGranular" but also records "failingTests"`);
+    } else {
+      if (!hasNames) {
+        shape.push(
+          `  - ${file} is NOT in "fileGranular" and must record "failingTests", the exact set of`,
+          `    failing test names. Moving a file to file granularity means adding it to`,
+          `    "fileGranular" -- deliberately, in a commit that says why -- not deleting a field.`,
+        );
+      }
+      if (hasReason) shape.push(`  - ${file} records "granularityReason" but is not in "fileGranular"`);
+    }
+  }
+  if (shape.length > 0) {
+    console.error(`\nFAIL: test/known-drift.json does not describe the recorded granularity partition:\n${shape.join("\n")}\n`);
     process.exit(1);
   }
 }
@@ -140,7 +184,7 @@ try {
   // renamed out of vitest.config.ts's include glob, deleted, or added is not a
   // pass and not a failure -- it is an absence, and an absence is what every
   // vacuous guard in this repository has looked like.
-  const vanished = missingFrom(suiteFiles, seen);
+  const vanished = missingFrom(suiteFiles.keys(), seen);
   const appeared = missingFrom(seen, suiteFiles);
   if (vanished.length > 0 || appeared.length > 0) {
     lines.push(
@@ -151,6 +195,25 @@ try {
       "A file that stops running stops guarding, silently, and this gate would",
       "otherwise report OK. Add or remove the name in \"suiteFiles\" in the same",
       "commit that adds or removes the file.",
+    );
+  }
+
+  // ...and how many tests each of them CONTAINS, for all 36 and not only the
+  // drifted ones. A file that runs and passes with a `describe` missing is the
+  // same absence as a file that does not run; the only difference is that it is
+  // harder to see. Applies to the three HTTP files too: a COLLECTED count is a
+  // property of the source, not of a server or a timeout.
+  const miscounted = [...suiteFiles]
+    .filter(([file, tests]) => seen.has(file) && detail.get(file)?.tests !== tests)
+    .map(([file, tests]) => `  - ${file}: collected ${detail.get(file)?.tests}, expected ${tests}`)
+    .sort();
+  if (miscounted.length > 0) {
+    lines.push(
+      `FAIL: ${miscounted.length} test file(s) do not contain the number of tests test/known-drift.json records:`,
+      ...miscounted,
+      "A test deleted, or a whole describe lost in a merge, leaves the file running",
+      "and passing and this gate green. Update the count in \"suiteFiles\" in the",
+      "same commit that adds or removes a test.",
     );
   }
   if (unexpected.length > 0) {
@@ -180,16 +243,9 @@ try {
     const expectedFailing = new Set(entry.failingTests);
     const newlyFailing = missingFrom(observed.failed, expectedFailing);
     const noLongerFailing = missingFrom(expectedFailing, observed.failed);
-    if (newlyFailing.length > 0 || noLongerFailing.length > 0 || observed.tests !== entry.tests) {
-      lines.push(`FAIL: ${file} does not match its recorded per-test drift:`);
-      if (observed.tests !== entry.tests) {
-        lines.push(
-          `  collected ${observed.tests} test(s); test/known-drift.json records ${entry.tests}.`,
-          `  A file whose tests stop being COLLECTED is the failure this whole gate exists`,
-          `  to catch -- test/sse.test.ts reported "(0 test)" for exactly this reason.`,
-        );
-      }
+    if (newlyFailing.length > 0 || noLongerFailing.length > 0) {
       lines.push(
+        `FAIL: ${file} does not match its recorded per-test drift:`,
         ...newlyFailing.map((name) => `  NEW failure, not part of the U0.1 drift: ${name}`),
         ...noLongerFailing.map((name) => `  recorded as failing but now passes: ${name}`),
       );
@@ -201,13 +257,15 @@ try {
     process.exit(1);
   }
 
-  const perTest = [...allowed.values()].filter((entry) => Array.isArray(entry.failingTests));
+  const totalTests = [...suiteFiles.values()].reduce((sum, tests) => sum + tests, 0);
   console.error(
-    `\nOK: all ${suiteFiles.size} expected test files ran.` +
+    `\nOK: all ${suiteFiles.size} expected test files ran, each with the ${totalTests} recorded` +
+      ` tests they collectively contain.` +
       `\n     ${seen.size - failing.size} of ${seen.size} pass and gate normally.` +
       `\n     ${allowed.size} are covered by test/known-drift.json (recorded ${drift.recordedOn},` +
-      ` retire in ${drift.retireIn}), of which ${perTest.length} are gated to an exact` +
-      ` failing-test-name set and ${allowed.size - perTest.length} stay file-granular.` +
+      ` retire in ${drift.retireIn}), of which ${allowed.size - fileGranular.size} are gated to an` +
+      ` exact failing-test-name set and ${fileGranular.size} stay file-granular by the pinned` +
+      ` "fileGranular" partition.` +
       `\n     Reason: ${drift.reason}\n`,
   );
 } finally {

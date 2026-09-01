@@ -152,7 +152,21 @@ function moduleSpecifiers(sourcePath: string): string[] {
       // an ambient declaration of, or an augmentation to, THAT package.
       // `declare global` and `namespace X` have Identifier names and are not
       // module specifiers, so the isStringLiteral guard is load-bearing.
-      push(node.name.text);
+      //
+      // Two forms are NOT package references and are skipped, both found by
+      // review after this branch shipped without them:
+      //
+      //  - `declare module "*.css"` and friends. The standard way to type an
+      //    asset import. `*.css` is a PATTERN, not a package, and reporting
+      //    `index.ts -> *.css` as a forbidden framework dependency is a false
+      //    positive with a baffling message.
+      //  - `declare module "./local.js"`. A relative name here declares a
+      //    module for a FILE, and is not an instruction to go read that file:
+      //    routing it into the graph walk made `resolveRelativeModule` THROW
+      //    `unresolved public module ./nope.js`, aborting the test instead of
+      //    returning a verdict.
+      const name = node.name.text;
+      if (!name.includes("*") && !name.startsWith(".") && !name.startsWith("/")) push(name);
     }
     ts.forEachChild(node, visit);
   };
@@ -191,10 +205,18 @@ function forbiddenImports(...roots: string[]): string[] {
   return walkModuleGraph(roots).violations;
 }
 
-/** Every `.ts` file under `src/` -- i.e. exactly what `tsc -p tsconfig.json` emits into `dist/`, which `files: ["dist"]` publishes in full. */
+// Every extension tsconfig.json compiles and emits. `.endsWith(".ts")` was too
+// narrow: `src/probe.mts` importing react passed BOTH surface tests. The packed
+// consumer did net it -- as `+ "dist/probe.d.mts"` in a file-list mismatch --
+// which is the wrong diagnosis, not a second line of defence. A maintainer
+// reads "the tarball has an unexpected file", not "a framework dependency
+// entered the public module graph".
+const emittedSourceExtension = /\.(?:m|c)?tsx?$/;
+
+/** Every source file under `src/` -- i.e. exactly what `tsc -p tsconfig.json` emits into `dist/`, which `files: ["dist"]` publishes in full. */
 function srcFiles(): string[] {
   return readdirSync(join(packageRoot, "src"), { recursive: true })
-    .filter((path): path is string => typeof path === "string" && path.endsWith(".ts"))
+    .filter((path): path is string => typeof path === "string" && emittedSourceExtension.test(path))
     .map((path) => join(packageRoot, "src", path))
     .sort();
 }
@@ -525,6 +547,40 @@ describe("@looprig/protocol public surface", () => {
     }
   });
 
+  it("does not mistake an asset pattern or a file-local `declare module` for a package", () => {
+    // The two over-approximations the `declare module` branch shipped with.
+    // `*.css` is a PATTERN -- the standard way to type an asset import -- and
+    // reporting `index.ts -> *.css` as a forbidden framework dependency is a
+    // false positive with a baffling message. `./sibling.js` names a FILE, and
+    // routing it into resolveRelativeModule made the walk THROW rather than
+    // return a verdict, which is worse than a wrong answer: it aborts the guard.
+    const fixture = mkdtempSync(join(tmpdir(), "looprig-protocol-declare-"));
+    try {
+      writeSource(
+        fixture,
+        "index.ts",
+        'declare module "*.css" {\n  const url: string;\n  export default url;\n}\n' +
+          'declare module "./sibling.js" {\n  export const x: number;\n}\n' +
+          "export const y = 1;\n",
+      );
+      expect(forbiddenImports(join(fixture, "index.ts"))).toStrictEqual([]);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("takes every extension tsc emits as its subject, not just .ts", () => {
+    // src/probe.mts importing react passed BOTH surface tests: outside
+    // srcFiles()'s filter, so the walk never read it, and outside the packed
+    // test's identical filter, so the tarball mismatch blamed the file list.
+    for (const path of ["a.ts", "b.tsx", "c.mts", "d.cts"]) {
+      expect(emittedSourceExtension.test(path), `${path} is emitted by tsconfig.json`).toBe(true);
+    }
+    for (const path of ["e.d.ts.map", "f.json", "g.js"]) {
+      expect(emittedSourceExtension.test(path), `${path} is not a tsc input`).toBe(false);
+    }
+  });
+
   it("installs the packed artifact into a standalone consumer that typechecks and runs", () => {
     const fixture = mkdtempSync(join(tmpdir(), "looprig-protocol-consumer-"));
     const packDir = join(fixture, "pack");
@@ -564,12 +620,23 @@ describe("@looprig/protocol public surface", () => {
       ) as Array<{ filename: string; files: Array<{ path: string }> }>;
       const artifact = packed[0];
       if (artifact === undefined) throw new Error("npm pack returned no artifact");
-      const expectedFiles = readdirSync(join(packageRoot, "src"), { recursive: true })
-        .filter((path): path is string => typeof path === "string" && path.endsWith(".ts"))
-        .flatMap((path) => {
-          const stem = path.slice(0, -3);
-          return [".d.ts", ".d.ts.map", ".js", ".js.map"].map((suffix) => `dist/${stem}${suffix}`);
-        });
+      // Derived from srcFiles(), the SAME list the framework-dependency walk
+      // takes as its subject, so the two cannot disagree about what tsc emits.
+      // They used to keep separate `.endsWith(".ts")` filters, and a src/*.mts
+      // was outside both -- passing the walk, and failing HERE with a bewildered
+      // "+ dist/probe.d.mts" instead of "framework dependency".
+      const expectedFiles = srcFiles().flatMap((absolute) => {
+        const path = relative(join(packageRoot, "src"), absolute);
+        const stem = path.replace(emittedSourceExtension, "");
+        const [declaration, javascript] = path.endsWith(".mts")
+          ? [".d.mts", ".mjs"]
+          : path.endsWith(".cts")
+            ? [".d.cts", ".cjs"]
+            : [".d.ts", ".js"];
+        return [declaration, `${declaration}.map`, javascript, `${javascript}.map`].map(
+          (suffix) => `dist/${stem}${suffix}`,
+        );
+      });
       expect(artifact.files.map(({ path }) => path).sort()).toStrictEqual(
         [...expectedFiles, "package.json"].sort(),
       );
