@@ -268,6 +268,7 @@ class CentrifugeClientLink implements ClientLink {
     let resolveReady!: () => void;
     let rejectReady!: (reason: unknown) => void;
     let readySettled = false;
+    let authorized = false;
     const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
     const settleReady = (error?: Error): void => {
       if (readySettled) return;
@@ -275,7 +276,11 @@ class CentrifugeClientLink implements ClientLink {
       if (error === undefined) resolveReady();
       else rejectReady(error);
     };
-    transportSubscription.on("subscribed", () => settleReady());
+    transportSubscription.on("subscribed", () => {
+      if (readySettled) return;
+      authorized = true;
+      settleReady();
+    });
     transportSubscription.on("publication", (context: unknown) => {
       try {
         const data = typeof context === "object" && context !== null && "data" in context ? context.data : undefined;
@@ -309,7 +314,7 @@ class CentrifugeClientLink implements ClientLink {
     return {
       get state(): ClientSubscriptionState { return subscriptionState(transportSubscription.state); },
       ready,
-      get version(): number | undefined { return thisLink.negotiated?.version; },
+      get version(): number | undefined { return authorized ? thisLink.negotiated?.version : undefined; },
       unsubscribe: () => transportSubscription.unsubscribe(),
     };
   }

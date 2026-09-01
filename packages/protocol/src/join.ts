@@ -314,7 +314,7 @@ export async function* joinFactorySessionView(
     try {
       const ready = await raceGeneration(subscription.ready, queue, options.signal);
       if (typeof ready === "string") { repair = ready === "repair"; continue; }
-      if (subscription.version !== undefined && subscription.version !== 1) { repair = true; continue; }
+      if (subscription.version !== 1) { repair = true; continue; }
       if (queue.requiresRepair) { repair = true; continue; }
 
       const controller = new AbortController();

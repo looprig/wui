@@ -281,14 +281,14 @@ class FakeFactoryLink implements FactoryJoinLink {
   readonly ready = new Deferred<void>();
   unsubscribed = 0;
 
-  constructor(readonly version = 1) {}
+  constructor(readonly version = 1, readonly includeVersion = true) {}
 
   subscribe(options: SubscribeOptions): ClientSubscription {
     this.options = options;
     return {
       state: "subscribing",
       ready: this.ready.promise,
-      version: this.version,
+      ...(this.includeVersion ? { version: this.version } : {}),
       unsubscribe: () => { this.unsubscribed += 1; },
     };
   }
@@ -634,6 +634,36 @@ describe("joinFactorySessionView", () => {
     first.ready.resolve();
     await vi.waitFor(() => expect(first.unsubscribed).toBe(1));
     expect(reads.statusCalls).toBe(0);
+    expect(reads.journalOptions).toHaveLength(0);
+    expect(index).toBe(2);
+    second.ready.resolve();
+    await vi.waitFor(() => expect(reads.statusCalls).toBe(1));
+    reads.status.resolve(factoryStatus(7));
+    reads.journal.resolve({ journal_tip: 7, covered_through: 7, events: [] });
+    expect(await factoryResult(projection)).toMatchObject({
+      kind: "projection",
+      generation: 2,
+      coveredThrough: 7,
+    });
+    await gen.return();
+  });
+
+  it("repairs an omitted negotiated wire version from the unchanged committed cursor", async () => {
+    const reads = new FakeFactoryReads();
+    const first = new FakeFactoryLink(1, false);
+    const second = new FakeFactoryLink(1);
+    let index = 0;
+    const link: FactoryJoinLink = { subscribe: (options) => [first, second][index++]!.subscribe(options) };
+    const controller = new AbortController();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 7,
+      signal: controller.signal,
+    });
+    const projection = gen.next();
+    first.ready.resolve();
+    await vi.waitFor(() => expect(first.unsubscribed).toBe(1));
+    expect(reads.statusCalls).toBe(0);
+    expect(reads.journalOptions).toHaveLength(0);
     expect(index).toBe(2);
     second.ready.resolve();
     await vi.waitFor(() => expect(reads.statusCalls).toBe(1));

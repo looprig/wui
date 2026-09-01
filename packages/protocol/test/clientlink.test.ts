@@ -130,6 +130,7 @@ describe("ClientLink", () => {
       onPublication: () => undefined,
       onReset: () => undefined,
     });
+    expect(binding.version).toBeUndefined();
     transport.subscriptions[0]!.sub.emit("subscribed", {});
     await binding.ready;
     expect(binding.version).toBe(1);
