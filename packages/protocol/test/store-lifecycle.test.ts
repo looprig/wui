@@ -16,7 +16,10 @@
  * transition is an event.
  */
 import { describe, expect, it, vi } from "vitest";
-import { SessionViewStore } from "../src/store.js";
+import { FactorySessionViewStore, SessionViewStore } from "../src/store.js";
+import type { FactoryJoinLink, FactoryJoinReads } from "../src/join.js";
+import type { ClientSubscription, SubscribeOptions } from "../src/clientlink.js";
+import type { FactoryPublication, SessionReset } from "../src/types.js";
 import { controllableLive, emptyPage, manualScheduler, tick } from "./store-fakes.js";
 
 function makeStore(options: { autoReconnect?: boolean; failHistory?: boolean } = {}) {
@@ -125,5 +128,75 @@ describe("SessionViewStore: liveness", () => {
     store.stop();
 
     expect(onChange).not.toHaveBeenCalled();
+  });
+});
+
+class StoreFactoryLink implements FactoryJoinLink {
+  subscriptions: SubscribeOptions[] = [];
+  unsubscribeCalls = 0;
+  subscribe(options: SubscribeOptions): ClientSubscription {
+    this.subscriptions.push(options);
+    return {
+      state: "subscribed",
+      ready: Promise.resolve(),
+      unsubscribe: () => { this.unsubscribeCalls += 1; },
+    };
+  }
+  publish(index: number, publication: FactoryPublication): void {
+    this.subscriptions[index]?.onPublication(publication);
+  }
+  reset(index: number, reset: SessionReset): void { this.subscriptions[index]?.onReset(reset); }
+}
+
+describe("FactorySessionViewStore", () => {
+  it("publishes and persists authenticated private coverage independently of public events", async () => {
+    const link = new StoreFactoryLink();
+    const persisted: number[] = [];
+    const reads: FactoryJoinReads = {
+      readStatus: async () => ({
+        session_id: "session-1", agent_id: "agent-1", state: "running", residency: "resident",
+        journal_tip: 5, updated_at: "2026-09-01T12:00:00Z",
+      }),
+      readJournal: async () => ({ events: [], journal_tip: 5, covered_through: 5 }),
+    };
+    const store = new FactorySessionViewStore({
+      reads, link, tenantId: "tenant-1", sessionId: "session-1", initialCoveredThrough: 3,
+      persistCoveredThrough: (covered) => persisted.push(covered),
+    });
+    const notify = vi.fn();
+    store.subscribe(notify);
+    store.start();
+    await vi.waitFor(() => expect(store.snapshot().coveredThrough).toBe(5));
+    expect(store.snapshot().event).toBeUndefined();
+    expect(persisted).toStrictEqual([5]);
+    expect(notify).toHaveBeenCalled();
+    store.stop();
+    await vi.waitFor(() => expect(link.unsubscribeCalls).toBe(1));
+  });
+
+  it("resumes a later generation from the greatest durable cursor and ignores old callbacks", async () => {
+    const link = new StoreFactoryLink();
+    let read = 0;
+    const reads: FactoryJoinReads = {
+      readStatus: async () => ({
+        session_id: "session-1", agent_id: "agent-1", state: "running", residency: "resident",
+        journal_tip: ++read === 1 ? 4 : 5, updated_at: "2026-09-01T12:00:00Z",
+      }),
+      readJournal: async () => ({ events: [], journal_tip: read === 1 ? 4 : 5, covered_through: read === 1 ? 4 : 5 }),
+    };
+    const store = new FactorySessionViewStore({ reads, link, tenantId: "tenant-1", sessionId: "session-1" });
+    store.start();
+    await vi.waitFor(() => expect(store.snapshot().coveredThrough).toBe(4));
+    store.stop();
+    store.start();
+    await vi.waitFor(() => expect(store.snapshot().coveredThrough).toBe(5));
+    link.publish(0, {
+      type: "enduring_publication", tenant_id: "tenant-1", session_id: "session-1",
+      event_id: "stale", journal_seq: 99, covered_through: 99, body: { type: "session.message" },
+    });
+    await Promise.resolve();
+    expect(store.snapshot().coveredThrough).toBe(5);
+    expect(store.snapshot().generation).toBe(2);
+    store.stop();
   });
 });

@@ -29,11 +29,22 @@
  *    "inside the join window" (arrived after subscribe, before the cold
  *    read resolved) without any timers or races.
  */
-import { describe, expect, it } from "vitest";
-import { joinSessionView, type JoinEvent, type JournalReader, type LiveFrameSource } from "../src/join.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  joinFactorySessionView,
+  joinSessionView,
+  type FactoryJoinEvent,
+  type FactoryJoinLink,
+  type FactoryJoinReads,
+  type JoinEvent,
+  type JournalReader,
+  type LiveFrameSource,
+} from "../src/join.js";
+import type { ClientSubscription, SubscribeOptions } from "../src/clientlink.js";
 import type { ReadHistoryOptions } from "../src/transport.js";
 import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "../src/sse.js";
 import type { EventEnvelope, EventJournalPage, StatusEvent } from "../src/types.js";
+import type { FactoryPublication, FactorySessionStatus, PublicJournalPage, SessionReset } from "../src/types.js";
 
 // --- Fixture builders ---------------------------------------------------------
 
@@ -250,6 +261,286 @@ describe("joinSessionView: the join window", () => {
       expect(collected[4]!.view.statusEvents.map((m) => m.journalSeq)).toEqual([0, 1, 2, 3, 4]);
     }
 
+    await gen.return();
+  });
+});
+
+// --- Factory subscribe-first join --------------------------------------------
+
+class Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve!: (value: T) => void;
+  reject!: (reason: unknown) => void;
+  constructor() {
+    this.promise = new Promise<T>((resolve, reject) => { this.resolve = resolve; this.reject = reject; });
+  }
+}
+
+class FakeFactoryLink implements FactoryJoinLink {
+  options: SubscribeOptions | undefined;
+  readonly ready = new Deferred<void>();
+  unsubscribed = 0;
+
+  subscribe(options: SubscribeOptions): ClientSubscription {
+    this.options = options;
+    return {
+      state: "subscribing",
+      ready: this.ready.promise,
+      unsubscribe: () => { this.unsubscribed += 1; },
+    };
+  }
+
+  publish(publication: FactoryPublication): void { this.options?.onPublication(publication); }
+  reset(reset: SessionReset): void { this.options?.onReset(reset); }
+  fail(error: Error): void { this.options?.onError?.(error); }
+}
+
+class FakeFactoryReads implements FactoryJoinReads {
+  readonly status = new Deferred<FactorySessionStatus>();
+  readonly journal = new Deferred<PublicJournalPage>();
+  statusCalls = 0;
+  journalOptions: Array<{ tail?: number; limit?: number; signal?: AbortSignal }> = [];
+  readStatus(_sessionId: string, _options?: { signal?: AbortSignal }): Promise<FactorySessionStatus> {
+    this.statusCalls += 1;
+    return this.status.promise;
+  }
+  readJournal(
+    _sessionId: string,
+    options: { tail?: number; limit?: number; signal?: AbortSignal } = {},
+  ): Promise<PublicJournalPage> {
+    this.journalOptions.push(options);
+    return this.journal.promise;
+  }
+}
+
+const factoryStatus = (tip: number): FactorySessionStatus => ({
+  session_id: "session-1",
+  agent_id: "agent-1",
+  state: "running",
+  residency: "resident",
+  journal_tip: tip,
+  updated_at: "2026-09-01T12:00:00Z",
+});
+
+const publicEvent = (seq: number, id = `event-${seq}`) => ({
+  event_id: id,
+  journal_seq: seq,
+  body: { type: "session.message", text: `message-${seq}` },
+});
+
+const publication = (seq: number, id = `event-${seq}`): FactoryPublication => ({
+  type: "enduring_publication",
+  tenant_id: "tenant-1",
+  session_id: "session-1",
+  event_id: id,
+  journal_seq: seq,
+  covered_through: seq,
+  body: { type: "session.message", text: `message-${seq}` },
+});
+
+async function factoryNext(gen: AsyncGenerator<FactoryJoinEvent>): Promise<FactoryJoinEvent> {
+  const next = await gen.next();
+  if (next.done) throw new Error("factory join ended unexpectedly");
+  return next.value;
+}
+
+async function factoryResult(result: Promise<IteratorResult<FactoryJoinEvent>>): Promise<FactoryJoinEvent> {
+  const resolved = await result;
+  if (resolved.done) throw new Error("factory join ended unexpectedly");
+  return resolved.value;
+}
+
+describe("joinFactorySessionView", () => {
+  it("authorizes before REST and emits projection plus the bounded immutable tail exactly once", async () => {
+    const reads = new FakeFactoryReads();
+    const link = new FakeFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { tailLimit: 3 });
+    const first = gen.next();
+    expect(link.options).toBeDefined();
+    expect(reads.statusCalls).toBe(0);
+    expect(reads.journalOptions).toStrictEqual([]);
+
+    link.publish(publication(5));
+    link.ready.resolve();
+    await vi.waitFor(() => expect(reads.statusCalls).toBe(1));
+    expect(reads.journalOptions).toMatchObject([{ tail: 3, limit: 3 }]);
+    expect("cursor" in reads.journalOptions[0]!).toBe(false);
+
+    reads.status.resolve(factoryStatus(5));
+    reads.journal.resolve({
+      journal_tip: 5,
+      covered_through: 5,
+      events: [publicEvent(2), publicEvent(5)],
+    });
+    const events = [await factoryResult(first), await factoryNext(gen), await factoryNext(gen)];
+    expect(events.map((event) => event.kind)).toStrictEqual(["projection", "public", "public"]);
+    expect(events.map((event) => event.coveredThrough)).toStrictEqual([0, 2, 5]);
+    expect(events.filter((event): event is Extract<FactoryJoinEvent, { kind: "public" }> => event.kind === "public")
+      .map((event) => event.event.event_id))
+      .toStrictEqual(["event-2", "event-5"]);
+    await gen.return();
+    expect(link.unsubscribed).toBe(1);
+  });
+
+  it("orders buffered publications above T and uses validated watermarks to cover private gaps", async () => {
+    const reads = new FakeFactoryReads();
+    const link = new FakeFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 3,
+    });
+    const first = gen.next();
+    link.ready.resolve();
+    await Promise.resolve();
+    link.publish(publication(7));
+    link.publish(publication(6));
+    reads.status.resolve(factoryStatus(5));
+    reads.journal.resolve({ journal_tip: 5, covered_through: 5, events: [publicEvent(5)] });
+    const events = [await factoryResult(first), await factoryNext(gen), await factoryNext(gen), await factoryNext(gen)];
+    expect(events.filter((event): event is Extract<FactoryJoinEvent, { kind: "public" }> => event.kind === "public")
+      .map((event) => event.event.journal_seq))
+      .toStrictEqual([5, 6, 7]);
+    expect(events.slice(1).map((event) => event.coveredThrough)).toStrictEqual([5, 6, 7]);
+    await gen.return();
+  });
+
+  it("deduplicates a post-tail resend by sequence and EventID before applying the next live publication", async () => {
+    const reads = new FakeFactoryReads();
+    const link = new FakeFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1");
+    const projection = gen.next();
+    link.ready.resolve();
+    await vi.waitFor(() => expect(reads.statusCalls).toBe(1));
+    reads.status.resolve(factoryStatus(5));
+    reads.journal.resolve({ journal_tip: 5, covered_through: 5, events: [publicEvent(5)] });
+    await factoryResult(projection);
+    await factoryNext(gen);
+    const next = gen.next();
+    link.publish(publication(5));
+    link.publish(publication(6));
+    const live = await factoryResult(next);
+    expect(live).toMatchObject({ kind: "public", coveredThrough: 6, event: { event_id: "event-6" } });
+    await gen.return();
+  });
+
+  it("repairs a forged live watermark without committing it", async () => {
+    const reads = new FakeFactoryReads();
+    const firstLink = new FakeFactoryLink();
+    const secondLink = new FakeFactoryLink();
+    const controller = new AbortController();
+    let index = 0;
+    const link: FactoryJoinLink = { subscribe: (options) => [firstLink, secondLink][index++]!.subscribe(options) };
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      signal: controller.signal,
+    });
+    const projection = gen.next();
+    firstLink.ready.resolve();
+    await vi.waitFor(() => expect(reads.statusCalls).toBe(1));
+    reads.status.resolve(factoryStatus(5));
+    reads.journal.resolve({ journal_tip: 5, covered_through: 5, events: [publicEvent(5)] });
+    await factoryResult(projection);
+    await factoryNext(gen);
+    void gen.next();
+    firstLink.publish({ ...publication(6), covered_through: 99 } as never);
+    await vi.waitFor(() => expect(firstLink.unsubscribed).toBe(1));
+    expect(index).toBe(2);
+    controller.abort();
+    await gen.return();
+  });
+
+  it("repairs a conflicting EventID for an already seen sequence", async () => {
+    const reads = new FakeFactoryReads();
+    const firstLink = new FakeFactoryLink();
+    const secondLink = new FakeFactoryLink();
+    const controller = new AbortController();
+    let index = 0;
+    const link: FactoryJoinLink = { subscribe: (options) => [firstLink, secondLink][index++]!.subscribe(options) };
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { signal: controller.signal });
+    const projection = gen.next();
+    firstLink.ready.resolve();
+    await vi.waitFor(() => expect(reads.statusCalls).toBe(1));
+    reads.status.resolve(factoryStatus(5));
+    reads.journal.resolve({ journal_tip: 5, covered_through: 5, events: [publicEvent(5)] });
+    await factoryResult(projection);
+    await factoryNext(gen);
+    void gen.next();
+    firstLink.publish(publication(5, "conflicting-event"));
+    await vi.waitFor(() => expect(firstLink.unsubscribed).toBe(1));
+    expect(index).toBe(2);
+    controller.abort();
+    await gen.return();
+  });
+
+  it("repairs from the last committed cursor on reset and makes old callbacks inert", async () => {
+    const reads1 = new FakeFactoryReads();
+    const reads2 = new FakeFactoryReads();
+    const links = [new FakeFactoryLink(), new FakeFactoryLink()];
+    let generation = 0;
+    const reads: FactoryJoinReads = {
+      readStatus: (...args) => (generation === 0 ? reads1 : reads2).readStatus(...args),
+      readJournal: (...args) => (generation++ === 0 ? reads1 : reads2).readJournal(...args),
+    };
+    let linkIndex = 0;
+    const link: FactoryJoinLink = { subscribe: (options) => links[linkIndex++]!.subscribe(options) };
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { initialCoveredThrough: 3 });
+    const first = gen.next();
+    links[0]!.ready.resolve();
+    await Promise.resolve();
+    reads1.status.resolve(factoryStatus(5));
+    reads1.journal.resolve({ journal_tip: 5, covered_through: 5, events: [publicEvent(5)] });
+    await first;
+    await factoryNext(gen);
+    const repairing = gen.next();
+    links[0]!.reset({
+      type: "session.reset", tenant_id: "tenant-1", session_id: "session-1", last_contiguous: 5, journal_tip: 8,
+    });
+    await vi.waitFor(() => expect(links[0]!.unsubscribed).toBe(1));
+    links[1]!.ready.resolve();
+    await Promise.resolve();
+    links[0]!.publish(publication(99));
+    reads2.status.resolve(factoryStatus(6));
+    reads2.journal.resolve({ journal_tip: 6, covered_through: 6, events: [publicEvent(6)] });
+    const projection = await repairing;
+    expect(projection.value).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 5 });
+    const publicUpdate = await factoryNext(gen);
+    expect(publicUpdate).toMatchObject({ kind: "public", generation: 2, coveredThrough: 6 });
+    await gen.return();
+  });
+
+  it("repairs instead of committing an overflowing prejoin buffer", async () => {
+    const reads = new FakeFactoryReads();
+    const firstLink = new FakeFactoryLink();
+    const secondLink = new FakeFactoryLink();
+    const controller = new AbortController();
+    let index = 0;
+    const link: FactoryJoinLink = { subscribe: (options) => [firstLink, secondLink][index++]!.subscribe(options) };
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 3,
+      maxPrejoinPublications: 1,
+      signal: controller.signal,
+    });
+    void gen.next();
+    firstLink.publish(publication(4));
+    firstLink.publish(publication(5));
+    firstLink.ready.resolve();
+    await vi.waitFor(() => expect(firstLink.unsubscribed).toBe(1));
+    expect(index).toBe(2);
+    controller.abort();
+    await gen.return();
+  });
+
+  it("accepts exactly the configured prejoin bound", async () => {
+    const reads = new FakeFactoryReads();
+    const link = new FakeFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { maxPrejoinPublications: 1 });
+    const projection = gen.next();
+    link.publish(publication(6));
+    link.ready.resolve();
+    await vi.waitFor(() => expect(reads.statusCalls).toBe(1));
+    reads.status.resolve(factoryStatus(5));
+    reads.journal.resolve({ journal_tip: 5, covered_through: 5, events: [publicEvent(5)] });
+    await factoryResult(projection);
+    await factoryNext(gen);
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", coveredThrough: 6 });
     await gen.return();
   });
 });

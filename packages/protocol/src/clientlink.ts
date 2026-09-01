@@ -31,6 +31,8 @@ export interface ClientLinkCredentials {
 
 export interface ClientSubscription {
   readonly state: ClientSubscriptionState;
+  /** Resolves only after the server has authorized and opened the subscription. */
+  readonly ready: Promise<void>;
   unsubscribe(): void;
 }
 
@@ -261,6 +263,17 @@ class CentrifugeClientLink implements ClientLink {
       subscriptionOptions.getData = () => this.credentials.subscriptionData!({ channel });
     }
     const transportSubscription = this.transport.newSubscription(channel, subscriptionOptions);
+    let resolveReady!: () => void;
+    let rejectReady!: (reason: unknown) => void;
+    let readySettled = false;
+    const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+    const settleReady = (error?: Error): void => {
+      if (readySettled) return;
+      readySettled = true;
+      if (error === undefined) resolveReady();
+      else rejectReady(error);
+    };
+    transportSubscription.on("subscribed", () => settleReady());
     transportSubscription.on("publication", (context: unknown) => {
       try {
         const data = typeof context === "object" && context !== null && "data" in context ? context.data : undefined;
@@ -273,7 +286,9 @@ class CentrifugeClientLink implements ClientLink {
     });
     transportSubscription.on("error", (context: unknown) => {
       const error = typeof context === "object" && context !== null && "error" in context ? context.error : context;
-      options.onError?.(transportError(error));
+      const mapped = transportError(error);
+      settleReady(mapped);
+      options.onError?.(mapped);
     });
     transportSubscription.on("unsubscribed", (context: unknown) => {
       const code = typeof context === "object" && context !== null && "code" in context && typeof context.code === "number"
@@ -283,11 +298,14 @@ class CentrifugeClientLink implements ClientLink {
       const reason = typeof context === "object" && context !== null && "reason" in context && typeof context.reason === "string"
         ? context.reason
         : "subscription removed";
-      options.onError?.(new RealtimeTransportError(reason, code, { cause: context }));
+      const error = new RealtimeTransportError(reason, code, { cause: context });
+      settleReady(error);
+      options.onError?.(error);
     });
     transportSubscription.subscribe();
     return {
       get state(): ClientSubscriptionState { return subscriptionState(transportSubscription.state); },
+      ready,
       unsubscribe: () => transportSubscription.unsubscribe(),
     };
   }

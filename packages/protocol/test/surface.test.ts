@@ -278,6 +278,8 @@ describe("@looprig/protocol public surface", () => {
 
   it("exports the store and its scheduler seam", () => {
     expect(protocol).toHaveProperty("SessionViewStore");
+    expect(protocol).toHaveProperty("FactorySessionViewStore");
+    expect(protocol).toHaveProperty("joinFactorySessionView");
     expect(protocol).toHaveProperty("browserFrameScheduler");
   });
 

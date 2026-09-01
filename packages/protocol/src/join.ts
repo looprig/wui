@@ -154,7 +154,24 @@ import type { SessionView, FoldInput, FoldResult, FoldError } from "./fold.js";
 import { emptySessionView, fold } from "./fold.js";
 import type { SseFrame } from "./sse.js";
 import type { EventJournalPage } from "./types.js";
+import type {
+  EnduringPublication,
+  EphemeralPublication,
+  FactoryPublication,
+  FactorySessionStatus,
+  PublicJournalPage,
+} from "./types.js";
+import type { ClientSubscription, SubscribeOptions } from "./clientlink.js";
 import type { ReadHistoryOptions } from "./transport.js";
+import type { FactoryJournalOptions } from "./factory-rest.js";
+import {
+  validateEnduringPublication,
+  validateEphemeralPublication,
+  validateFactorySessionStatus,
+  validateJournalTip,
+  validatePublicJournalPage,
+  validateSessionReset,
+} from "./validate.js";
 
 // --- Public surface -----------------------------------------------------------
 
@@ -167,6 +184,325 @@ import type { ReadHistoryOptions } from "./transport.js";
  */
 export interface JournalReader {
   readHistory(sessionId: string, options?: ReadHistoryOptions): Promise<EventJournalPage>;
+}
+
+// --- Factory sessionwire/v1 join --------------------------------------------
+
+export interface FactoryJoinReads {
+  readStatus(sessionId: string, options?: { signal?: AbortSignal }): Promise<FactorySessionStatus>;
+  readJournal(sessionId: string, options?: FactoryJournalOptions): Promise<PublicJournalPage>;
+}
+
+export interface FactoryJoinLink {
+  subscribe(options: SubscribeOptions): ClientSubscription;
+}
+
+export interface FactoryJoinOptions {
+  /** Greatest authenticated sequence durably persisted by the application. */
+  initialCoveredThrough?: number;
+  /** Bound used for the one current-view tail request. Default 256. */
+  tailLimit?: number;
+  /** Maximum publications retained while the tail is in flight. Default 256. */
+  maxPrejoinPublications?: number;
+  signal?: AbortSignal;
+}
+
+export type FactoryJoinEvent =
+  | {
+    kind: "projection";
+    generation: number;
+    status: FactorySessionStatus;
+    coveredThrough: number;
+  }
+  | {
+    kind: "public";
+    generation: number;
+    status: FactorySessionStatus;
+    event: PublicJournalPage["events"][number];
+    coveredThrough: number;
+  }
+  | {
+    kind: "ephemeral";
+    generation: number;
+    status: FactorySessionStatus;
+    publication: EphemeralPublication;
+    coveredThrough: number;
+  }
+  | {
+    kind: "coverage";
+    generation: number;
+    status: FactorySessionStatus;
+    coveredThrough: number;
+  };
+
+type FactorySignal =
+  | { kind: "publication"; publication: FactoryPublication }
+  | { kind: "repair"; error?: Error };
+
+const DEFAULT_FACTORY_TAIL_LIMIT = 256;
+
+/**
+ * Subscribe-first Factory join. Each repair replaces the complete generation;
+ * callbacks close over its token and are inert as soon as it is superseded.
+ */
+export async function* joinFactorySessionView(
+  reads: FactoryJoinReads,
+  link: FactoryJoinLink,
+  tenantId: string,
+  sessionId: string,
+  options: FactoryJoinOptions = {},
+): AsyncGenerator<FactoryJoinEvent, void, void> {
+  const tailLimit = positiveBound(options.tailLimit ?? DEFAULT_FACTORY_TAIL_LIMIT, "tailLimit");
+  const maxBuffered = positiveBound(options.maxPrejoinPublications ?? DEFAULT_FACTORY_TAIL_LIMIT, "maxPrejoinPublications");
+  let coveredThrough = safeSequence(options.initialCoveredThrough ?? 0, "initialCoveredThrough");
+  let generation = 0;
+  let activeToken = 0;
+
+  while (!options.signal?.aborted) {
+    const token = ++activeToken;
+    const currentGeneration = ++generation;
+    const generationBase = coveredThrough;
+    const queue = new FactorySignalQueue(maxBuffered);
+    const push = (signal: FactorySignal): void => {
+      if (token === activeToken) queue.push(signal);
+    };
+    const subscription = link.subscribe({
+      tenantId,
+      sessionId,
+      onPublication: (value) => push({ kind: "publication", publication: value }),
+      onReset: (value) => {
+        try { validateSessionReset(value); } catch { /* still repair */ }
+        push({ kind: "repair" });
+      },
+      onError: (error) => push({ kind: "repair", error }),
+    });
+
+    let repair = false;
+    try {
+      const ready = await raceGeneration(subscription.ready, queue, options.signal);
+      if (typeof ready === "string") { repair = ready === "repair"; continue; }
+      if (queue.requiresRepair) { repair = true; continue; }
+
+      const controller = new AbortController();
+      const abort = (): void => controller.abort(options.signal?.reason);
+      options.signal?.addEventListener("abort", abort, { once: true });
+      let status: FactorySessionStatus;
+      let page: PublicJournalPage;
+      try {
+        const cold = Promise.all([
+          reads.readStatus(sessionId, { signal: controller.signal }),
+          reads.readJournal(sessionId, { tail: tailLimit, limit: tailLimit, signal: controller.signal }),
+        ]);
+        const result = await raceGeneration(cold, queue, options.signal);
+        if (typeof result === "string") {
+          controller.abort();
+          repair = result === "repair";
+          continue;
+        }
+        [status, page] = result.value;
+      } finally {
+        options.signal?.removeEventListener("abort", abort);
+      }
+
+      status = validateFactorySessionStatus(status);
+      page = validatePublicJournalPage(page);
+      if (status.session_id !== sessionId || status.journal_tip !== page.journal_tip || page.covered_through < coveredThrough) {
+        repair = true;
+        continue;
+      }
+      if (queue.requiresRepair) { repair = true; continue; }
+      const tip = page.journal_tip;
+      yield { kind: "projection", generation: currentGeneration, status, coveredThrough };
+
+      const prejoin = queue.drainPublications();
+      if (queue.requiresRepair) { repair = true; continue; }
+      const enduring = prejoin.filter((item): item is EnduringPublication => item.type === "enduring_publication");
+      const candidates = mergeFactoryEvents(page.events, enduring, coveredThrough, tip);
+      if (candidates === undefined) { repair = true; continue; }
+      const seen = new Map<number, string>();
+      for (const event of candidates) {
+        seen.set(event.journal_seq, event.event_id);
+        if (event.journal_seq <= coveredThrough) continue;
+        coveredThrough = event.journal_seq;
+        yield { kind: "public", generation: currentGeneration, status, event, coveredThrough };
+      }
+      if (page.covered_through > coveredThrough) {
+        coveredThrough = page.covered_through;
+        yield { kind: "coverage", generation: currentGeneration, status, coveredThrough };
+      }
+
+      const aboveTip = enduring.filter((item) => item.journal_seq > tip).sort((a, b) => a.journal_seq - b.journal_seq);
+      for (const item of aboveTip) {
+        const parsed = validateEnduringPublication(item);
+        if (parsed.tenant_id !== tenantId || parsed.session_id !== sessionId || parsed.covered_through < parsed.journal_seq) {
+          repair = true;
+          break;
+        }
+        const prior = seen.get(parsed.journal_seq);
+        if (prior !== undefined) {
+          if (prior !== parsed.event_id) { repair = true; break; }
+          continue;
+        }
+        if (parsed.journal_seq <= generationBase) continue;
+        if (parsed.journal_seq <= coveredThrough) { repair = true; break; }
+        seen.set(parsed.journal_seq, parsed.event_id);
+        coveredThrough = parsed.covered_through;
+        yield { kind: "public", generation: currentGeneration, status, event: factoryEvent(parsed), coveredThrough };
+      }
+      if (repair) continue;
+
+      for (;;) {
+        const next = await queue.next(options.signal);
+        if (next === undefined) return;
+        if (next.kind === "repair") { repair = true; break; }
+        const value = next.publication;
+        if (value.type === "journal_tip") {
+          const tipHint = validateJournalTip(value);
+          if (tipHint.tenant_id !== tenantId || tipHint.session_id !== sessionId) { repair = true; break; }
+          continue;
+        }
+        if (value.type === "ephemeral_publication") {
+          const parsed = validateEphemeralPublication(value);
+          if (parsed.tenant_id !== tenantId || parsed.session_id !== sessionId) { repair = true; break; }
+          yield { kind: "ephemeral", generation: currentGeneration, status, publication: parsed, coveredThrough };
+          continue;
+        }
+        const parsed = validateEnduringPublication(value);
+        if (parsed.tenant_id !== tenantId || parsed.session_id !== sessionId) { repair = true; break; }
+        const prior = seen.get(parsed.journal_seq);
+        if (prior !== undefined) {
+          if (prior !== parsed.event_id) { repair = true; break; }
+          continue;
+        }
+        if (parsed.journal_seq <= generationBase) continue;
+        if (parsed.journal_seq <= coveredThrough) { repair = true; break; }
+        seen.set(parsed.journal_seq, parsed.event_id);
+        coveredThrough = parsed.covered_through;
+        yield { kind: "public", generation: currentGeneration, status, event: factoryEvent(parsed), coveredThrough };
+      }
+    } catch (error) {
+      if (options.signal?.aborted) return;
+      repair = true;
+    } finally {
+      activeToken += 1;
+      subscription.unsubscribe();
+    }
+    if (!repair) return;
+  }
+}
+
+function positiveBound(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) throw new RangeError(`${name} must be a positive safe integer`);
+  return value;
+}
+
+function safeSequence(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) throw new RangeError(`${name} must be a non-negative safe integer`);
+  return value;
+}
+
+function factoryEvent(publication: EnduringPublication): PublicJournalPage["events"][number] {
+  return { event_id: publication.event_id, journal_seq: publication.journal_seq, body: publication.body };
+}
+
+function mergeFactoryEvents(
+  pageEvents: PublicJournalPage["events"],
+  publications: EnduringPublication[],
+  coveredThrough: number,
+  tip: number,
+): PublicJournalPage["events"] | undefined {
+  const bySequence = new Map<number, PublicJournalPage["events"][number]>();
+  for (const event of pageEvents) bySequence.set(event.journal_seq, event);
+  for (const publication of publications) {
+    if (publication.journal_seq > tip || publication.journal_seq <= coveredThrough) continue;
+    const event = factoryEvent(validateEnduringPublication(publication));
+    const prior = bySequence.get(event.journal_seq);
+    if (prior !== undefined && prior.event_id !== event.event_id) return undefined;
+    bySequence.set(event.journal_seq, prior ?? event);
+  }
+  return [...bySequence.values()].sort((a, b) => a.journal_seq - b.journal_seq);
+}
+
+class FactorySignalQueue {
+  private readonly items: FactorySignal[] = [];
+  private waiter: ((value: FactorySignal | undefined) => void) | undefined;
+  private readonly repairWaiters = new Set<() => void>();
+  requiresRepair = false;
+
+  constructor(private readonly maxBuffered: number) {}
+
+  push(item: FactorySignal): void {
+    if (item.kind === "repair") {
+      this.requiresRepair = true;
+      for (const resolve of this.repairWaiters) resolve();
+      this.repairWaiters.clear();
+    }
+    const waiter = this.waiter;
+    if (waiter !== undefined) {
+      this.waiter = undefined;
+      waiter(item);
+      return;
+    }
+    this.items.push(item);
+    const publicationCount = this.items.filter((entry) => entry.kind === "publication").length;
+    if (publicationCount > this.maxBuffered) {
+      this.requiresRepair = true;
+      this.items.length = 0;
+      for (const resolve of this.repairWaiters) resolve();
+      this.repairWaiters.clear();
+    }
+  }
+
+  drainPublications(): FactoryPublication[] {
+    const publications: FactoryPublication[] = [];
+    for (const item of this.items.splice(0)) {
+      if (item.kind === "repair") this.requiresRepair = true;
+      else publications.push(item.publication);
+    }
+    return publications;
+  }
+
+  waitForRepair(signal?: AbortSignal): Promise<"repair" | "aborted"> {
+    if (this.requiresRepair) return Promise.resolve("repair");
+    if (signal?.aborted) return Promise.resolve("aborted");
+    return new Promise((resolve) => {
+      const repaired = (): void => {
+        signal?.removeEventListener("abort", aborted);
+        resolve("repair");
+      };
+      const aborted = (): void => {
+        this.repairWaiters.delete(repaired);
+        resolve("aborted");
+      };
+      this.repairWaiters.add(repaired);
+      signal?.addEventListener("abort", aborted, { once: true });
+    });
+  }
+
+  async next(signal?: AbortSignal): Promise<FactorySignal | undefined> {
+    const item = this.items.shift();
+    if (item !== undefined) return item;
+    if (signal?.aborted) return undefined;
+    return new Promise((resolve) => {
+      const abort = (): void => { this.waiter = undefined; resolve(undefined); };
+      signal?.addEventListener("abort", abort, { once: true });
+      this.waiter = (value) => {
+        signal?.removeEventListener("abort", abort);
+        resolve(value);
+      };
+    });
+  }
+}
+
+async function raceGeneration<T>(
+  promise: Promise<T>,
+  queue: FactorySignalQueue,
+  signal?: AbortSignal,
+): Promise<{ readonly value: T } | "repair" | "aborted"> {
+  return Promise.race([
+    promise.then((value) => ({ value } as const)),
+    queue.waitForRepair(signal),
+  ]);
 }
 
 /**

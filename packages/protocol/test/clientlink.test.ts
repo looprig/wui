@@ -152,6 +152,12 @@ describe("ClientLink", () => {
       onError: (error) => errors.push(error),
     });
     const created = transport.subscriptions[0];
+    let ready = false;
+    binding.ready.then(() => { ready = true; });
+    await Promise.resolve();
+    expect(ready).toBe(false);
+    created?.sub.emit("subscribed", { channel: created.channel });
+    await expect(binding.ready).resolves.toBeUndefined();
     expect(created?.channel).toBe("session:tenant%2Fa:session%3A1");
     expect(created?.sub.subscribeCalls).toBe(1);
     await expect((created?.options.getToken as () => Promise<string>)()).resolves.toBe(
@@ -183,6 +189,18 @@ describe("ClientLink", () => {
     binding.unsubscribe();
     expect(created?.sub.unsubscribeCalls).toBe(1);
     expect(binding.state).toBe("unsubscribed");
+  });
+
+  it("rejects subscription readiness when authorization fails before open", async () => {
+    const { link, transport } = setup();
+    const binding = link.subscribe({
+      tenantId: "tenant-1",
+      sessionId: "session-1",
+      onPublication: () => undefined,
+      onReset: () => undefined,
+    });
+    transport.subscriptions[0]!.sub.emit("unsubscribed", { code: 103, reason: "permission denied" });
+    await expect(binding.ready).rejects.toMatchObject({ message: "permission denied", transportCode: 103 });
   });
 
   it("never turns a REST-only DTO into a publication or RPC result", async () => {
