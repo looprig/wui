@@ -39,6 +39,18 @@ export * from "./validate.js";
 export * from "./errors.js";
 export * from "./transport.js";
 export * from "./client.js";
+export * from "./factory-rest.js";
+export {
+  createClientLink,
+  type ClientLink,
+  type ClientLinkConstructor,
+  type ClientLinkCredentials,
+  type ClientLinkOptions,
+  type ClientLinkState,
+  type ClientSubscription,
+  type ClientSubscriptionState,
+  type SubscribeOptions,
+} from "./clientlink.js";
 export * from "./sse.js";
 export {
   decodeBlock,
@@ -86,4 +98,20 @@ export {
   sessionSummarySchema,
   statusEventSchema,
   uuidSchema,
+  factoryAgentCapabilitySummarySchema,
+  factoryCommandStatusSchema,
+  factoryDepartmentCapabilitySummarySchema,
+  factoryEnduringPublicationSchema,
+  factoryEphemeralPublicationSchema,
+  factoryErrorEnvelopeSchema,
+  factoryJournalTipSchema,
+  factoryObjectMetadataSchema,
+  factoryPublicGatePageSchema,
+  factoryPublicJournalPageSchema,
+  factoryRecentSessionPageSchema,
+  factorySchemas,
+  factorySessionResetSchema,
+  factorySessionStatusSchema,
+  factoryVersionNegotiationRequestSchema,
+  factoryVersionNegotiationResponseSchema,
 } from "./schema.js";

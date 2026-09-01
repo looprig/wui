@@ -76,9 +76,11 @@ Build/dev — never bundled:
 
   Three naming traps, in the order they bite: the npm package is **`centrifuge`** — `centrifuge-js` is the upstream *repository* name (the runbook says `centrifuge-js` throughout and is wrong), and `@centrifuge/centrifuge-js` is an unrelated blockchain project. Pin exactly, no range, as with `ajv` and `json-schema-to-ts`: a caret would let a consumer install a version nothing has run against v0.38.0. The exact top-level pin still leans on `package-lock.json` for `events ^3.3.0` and `protobufjs ^7.6.0` and their twelve indirect packages.
 
-  As of this commit the dependency is **declared and not imported**. U1.1 owns `ClientLink`; it is Wave 4C-blocked on Factory contract fixtures that do not exist. Nothing may import `centrifuge` before then, and the live SSE client stays.
+  U1.1 now imports this dependency only in `packages/protocol/src/clientlink.ts`,
+  behind the Looprig-owned `ClientLink` API. The live SSE client remains in
+  place as the required compatibility path until the React migration and U6.
 
-  **For whoever writes `ClientLink`: none of these SDK types may appear in `@looprig/protocol`'s public API.** Keep every one of them private to `clientlink.ts` and return Looprig-owned types instead — connection/subscription state enums, validated publication and RPC payloads, typed Core-code errors, and an opaque recovery observation only if the public contract genuinely needs one:
+  **None of these SDK types may appear in `@looprig/protocol`'s public API.** Keep every one of them private to `clientlink.ts` and return Looprig-owned types instead — connection/subscription state enums, validated publication and RPC payloads, typed Core-code errors, and an opaque recovery observation only if the public contract genuinely needs one:
 
   - construction/configuration — `Centrifuge`, `Subscription`, `Options`, `SubscriptionOptions`, `ConnectionTokenContext`, `SubscriptionTokenContext`, `SubscriptionDataContext`;
   - connection state — `State`, `StateContext`, `ConnectingContext`, `ConnectedContext`, `DisconnectedContext`;

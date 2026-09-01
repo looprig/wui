@@ -58,7 +58,8 @@
   "suiteFiles": {
     "test/blocks.test.ts": 24,
     "test/conformance.test.ts": 40,
-    "test/contract.test.ts": 62,
+    "test/clientlink.test.ts": 6,
+    "test/contract.test.ts": 65,
     "test/enduring.test.ts": 62,
     "test/errors.test.ts": 10,
     "test/fold-contract-fixtures.test.ts": 1,
@@ -89,9 +90,9 @@
     "test/store-lifecycle.test.ts": 6,
     "test/store-visibility.test.ts": 15,
     "test/store.test.ts": 8,
-    "test/surface.test.ts": 29,
+    "test/surface.test.ts": 30,
     "test/toolsummary.test.ts": 25,
-    "test/transport.test.ts": 41
+    "test/transport.test.ts": 45
   },
   "fileGranular": [
     "test/host-transport-csrf.test.ts",

@@ -12,6 +12,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { HostTransport, generateIdempotencyKey } from "../src/transport.js";
+import { createFactoryClient } from "../src/client.js";
+import { FactoryRestReads } from "../src/factory-rest.js";
 import {
   CSRFRejectedError,
   GateCapacityError,
@@ -146,6 +148,124 @@ describe("HostTransport.listSessions", () => {
     const transport = new HostTransport({ baseUrl });
 
     await expect(transport.listSessions()).rejects.toBeInstanceOf(ContractValidationError);
+  });
+});
+
+describe("Factory durable reads", () => {
+  it("constructs one application ClientLink while status/list/journal/gate reads never open it", async () => {
+    const responses = new Map<string, unknown>([
+      ["/v1/agents?limit=10", readFixture("department_capability_summary.json")],
+      ["/v1/sessions?limit=10", readFixture("recent_session_page.json")],
+      ["/v1/sessions/session-1/status", readFixture("session_status.json")],
+      ["/v1/sessions/session-1/journal?tail=25", readFixture("public_journal_page.json")],
+      ["/v1/sessions/session-1/gates?limit=10", readFixture("public_gate_page.json")],
+    ]);
+    const urls: string[] = [];
+    const authorization: Array<string | null> = [];
+    let constructedLinks = 0;
+    let connectedLinks = 0;
+    const client = createFactoryClient({
+      fetch: async (input, init) => {
+        urls.push(input);
+        authorization.push(new Headers(init?.headers).get("Authorization"));
+        const body = responses.get(input);
+        if (body === undefined) throw new Error(`unexpected read ${input}`);
+        return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+      credentials: { restHeaders: async () => ({ Authorization: "Bearer rotated" }) },
+      clientLinkFactory: () => {
+        constructedLinks += 1;
+        return {
+          get state() { return "disconnected" as const; },
+          connect: async () => { connectedLinks += 1; return { version: 1 as const }; },
+          disconnect: () => undefined,
+          subscribe: () => { throw new Error("read opened a subscription"); },
+          rpc: async () => { throw new Error("read issued an RPC"); },
+        };
+      },
+      clock: () => 1234,
+      idGenerator: () => "id-1",
+    });
+
+    await client.reads.listAgents({ limit: 10 });
+    await client.reads.listRecentSessions({ limit: 10 });
+    await client.reads.readStatus("session-1");
+    await client.reads.readJournal("session-1", { tail: 25 });
+    await client.reads.listGates("session-1", { limit: 10 });
+
+    expect(urls).toStrictEqual([...responses.keys()]);
+    expect(authorization).toStrictEqual(Array.from({ length: responses.size }, () => "Bearer rotated"));
+    expect(constructedLinks).toBe(1);
+    expect(connectedLinks).toBe(0);
+    expect(client.clock()).toBe(1234);
+    expect(client.idGenerator()).toBe("id-1");
+  });
+
+  it("validates the Department capability envelope before exposing agents", async () => {
+    const reads = new FactoryRestReads({
+      fetch: async () => new Response(JSON.stringify([readFixture("agent_capability_summary.json")]), { status: 200 }),
+    });
+    await expect(reads.listAgents()).rejects.toBeInstanceOf(ContractValidationError);
+  });
+
+  it("keeps URLs origin-relative by default, supports a headless base URL, and validates every JSON body", async () => {
+    const requested: Array<{ input: string; init?: RequestInit }> = [];
+    const client = createFactoryClient({
+      baseUrl: "https://factory.example/base/",
+      fetch: async (input, init) => {
+        requested.push({ input, init });
+        return new Response(JSON.stringify({ session_id: "session-1" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+      clientLinkFactory: () => ({
+        get state() { return "disconnected" as const; },
+        connect: async () => ({ version: 1 as const }),
+        disconnect: () => undefined,
+        subscribe: () => { throw new Error("unused"); },
+        rpc: async () => { throw new Error("unused"); },
+      }),
+    });
+
+    await expect(client.reads.readStatus("session-1")).rejects.toBeInstanceOf(ContractValidationError);
+    expect(requested[0]?.input).toBe("https://factory.example/base/v1/sessions/session-1/status");
+  });
+
+  it("validates object metadata and returns only the requested authorized byte range", async () => {
+    const calls: Array<{ input: string; init?: RequestInit }> = [];
+    const metadata = readFixture("object_metadata.json");
+    const client = createFactoryClient({
+      fetch: async (input, init) => {
+        calls.push({ input, init });
+        if (input.endsWith("/metadata")) {
+          return new Response(JSON.stringify(metadata), { status: 200 });
+        }
+        return new Response(new Uint8Array([2, 3, 4]), {
+          status: 206,
+          headers: { "Content-Range": "bytes 2-4/9", "Content-Type": "application/octet-stream" },
+        });
+      },
+      clientLinkFactory: () => ({
+        get state() { return "disconnected" as const; },
+        connect: async () => ({ version: 1 as const }),
+        disconnect: () => undefined,
+        subscribe: () => { throw new Error("unused"); },
+        rpc: async () => { throw new Error("unused"); },
+      }),
+    });
+
+    await expect(client.reads.readObjectMetadata("session-1", "object/a")).resolves.toEqual(metadata);
+    await expect(client.reads.readObjectRange("session-1", "object/a", { start: 2, end: 4 })).resolves.toEqual({
+      bytes: new Uint8Array([2, 3, 4]),
+      contentRange: "bytes 2-4/9",
+      mediaType: "application/octet-stream",
+    });
+    expect(calls.map(({ input }) => input)).toStrictEqual([
+      "/v1/sessions/session-1/objects/object%2Fa/metadata",
+      "/v1/sessions/session-1/objects/object%2Fa",
+    ]);
+    expect(new Headers(calls[1]?.init?.headers).get("Range")).toBe("bytes=2-4");
   });
 });
 

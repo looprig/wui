@@ -18,7 +18,57 @@
  * UnknownLooprigError, which still carries the real `code` string untyped so a
  * caller can still branch on it, just without a dedicated class.
  */
-import type { BFFErrorResponse, ErrorResponse } from "./types.js";
+import type { BFFErrorResponse, CoreErrorEnvelope, ErrorResponse } from "./types.js";
+
+export class CoreProtocolError extends Error {
+  readonly code: string;
+  readonly retryable: boolean;
+  readonly body: CoreErrorEnvelope;
+
+  constructor(body: CoreErrorEnvelope) {
+    super(body.error.message ?? body.error.code);
+    this.name = new.target.name;
+    this.code = body.error.code;
+    this.retryable = body.error.retryable;
+    this.body = body;
+  }
+}
+
+export class CoreInvalidRequestError extends CoreProtocolError {}
+export class CoreUnsupportedVersionError extends CoreProtocolError {}
+export class CoreSessionNotFoundError extends CoreProtocolError {}
+export class CoreCommandRejectedError extends CoreProtocolError {}
+export class CoreGateResolvedError extends CoreProtocolError {}
+export class CoreGateNotResumableError extends CoreProtocolError {}
+export class CoreGateExpiredError extends CoreProtocolError {}
+export class CoreGateResponseInvalidError extends CoreProtocolError {}
+export class CoreRuntimeUnavailableError extends CoreProtocolError {}
+
+export function errorFromCoreEnvelope(body: CoreErrorEnvelope): CoreProtocolError {
+  switch (body.error.code) {
+    case "invalid_request": return new CoreInvalidRequestError(body);
+    case "unsupported_version": return new CoreUnsupportedVersionError(body);
+    case "session_not_found": return new CoreSessionNotFoundError(body);
+    case "command_rejected": return new CoreCommandRejectedError(body);
+    case "gate_resolved": return new CoreGateResolvedError(body);
+    case "gate_not_resumable": return new CoreGateNotResumableError(body);
+    case "gate_expired": return new CoreGateExpiredError(body);
+    case "gate_response_invalid": return new CoreGateResponseInvalidError(body);
+    case "runtime_unavailable": return new CoreRuntimeUnavailableError(body);
+    default: return new CoreProtocolError(body);
+  }
+}
+
+/** A Centrifuge failure translated into an SDK-independent public error. */
+export class RealtimeTransportError extends Error {
+  readonly transportCode: number | undefined;
+
+  constructor(message: string, transportCode?: number, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "RealtimeTransportError";
+    this.transportCode = transportCode;
+  }
+}
 
 /**
  * The `error.code` field's type. Widened beyond `ErrorResponse["error"]["code"]`

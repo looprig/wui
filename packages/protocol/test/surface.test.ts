@@ -213,11 +213,11 @@ function forbiddenImports(...roots: string[]): string[] {
 // entered the public module graph".
 const emittedSourceExtension = /\.(?:m|c)?tsx?$/;
 
-/** Every source file under `src/` -- i.e. exactly what `tsc -p tsconfig.json` emits into `dist/`, which `files: ["dist"]` publishes in full. */
-function srcFiles(): string[] {
-  return readdirSync(join(packageRoot, "src"), { recursive: true })
+/** Every source file under `dir` -- i.e. exactly what `tsc -p tsconfig.json` emits into `dist/`, which `files: ["dist"]` publishes in full. */
+function srcFiles(dir = join(packageRoot, "src")): string[] {
+  return readdirSync(dir, { recursive: true })
     .filter((path): path is string => typeof path === "string" && emittedSourceExtension.test(path))
-    .map((path) => join(packageRoot, "src", path))
+    .map((path) => join(dir, path))
     .sort();
 }
 
@@ -318,6 +318,9 @@ describe("@looprig/protocol public surface", () => {
       "HostTransport",
       "ServeTransport",
       "createClient",
+      "createFactoryClient",
+      "createClientLink",
+      "FactoryRestReads",
       "createHostTransport",
       "CSRF_TOKEN_HEADER",
       "generateIdempotencyKey",
@@ -513,6 +516,15 @@ describe("@looprig/protocol public surface", () => {
       want: "index.ts -> react",
     },
     {
+      // A dot is ordinary inside a package name. This fixture distinguishes
+      // package declarations from the relative `./file.js` form below.
+      name: "dotted ambient package",
+      files: {
+        "index.ts": 'declare module "lodash.debounce" {\n  export default function debounce(): void;\n}\n',
+      },
+      want: "index.ts -> lodash.debounce",
+    },
+    {
       // How a .d.ts acquires @types/*. Pruned from the emit while unused, real
       // the moment the global it brings in is referenced -- as here.
       name: "triple-slash types reference",
@@ -578,6 +590,19 @@ describe("@looprig/protocol public surface", () => {
     }
     for (const path of ["e.d.ts.map", "f.json", "g.js"]) {
       expect(emittedSourceExtension.test(path), `${path} is not a tsc input`).toBe(false);
+    }
+
+    const fixture = mkdtempSync(join(tmpdir(), "looprig-protocol-extensions-"));
+    try {
+      writeSource(fixture, "index.mts", "export const mts = true;\n");
+      writeSource(fixture, "b.tsx", "export const tsx = true;\n");
+      writeSource(fixture, "ignored.js", "export const js = true;\n");
+      expect(srcFiles(fixture).map((path) => relative(fixture, path))).toStrictEqual([
+        "b.tsx",
+        "index.mts",
+      ]);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
     }
   });
 

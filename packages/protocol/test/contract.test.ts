@@ -21,8 +21,14 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { allSchemas, bffErrorResponseSchema, errorResponseSchema } from "../src/schema.js";
-import { ContractValidationError, validate, type SchemaName } from "../src/validate.js";
+import { allSchemas, bffErrorResponseSchema, errorResponseSchema, factorySchemas } from "../src/schema.js";
+import {
+  ContractValidationError,
+  validate,
+  validateFactory,
+  type FactorySchemaName,
+  type SchemaName,
+} from "../src/validate.js";
 
 const schemaDir = fileURLToPath(new URL("../../../contract/schema/", import.meta.url));
 const fixtureDir = fileURLToPath(new URL("../../../contract/fixtures/", import.meta.url));
@@ -55,6 +61,70 @@ describe("schema mirrors match the vendored contract", () => {
       expect(allSchemas[stem]).toEqual(vendored);
     });
   }
+});
+
+describe("Factory boundary schema subset", () => {
+  it("is byte-for-content identical to and validates every corresponding Core fixture", () => {
+    for (const [stem, schema] of Object.entries(factorySchemas)) {
+      expect(schema, `${stem} schema drifted`).toEqual(readJson(schemaDir, `${stem}.schema.json`));
+      expect(() => validateFactory(stem as FactorySchemaName, readJson(fixtureDir, `${stem}.json`))).not.toThrow();
+    }
+  });
+
+  it("rejects malformed data through the Factory validator rather than casting it", () => {
+    expect(() => validateFactory("command_status", { status: "accepted" })).toThrow(ContractValidationError);
+    expect(() => validateFactory("enduring_publication", { type: "enduring_publication" })).toThrow(
+      ContractValidationError,
+    );
+    expect(() => validateFactory("recent_session_page", { sessions: "not-an-array" })).toThrow(
+      ContractValidationError,
+    );
+  });
+
+  it("enforces Core decoder invariants that JSON Schema cannot express", () => {
+    expect(() => validateFactory("session_reset", {
+      type: "session.reset",
+      tenant_id: "tenant-1",
+      session_id: "session-1",
+      last_contiguous: 2,
+      journal_tip: 1,
+    })).toThrow(ContractValidationError);
+
+    const command = readJson(fixtureDir, "command_status.json") as Record<string, unknown>;
+    expect(() => validateFactory("command_status", { ...command, status: "accepted" }))
+      .toThrow(ContractValidationError);
+
+    const recent = readJson(fixtureDir, "recent_session_page.json") as {
+      sessions: Array<Record<string, unknown>>;
+    };
+    expect(() => validateFactory("recent_session_page", {
+      ...recent,
+      sessions: [
+        { ...recent.sessions[0], last_active_at: "2026-08-28T09:00:00-04:00" },
+        { ...recent.sessions[0], last_active_at: "2026-08-28T14:00:00Z" },
+      ],
+    })).toThrow(ContractValidationError);
+
+    const journal = readJson(fixtureDir, "public_journal_page.json") as Record<string, unknown>;
+    expect(() => validateFactory("public_journal_page", { ...journal, covered_through: 999, journal_tip: 1 }))
+      .toThrow(ContractValidationError);
+
+    const ephemeral = readJson(fixtureDir, "ephemeral_publication.json") as Record<string, unknown>;
+    expect(() => validateFactory("ephemeral_publication", { ...ephemeral, event_id: "event-1" }))
+      .toThrow(ContractValidationError);
+
+    const gates = readJson(fixtureDir, "public_gate_page.json") as Record<string, unknown>;
+    expect(() => validateFactory("public_gate_page", { ...gates, open_gate_count: 0 }))
+      .toThrow(ContractValidationError);
+
+    const agent = readJson(fixtureDir, "agent_capability_summary.json") as Record<string, unknown>;
+    expect(() => validateFactory("agent_capability_summary", { ...agent, agent_id: "x".repeat(257) }))
+      .toThrow(ContractValidationError);
+
+    const status = readJson(fixtureDir, "session_status.json") as Record<string, unknown>;
+    expect(() => validateFactory("session_status", { ...status, updated_at: "2026-02-30T00:00:00Z" }))
+      .toThrow(ContractValidationError);
+  });
 });
 
 // --- 1b. The BFF error superset ----------------------------------------------

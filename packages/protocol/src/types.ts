@@ -23,6 +23,21 @@ import {
   eventEnvelopeSchema,
   eventHeaderSchema,
   eventJournalPageSchema,
+  factoryAgentCapabilitySummarySchema,
+  factoryCommandStatusSchema,
+  factoryDepartmentCapabilitySummarySchema,
+  factoryEnduringPublicationSchema,
+  factoryEphemeralPublicationSchema,
+  factoryErrorEnvelopeSchema,
+  factoryJournalTipSchema,
+  factoryObjectMetadataSchema,
+  factoryPublicGatePageSchema,
+  factoryPublicJournalPageSchema,
+  factoryRecentSessionPageSchema,
+  factorySessionResetSchema,
+  factorySessionStatusSchema,
+  factoryVersionNegotiationRequestSchema,
+  factoryVersionNegotiationResponseSchema,
   gateAcceptedResponseSchema,
   gateResponseRequestSchema,
   inputResponseSchema,
@@ -136,3 +151,22 @@ export type SessionStatus = FromSchema<
   typeof sessionStatusSchema,
   { references: [typeof uuidSchema, typeof statusEventSchema, typeof eventEnvelopeSchema] }
 >;
+
+/** Core sessionwire/v1 DTOs used only at the new Factory boundaries. */
+export type AgentCapabilitySummary = FromSchema<typeof factoryAgentCapabilitySummarySchema>;
+export type DepartmentCapabilitySummary = FromSchema<typeof factoryDepartmentCapabilitySummarySchema>;
+export type RecentSessionPage = FromSchema<typeof factoryRecentSessionPageSchema>;
+export type FactorySessionStatus = FromSchema<typeof factorySessionStatusSchema>;
+export type PublicJournalPage = FromSchema<typeof factoryPublicJournalPageSchema>;
+export type PublicGatePage = FromSchema<typeof factoryPublicGatePageSchema>;
+export type ObjectMetadata = FromSchema<typeof factoryObjectMetadataSchema>;
+export type EnduringPublication = FromSchema<typeof factoryEnduringPublicationSchema>;
+export type EphemeralPublication = FromSchema<typeof factoryEphemeralPublicationSchema>;
+export type JournalTip = FromSchema<typeof factoryJournalTipSchema>;
+export type SessionReset = FromSchema<typeof factorySessionResetSchema>;
+export type VersionNegotiationRequest = FromSchema<typeof factoryVersionNegotiationRequestSchema>;
+export type VersionNegotiationResponse = FromSchema<typeof factoryVersionNegotiationResponseSchema>;
+export type CommandStatus = FromSchema<typeof factoryCommandStatusSchema>;
+export type CoreErrorEnvelope = FromSchema<typeof factoryErrorEnvelopeSchema>;
+
+export type FactoryPublication = EnduringPublication | EphemeralPublication | JournalTip;
