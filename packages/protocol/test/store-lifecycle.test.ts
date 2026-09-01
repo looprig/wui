@@ -139,6 +139,7 @@ class StoreFactoryLink implements FactoryJoinLink {
     return {
       state: "subscribed",
       ready: Promise.resolve(),
+      version: 1,
       unsubscribe: () => { this.unsubscribeCalls += 1; },
     };
   }

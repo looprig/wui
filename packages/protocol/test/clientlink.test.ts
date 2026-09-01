@@ -124,6 +124,17 @@ describe("ClientLink", () => {
     expect(transport.connectCalls).toBe(1);
     await expect(alreadyConnected).resolves.toStrictEqual({ version: 1 });
 
+    const binding = link.subscribe({
+      tenantId: "tenant-1",
+      sessionId: "session-1",
+      onPublication: () => undefined,
+      onReset: () => undefined,
+    });
+    transport.subscriptions[0]!.sub.emit("subscribed", {});
+    await binding.ready;
+    expect(binding.version).toBe(1);
+    binding.unsubscribe();
+
     link.disconnect();
     expect(transport.disconnectCalls).toBe(1);
     expect(link.state).toBe("disconnected");
@@ -201,6 +212,41 @@ describe("ClientLink", () => {
     });
     transport.subscriptions[0]!.sub.emit("unsubscribed", { code: 103, reason: "permission denied" });
     await expect(binding.ready).rejects.toMatchObject({ message: "permission denied", transportCode: 103 });
+  });
+
+  it("settles readiness when a code-zero unsubscribe terminates the subscription before open", async () => {
+    const { link, transport } = setup();
+    const onError = vi.fn();
+    const binding = link.subscribe({
+      tenantId: "tenant-1",
+      sessionId: "session-1",
+      onPublication: () => undefined,
+      onReset: () => undefined,
+      onError,
+    });
+    transport.subscriptions[0]!.sub.emit("unsubscribed", { code: 0, reason: "closed before authorization" });
+    await expect(binding.ready).rejects.toMatchObject({
+      message: "closed before authorization",
+      transportCode: 0,
+    });
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report a normal code-zero unsubscribe after readiness as an authorization failure", async () => {
+    const { link, transport } = setup();
+    const onError = vi.fn();
+    const binding = link.subscribe({
+      tenantId: "tenant-1",
+      sessionId: "session-1",
+      onPublication: () => undefined,
+      onReset: () => undefined,
+      onError,
+    });
+    const sub = transport.subscriptions[0]!.sub;
+    sub.emit("subscribed", {});
+    await expect(binding.ready).resolves.toBeUndefined();
+    sub.emit("unsubscribed", { code: 0, reason: "normal close" });
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it("never turns a REST-only DTO into a publication or RPC result", async () => {

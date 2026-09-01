@@ -33,6 +33,8 @@ export interface ClientSubscription {
   readonly state: ClientSubscriptionState;
   /** Resolves only after the server has authorized and opened the subscription. */
   readonly ready: Promise<void>;
+  /** Negotiated sessionwire version, available after `ready` settles successfully. */
+  readonly version?: number;
   unsubscribe(): void;
 }
 
@@ -294,18 +296,20 @@ class CentrifugeClientLink implements ClientLink {
       const code = typeof context === "object" && context !== null && "code" in context && typeof context.code === "number"
         ? context.code
         : undefined;
-      if (code === 0) return;
       const reason = typeof context === "object" && context !== null && "reason" in context && typeof context.reason === "string"
         ? context.reason
         : "subscription removed";
+      if (code === 0 && readySettled) return;
       const error = new RealtimeTransportError(reason, code, { cause: context });
       settleReady(error);
       options.onError?.(error);
     });
     transportSubscription.subscribe();
+    const thisLink = this;
     return {
       get state(): ClientSubscriptionState { return subscriptionState(transportSubscription.state); },
       ready,
+      get version(): number | undefined { return thisLink.negotiated?.version; },
       unsubscribe: () => transportSubscription.unsubscribe(),
     };
   }

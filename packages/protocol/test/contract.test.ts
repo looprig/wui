@@ -125,6 +125,33 @@ describe("Factory boundary schema subset", () => {
     expect(() => validateFactory("session_status", { ...status, updated_at: "2026-02-30T00:00:00Z" }))
       .toThrow(ContractValidationError);
   });
+
+  it("rejects journal coordinates that cannot be represented exactly by JavaScript", () => {
+    const unsafe = Number.MAX_SAFE_INTEGER + 1;
+    const mutations: Array<[FactorySchemaName, Record<string, unknown>]> = [
+      ["session_status", { ...(readJson(fixtureDir, "session_status.json") as object), journal_tip: unsafe }],
+      ["journal_tip", { ...(readJson(fixtureDir, "journal_tip.json") as object), journal_tip: unsafe }],
+      ["session_reset", {
+        ...(readJson(fixtureDir, "session_reset.json") as object),
+        last_contiguous: unsafe,
+        journal_tip: unsafe,
+      }],
+      ["enduring_publication", {
+        ...(readJson(fixtureDir, "enduring_publication.json") as object),
+        journal_seq: unsafe,
+        covered_through: unsafe,
+      }],
+      ["public_journal_page", {
+        ...(readJson(fixtureDir, "public_journal_page.json") as object),
+        journal_tip: unsafe,
+        covered_through: unsafe,
+        events: [{ event_id: "event-unsafe", journal_seq: unsafe, body: {} }],
+      }],
+    ];
+    for (const [schema, value] of mutations) {
+      expect(() => validateFactory(schema, value), schema).toThrow(ContractValidationError);
+    }
+  });
 });
 
 // --- 1b. The BFF error superset ----------------------------------------------

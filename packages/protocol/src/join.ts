@@ -263,13 +263,46 @@ export async function* joinFactorySessionView(
     const currentGeneration = ++generation;
     const generationBase = coveredThrough;
     const queue = new FactorySignalQueue(maxBuffered);
+    let prejoinOpen = true;
     const push = (signal: FactorySignal): void => {
       if (token === activeToken) queue.push(signal);
+    };
+    const admitPublication = (value: FactoryPublication): void => {
+      if (token !== activeToken) return;
+      try {
+        if (value.type === "enduring_publication") {
+          const parsed = validateEnduringPublication(value);
+          if (parsed.tenant_id !== tenantId || parsed.session_id !== sessionId) {
+            push({ kind: "repair" });
+            return;
+          }
+          if (prejoinOpen && parsed.journal_seq <= generationBase) return;
+          push({ kind: "publication", publication: parsed });
+          return;
+        }
+        if (value.type === "ephemeral_publication") {
+          const parsed = validateEphemeralPublication(value);
+          if (parsed.tenant_id !== tenantId || parsed.session_id !== sessionId) {
+            push({ kind: "repair" });
+            return;
+          }
+          if (!prejoinOpen) push({ kind: "publication", publication: parsed });
+          return;
+        }
+        const parsed = validateJournalTip(value);
+        if (parsed.tenant_id !== tenantId || parsed.session_id !== sessionId) {
+          push({ kind: "repair" });
+          return;
+        }
+        if (!prejoinOpen) push({ kind: "publication", publication: parsed });
+      } catch (error) {
+        push({ kind: "repair", error: error instanceof Error ? error : undefined });
+      }
     };
     const subscription = link.subscribe({
       tenantId,
       sessionId,
-      onPublication: (value) => push({ kind: "publication", publication: value }),
+      onPublication: admitPublication,
       onReset: (value) => {
         try { validateSessionReset(value); } catch { /* still repair */ }
         push({ kind: "repair" });
@@ -281,6 +314,7 @@ export async function* joinFactorySessionView(
     try {
       const ready = await raceGeneration(subscription.ready, queue, options.signal);
       if (typeof ready === "string") { repair = ready === "repair"; continue; }
+      if (subscription.version !== undefined && subscription.version !== 1) { repair = true; continue; }
       if (queue.requiresRepair) { repair = true; continue; }
 
       const controller = new AbortController();
@@ -306,16 +340,20 @@ export async function* joinFactorySessionView(
 
       status = validateFactorySessionStatus(status);
       page = validatePublicJournalPage(page);
-      if (status.session_id !== sessionId || status.journal_tip !== page.journal_tip || page.covered_through < coveredThrough) {
+      if (status.session_id !== sessionId
+        || status.journal_tip !== page.journal_tip
+        || page.covered_through < coveredThrough
+        || page.events.length > tailLimit) {
         repair = true;
         continue;
       }
       if (queue.requiresRepair) { repair = true; continue; }
       const tip = page.journal_tip;
+      const prejoin = queue.drainPublications();
+      prejoinOpen = false;
+      if (queue.requiresRepair) { repair = true; continue; }
       yield { kind: "projection", generation: currentGeneration, status, coveredThrough };
 
-      const prejoin = queue.drainPublications();
-      if (queue.requiresRepair) { repair = true; continue; }
       const enduring = prejoin.filter((item): item is EnduringPublication => item.type === "enduring_publication");
       const candidates = mergeFactoryEvents(page.events, enduring, coveredThrough, tip);
       if (candidates === undefined) { repair = true; continue; }

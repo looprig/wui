@@ -216,6 +216,10 @@ function idsWithinCoreLimit(...values: Array<string | undefined>): boolean {
   return values.every((value) => value === undefined || idEncoder.encode(value).byteLength <= 256);
 }
 
+function safeJournalCoordinate(value: number, minimum = 0): boolean {
+  return Number.isSafeInteger(value) && value >= minimum;
+}
+
 function validDateTime(value: string | undefined): boolean {
   if (value === undefined) return true;
   const match = DATE_TIME_PATTERN.exec(value);
@@ -282,6 +286,8 @@ function validateFactorySemantics<K extends FactorySchemaName>(
     case "enduring_publication": {
       const value = data as EnduringPublication;
       if (!idsWithinCoreLimit(value.tenant_id, value.session_id, value.event_id)
+        || !safeJournalCoordinate(value.journal_seq, 1)
+        || !safeJournalCoordinate(value.covered_through, 1)
         || value.covered_through !== value.journal_seq) semanticFailure(schemaName);
       return;
     }
@@ -293,12 +299,15 @@ function validateFactorySemantics<K extends FactorySchemaName>(
     }
     case "journal_tip": {
       const value = data as JournalTip;
-      if (!idsWithinCoreLimit(value.tenant_id, value.session_id)) semanticFailure(schemaName);
+      if (!idsWithinCoreLimit(value.tenant_id, value.session_id)
+        || !safeJournalCoordinate(value.journal_tip)) semanticFailure(schemaName);
       return;
     }
     case "session_reset": {
       const value = data as SessionReset;
       if (!idsWithinCoreLimit(value.tenant_id, value.session_id)
+        || !safeJournalCoordinate(value.last_contiguous)
+        || !safeJournalCoordinate(value.journal_tip)
         || value.last_contiguous > value.journal_tip) semanticFailure(schemaName);
       return;
     }
@@ -327,15 +336,19 @@ function validateFactorySemantics<K extends FactorySchemaName>(
     case "session_status": {
       const value = data as FactorySessionStatus;
       if (!idsWithinCoreLimit(value.session_id, value.agent_id, value.waiting_gate_id)
+        || !safeJournalCoordinate(value.journal_tip)
         || !validDateTime(value.updated_at)) semanticFailure(schemaName);
       return;
     }
     case "public_journal_page": {
       const value = data as PublicJournalPage;
-      if (value.covered_through > value.journal_tip) semanticFailure(schemaName);
+      if (!safeJournalCoordinate(value.journal_tip)
+        || !safeJournalCoordinate(value.covered_through)
+        || value.covered_through > value.journal_tip) semanticFailure(schemaName);
       let previous = 0;
       for (const event of value.events) {
         if (!idsWithinCoreLimit(event.event_id)
+          || !safeJournalCoordinate(event.journal_seq, 1)
           || event.journal_seq <= previous
           || event.journal_seq > value.covered_through) semanticFailure(schemaName);
         previous = event.journal_seq;
@@ -344,13 +357,15 @@ function validateFactorySemantics<K extends FactorySchemaName>(
     }
     case "public_gate_page": {
       const value = data as PublicGatePage;
-      if (value.gates.length > value.open_gate_count) semanticFailure(schemaName);
+      if (!safeJournalCoordinate(value.journal_tip)
+        || value.gates.length > value.open_gate_count) semanticFailure(schemaName);
       let previous = 0;
       for (const gate of value.gates) {
         if (!idsWithinCoreLimit(gate.gate_id, gate.opened_event_id)
           || !validDateTime(gate.deadline)
           || !validGateOrigin(gate.prompt.origin)
           || gate.prompt.controls?.some((control) => control.action.trim() === "" || control.label.trim() === "")
+          || !safeJournalCoordinate(gate.opened_journal_seq, 1)
           || gate.opened_journal_seq <= previous
           || gate.opened_journal_seq > value.journal_tip) semanticFailure(schemaName);
         previous = gate.opened_journal_seq;
