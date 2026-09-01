@@ -50,7 +50,10 @@ frozen between releases and may lag `app/` source during development. `make
 release-dist` is the only release path: it performs a clean dependency install,
 builds into two isolated output directories, refuses byte-different manifests,
 rejects symlinks and non-regular output, then transactionally replaces and stages
-`dist/` and runs the Go race/build gates against that embed. Any publication or
+`dist/` and runs the Go race/build gates against that embed. It requires a POSIX
+release host; native Windows is intentionally unsupported because safe rollback
+depends on stopping every descendant through release-owned negative process-group IDs.
+Run publication from a supported Unix host or POSIX CI runner. Any publication or
 gate failure, plus handled `SIGHUP`, `SIGINT`, or `SIGTERM`, restores the exact
 committed snapshot and index; signal exits retain their conventional nonzero
 status. Build and gate commands run in release-owned process groups: handled

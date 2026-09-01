@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 const repository = fileURLToPath(new URL("../..", import.meta.url));
@@ -74,6 +74,14 @@ type BuildMode =
   | "symlink-relative-same"
   | "symlink-relative-different"
   | "fifo";
+
+type HandledReleaseSignal = "SIGHUP" | "SIGINT" | "SIGTERM";
+
+const signalExitCode: Record<HandledReleaseSignal, number> = {
+  SIGHUP: 129,
+  SIGINT: 130,
+  SIGTERM: 143,
+};
 
 function installFakeReleaseTools(
   clone: string,
@@ -204,7 +212,7 @@ async function waitForFile(path: string): Promise<void> {
   }
 }
 
-async function interruptRelease(clone: string, signal: "SIGINT" | "SIGTERM") {
+async function interruptRelease(clone: string, signal: HandledReleaseSignal) {
   const expected = manifest(clone);
   const env = installFakeReleaseTools(clone, "deterministic", { gateSleep: true, gateGrandchild: true });
   const temporaryRoot = join(clone, ".release-temporary");
@@ -227,7 +235,7 @@ async function interruptRelease(clone: string, signal: "SIGINT" | "SIGTERM") {
   return { env, expected, result, temporaryRoot };
 }
 
-async function interruptFirstBuild(clone: string, signal: "SIGINT" | "SIGTERM") {
+async function interruptFirstBuild(clone: string, signal: HandledReleaseSignal) {
   const expected = manifest(clone);
   const env = installFakeReleaseTools(clone, "deterministic", { buildSleep: true });
   const temporaryRoot = join(clone, ".release-temporary");
@@ -278,6 +286,46 @@ async function interruptAfterGateLeaderExit(clone: string) {
 }
 
 describe("bundle release workflow", () => {
+  it("rejects a non-POSIX release host before creating temporary state or running a build", () => {
+    const clone = cloneWithCurrentWorkflow();
+    const expected = manifest(clone);
+    const env = installFakeReleaseTools(clone, "deterministic");
+    const temporaryRoot = join(clone, ".release-temporary");
+    mkdirSync(temporaryRoot);
+    env.TMPDIR = temporaryRoot;
+    const releaseModule = pathToFileURL(join(clone, "app/scripts/release-dist.mjs")).href;
+    const source = `
+      import { stageReproducibleDist } from ${JSON.stringify(releaseModule)};
+      await stageReproducibleDist(
+        "npm",
+        ["run", "build", "--workspace", "app", "--", "--outDir", "{out}", "--emptyOutDir"],
+        "win32",
+      );
+    `;
+
+    const result = spawnSync("node", ["--input-type=module", "--eval", source], {
+      cwd: clone,
+      env,
+      encoding: "utf8",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("requires a POSIX release host");
+    expect(manifest(clone)).toEqual(expected);
+    expect(run("git", ["status", "--porcelain=v1", "--", "dist"], clone)).toBe("");
+    expect(readdirSync(temporaryRoot)).toStrictEqual([]);
+    expect(existsSync(env.BUNDLE_TEST_COUNT!)).toBe(false);
+    expect(existsSync(env.BUNDLE_TEST_GO_CALLS!)).toBe(false);
+  });
+
+  it("documents the POSIX release-host boundary and its process-group reason", () => {
+    const readme = readFileSync(join(repository, "README.md"), "utf8").replaceAll(/\s+/g, " ");
+
+    expect(readme).toContain("POSIX release host");
+    expect(readme).toContain("negative process-group IDs");
+    expect(readme).toContain("native Windows");
+  });
+
   it("dist-reset restores the exact tracked snapshot and removes generated extras", () => {
     const clone = cloneWithCurrentWorkflow();
     const expected = manifest(clone);
@@ -419,7 +467,7 @@ describe("bundle release workflow", () => {
     },
   );
 
-  it.each(["SIGINT", "SIGTERM"] as const)(
+  it.each(["SIGHUP", "SIGINT", "SIGTERM"] as const)(
     "terminates its gate process group before rollback on direct %s",
     async (signal) => {
       const clone = cloneWithCurrentWorkflow();
@@ -429,7 +477,7 @@ describe("bundle release workflow", () => {
       expectPristineDist(clone, interrupted.expected);
       expect(readdirSync(interrupted.temporaryRoot).filter((entry) => entry.startsWith("looprig-wui-release-dist-")))
         .toStrictEqual([]);
-      expect(interrupted.result).toStrictEqual({ code: signal === "SIGINT" ? 130 : 143, signal: null });
+      expect(interrupted.result).toStrictEqual({ code: signalExitCode[signal], signal: null });
       await new Promise((resolve) => setTimeout(resolve, 1_000));
       expectPristineDist(clone, interrupted.expected);
       expect(existsSync(interrupted.env.BUNDLE_TEST_LATE_TEMP!)).toBe(false);
@@ -450,7 +498,7 @@ describe("bundle release workflow", () => {
       .toStrictEqual([]);
   }, 20_000);
 
-  it.each(["SIGINT", "SIGTERM"] as const)(
+  it.each(["SIGHUP", "SIGINT", "SIGTERM"] as const)(
     "cleans temporary output when directly interrupted during build one with %s",
     async (signal) => {
       const clone = cloneWithCurrentWorkflow();
@@ -460,7 +508,7 @@ describe("bundle release workflow", () => {
       expectPristineDist(clone, interrupted.expected);
       expect(readdirSync(interrupted.temporaryRoot).filter((entry) => entry.startsWith("looprig-wui-release-dist-")))
         .toStrictEqual([]);
-      expect(interrupted.result).toStrictEqual({ code: signal === "SIGINT" ? 130 : 143, signal: null });
+      expect(interrupted.result).toStrictEqual({ code: signalExitCode[signal], signal: null });
     },
     20_000,
   );

@@ -10,6 +10,7 @@ const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const dist = join(repository, "dist");
 const signalExitCode = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
 const handledSignals = Object.keys(signalExitCode);
+const posixReleasePlatforms = new Set(["aix", "android", "darwin", "freebsd", "linux", "openbsd", "sunos"]);
 const terminationGraceMilliseconds = 500;
 const killWaitMilliseconds = 5_000;
 
@@ -185,7 +186,12 @@ async function build(commands, command, args, output) {
   }
 }
 
-export async function stageReproducibleDist(command, args) {
+export async function stageReproducibleDist(command, args, platform = process.platform) {
+  if (!posixReleasePlatforms.has(platform)) {
+    throw new Error(
+      `release-dist cannot run on ${platform}: it requires a POSIX release host because transactional rollback terminates release-owned process groups by negative PID; run it from a supported Unix host instead of Windows`,
+    );
+  }
   if (command === undefined || !args.includes("{out}")) {
     throw new TypeError("usage: release-dist.mjs COMMAND ... {out} ...");
   }
