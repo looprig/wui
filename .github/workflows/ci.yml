@@ -56,18 +56,25 @@ jobs:
       # validate those Core bytes with ajv: its TypeScript schema mirror still
       # describes the Harness-era contract, so the two disagree. That
       # disagreement is deliberate, permitted by the Wave 2 checkpoint, and
-      # recorded file-by-file in packages/protocol/test/known-drift.json;
-      # reconciling it is Wave 4C protocol work, blocked on Factory contract
-      # fixtures that do not exist yet.
+      # recorded in packages/protocol/test/known-drift.json -- by FILE for the
+      # three that drive real HTTP servers under timeouts, and by exact FAILING
+      # TEST NAME for the other seven; reconciling it is Wave 4C protocol work,
+      # blocked on Factory contract fixtures that do not exist yet.
       #
-      # The suite still RUNS here, every test of it. @looprig/protocol's `test`
-      # script is scripts/known-drift-gate.mjs, which fails on any failing file
-      # the recorded allowance does not cover and on any allowance that has gone
-      # stale. Dropping the workspace would leave a suite CI never runs, which
-      # is indistinguishable from a passing one -- the exact failure the
-      # deferred-ports tripwire existed to prevent -- and a blanket
-      # continue-on-error is that same failure wearing a different hat: it would
-      # hide every future regression in the 26 healthy files for as long as the
-      # drift lasts.
+      # The suite still RUNS here, every test of it, and that is now asserted
+      # rather than claimed: known-drift.json records the full expected test
+      # FILE set and the gate fails on any mismatch, because the first version
+      # of it printed "26 of 36 test files pass" and asserted nothing about the
+      # 36 -- so a file renamed out of vitest's include glob stopped guarding
+      # and the gate still exited 0. @looprig/protocol's `test` script is
+      # scripts/known-drift-gate.mjs, which fails on any failing file the
+      # allowance does not cover, any new failing TEST inside a fast drifted
+      # file, any drifted file that stops collecting its tests, and any
+      # allowance that has gone stale. Dropping the workspace would leave a
+      # suite CI never runs, which is indistinguishable from a passing one --
+      # the exact failure the deferred-ports tripwire existed to prevent -- and
+      # a blanket continue-on-error is that same failure wearing a different
+      # hat: it would hide every future regression in the 26 healthy files for
+      # as long as the drift lasts.
       - run: npm run typecheck --workspaces --if-present
       - run: npm test --workspaces --if-present
