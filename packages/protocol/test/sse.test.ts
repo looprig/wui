@@ -27,8 +27,40 @@ function readFixtureBytes(file: string): Uint8Array {
   return new Uint8Array(readFileSync(fixtureDir + file));
 }
 
-const enduringBytes = readFixtureBytes("enduring_frame.sse");
-const ephemeralFixtureBytes = readFixtureBytes("ephemeral_token_delta.sse");
+// The two SSE wire vectors, INLINE, byte-for-byte as `contract/fixtures/`
+// carried them until task U0.1 re-sourced that directory from Core's
+// `sessionwire/v1`, which ships no `.sse` fixture at all.
+//
+// They are module-scope on purpose: `combined` below, and with it the
+// every-single-cut-offset chunk-splitting suite this file's header calls "the
+// point of this file", are built from them. Reading them off disk here is what
+// stopped that suite running: the ENOENT threw during COLLECTION, so vitest
+// reported `test/sse.test.ts (0 test)` and the known-drift gate counted the file
+// as "failing" and moved on. Zero of src/sse.ts's parser tests executed for as
+// long as the allowance lasts -- a file granular gate cannot tell a suite that
+// fails from one that never ran, which is the exact failure the gate exists to
+// prevent, one level down.
+//
+// So the parser half runs against these constants and the CONTRACT half still
+// reads the real fixtures, inside `it()`, where an ENOENT fails one test
+// instead of the file. Those two tests are the drift; everything else here
+// tests src/sse.ts, which U0.1 did not touch.
+const encoder = new TextEncoder();
+const enduringBytes = encoder.encode(
+  'event: enduring\nid: 42\ndata: {"v":1,"event":{"created_at":"2026-07-08T12:00:00Z",' +
+    '"event_id":"00000000-0000-0000-0000-000000000000",' +
+    '"loop_id":"00000000-0000-0000-0000-000000000000",' +
+    '"session_id":"00000000-0000-0000-0000-000000000000",' +
+    '"turn_id":"00000000-0000-0000-0000-000000000000",' +
+    '"turn_index":1,"type":"TurnDone","v":1}}\n\n',
+);
+const ephemeralFixtureBytes = encoder.encode(
+  'event: ephemeral\ndata: {"v":1,"kind":"token_delta","header":' +
+    '{"session_id":"00000000-0000-0000-0000-000000000000",' +
+    '"event_id":"00000000-0000-0000-0000-000000000000",' +
+    '"created_at":"2026-07-08T12:00:00Z"},' +
+    '"delta":{"chunk_type":"text","text":"hello"}}\n\n',
+);
 
 const enduringExpectedData = {
   v: 1,
@@ -92,13 +124,25 @@ function normalize(frames: SseFrame[]): unknown[] {
 // --- 1. Golden fixtures, fed as one chunk -----------------------------------
 
 describe("golden fixtures parsed as a single chunk", () => {
+  // These two are the CONTRACT half, and the only two tests in this file that
+  // touch the vendored fixtures. They read them inside the `it()` so a missing
+  // fixture fails these two and nothing else; U0.1 removed both `.sse` files,
+  // so they are the failures test/known-drift.json records for this file.
+  // Each also asserts the inline vector above is byte-identical to the fixture,
+  // so the inlining can never silently drift away from the contract: when
+  // Wave 4C restores the fixtures, a mismatch fails here rather than quietly
+  // testing the parser against a stale copy.
   it("parses enduring_frame.sse: correct journal_seq and ajv-validated payload", () => {
-    const frames = parseWhole(enduringBytes);
+    const fixture = readFixtureBytes("enduring_frame.sse");
+    expect(fixture).toEqual(enduringBytes);
+    const frames = parseWhole(fixture);
     expect(frames).toEqual([{ type: "enduring", journalSeq: 42, data: enduringExpectedData }]);
   });
 
   it("parses ephemeral_token_delta.sse with a real EventHeader and no journal sequence", () => {
-    const frames = parseWhole(ephemeralFixtureBytes);
+    const fixture = readFixtureBytes("ephemeral_token_delta.sse");
+    expect(fixture).toEqual(ephemeralFixtureBytes);
+    const frames = parseWhole(fixture);
     expect(frames).toEqual([{ type: "ephemeral", data: ephemeralExpectedData }]);
     expect(frames[0]).not.toHaveProperty("journalSeq");
   });
