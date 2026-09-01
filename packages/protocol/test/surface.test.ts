@@ -48,7 +48,7 @@ const workspaceRoot = resolve(packageRoot, "../..");
 // dependencies" test asserts this set and the manifest's `dependencies` keys are
 // the SAME set, in both directions, so admitting a package here without
 // declaring it (or declaring one without admitting it) fails.
-const allowedPackageRoots = new Set(["ajv", "json-schema-to-ts"]);
+const allowedPackageRoots = new Set(["ajv", "centrifuge", "json-schema-to-ts"]);
 
 function packageRootOf(specifier: string): string {
   const parts = specifier.split("/");
@@ -265,7 +265,21 @@ describe("@looprig/protocol public surface", () => {
     ) as { dependencies?: Record<string, string>; scripts?: Record<string, string> };
     // design §1: "Zero framework deps. A Vue or Solid author installs that one
     // package." That is the package's whole reason to exist.
-    expect(manifest.dependencies).toStrictEqual({ ajv: "8.20.0", "json-schema-to-ts": "3.1.1" });
+    // Exact, never a range. `centrifuge` is the official Centrifugal client and
+    // `5.7.2` is the version the compatibility spike verified against the
+    // embedded github.com/centrifugal/centrifuge v0.38.0 server; a caret would
+    // let a consumer install a version nothing has ever run against that server.
+    // Note the npm package is `centrifuge` -- `centrifuge-js` is the upstream
+    // REPOSITORY name, and `@centrifuge/centrifuge-js` is an unrelated
+    // blockchain project.
+    expect(manifest.dependencies).toStrictEqual({
+      ajv: "8.20.0",
+      centrifuge: "5.7.2",
+      "json-schema-to-ts": "3.1.1",
+    });
+    for (const [name, version] of Object.entries(manifest.dependencies ?? {})) {
+      expect(version, `${name} must be pinned exactly, not to a range`).toMatch(/^\d+\.\d+\.\d+$/);
+    }
     // The import allowlist and the declared dependencies are one fact stated
     // twice, so assert them equal in BOTH directions rather than asserting a
     // second hand-written list. An entry admitted to the allowlist but never
