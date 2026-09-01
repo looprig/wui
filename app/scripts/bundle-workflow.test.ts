@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -75,7 +75,16 @@ type BuildMode =
   | "symlink-relative-different"
   | "fifo";
 
-function installFakeReleaseTools(clone: string, mode: BuildMode, failures: { gate?: boolean; gitAdd?: boolean } = {}) {
+function installFakeReleaseTools(
+  clone: string,
+  mode: BuildMode,
+  failures: {
+    gate?: boolean;
+    gateSleep?: boolean;
+    gitAdd?: boolean;
+    duringBuildEdit?: "tracked" | "ignored" | "staged";
+  } = {},
+) {
   const bin = join(clone, ".test-bin");
   mkdirSync(bin);
   const npm = join(bin, "npm");
@@ -101,6 +110,17 @@ const index = process.env.BUNDLE_TEST_MODE === "placeholder"
   : '<script type="module" src="/assets/app.js"></script>';
 writeFileSync(resolve(out, "index.html"), index);
 writeFileSync(resolve(out, "assets/app.js"), 'export const marker = "' + marker + '";');
+if (count === 2) {
+  const edit = process.env.BUNDLE_TEST_DURING_BUILD_EDIT;
+  if (edit === "tracked" || edit === "staged") {
+    writeFileSync(resolve("dist/index.html"), "caller edit during build");
+    if (edit === "staged") {
+      const staged = spawnSync("git", ["add", "dist/index.html"]);
+      if (staged.status !== 0) process.exit(staged.status ?? 1);
+    }
+  }
+  if (edit === "ignored") writeFileSync(resolve("dist/assets/caller-during-build.js"), "caller edit during build");
+}
 const mode = process.env.BUNDLE_TEST_MODE;
 if (mode?.startsWith("symlink-")) {
   const relative = mode.includes("relative");
@@ -115,7 +135,7 @@ if (mode === "fifo") {
 `);
   chmodSync(npm, 0o755);
   const go = join(bin, "go");
-  writeFileSync(go, '#!/bin/sh\necho "$@" >> "$BUNDLE_TEST_GO_CALLS"\nif [ "$BUNDLE_TEST_GATE_FAIL" = "1" ] && [ "$1" = "test" ]; then exit 42; fi\nexit 0\n');
+  writeFileSync(go, '#!/bin/sh\necho "$@" >> "$BUNDLE_TEST_GO_CALLS"\nif [ "$BUNDLE_TEST_GATE_SLEEP" = "1" ] && [ "$1" = "test" ]; then echo ready > "$BUNDLE_TEST_GATE_READY"; sleep 30; fi\nif [ "$BUNDLE_TEST_GATE_FAIL" = "1" ] && [ "$1" = "test" ]; then exit 42; fi\nexit 0\n');
   chmodSync(go, 0o755);
   const realGit = run("which", ["git"], clone).trim();
   const git = join(bin, "git");
@@ -134,13 +154,50 @@ process.exit(result.status ?? 1);
     BUNDLE_TEST_MODE: mode,
     BUNDLE_TEST_GO_CALLS: join(clone, ".go-calls"),
     BUNDLE_TEST_GATE_FAIL: failures.gate ? "1" : "0",
+    BUNDLE_TEST_GATE_SLEEP: failures.gateSleep ? "1" : "0",
+    BUNDLE_TEST_GATE_READY: join(clone, ".gate-ready"),
     BUNDLE_TEST_GIT_ADD_FAIL: failures.gitAdd ? "1" : "0",
+    BUNDLE_TEST_DURING_BUILD_EDIT: failures.duringBuildEdit ?? "",
   };
 }
 
 function expectPristineDist(clone: string, expected: Record<string, string>): void {
   expect(manifest(clone)).toEqual(expected);
   expect(run("git", ["status", "--porcelain=v1", "--", "dist"], clone)).toBe("");
+}
+
+async function waitForFile(path: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+async function interruptRelease(clone: string, signal: "SIGINT" | "SIGTERM") {
+  const expected = manifest(clone);
+  const env = installFakeReleaseTools(clone, "deterministic", { gateSleep: true });
+  const temporaryRoot = join(clone, ".release-temporary");
+  mkdirSync(temporaryRoot);
+  env.TMPDIR = temporaryRoot;
+  const child = spawn(
+    "node",
+    [
+      "app/scripts/release-dist.mjs",
+      "npm", "run", "build", "--workspace", "app", "--", "--outDir", "{out}", "--emptyOutDir",
+    ],
+    { cwd: clone, env, detached: true, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += String(chunk); });
+  child.stderr.on("data", (chunk) => { output += String(chunk); });
+  await waitForFile(env.BUNDLE_TEST_GATE_READY!);
+  process.kill(-child.pid!, signal);
+  const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, closedBy) => resolve({ code, signal: closedBy }));
+  });
+  return { env, expected, output, result, temporaryRoot };
 }
 
 describe("bundle release workflow", () => {
@@ -189,6 +246,20 @@ describe("bundle release workflow", () => {
     run("make", ["dist-reset"], clone);
 
     expect(existsSync(nested)).toBe(false);
+    expectPristineDist(clone, expected);
+  });
+
+  it("dist-reset recovers a simulated SIGKILL or power-loss publication residue", () => {
+    const clone = cloneWithCurrentWorkflow();
+    const expected = manifest(clone);
+    rmSync(join(clone, "dist"), { recursive: true, force: true });
+    mkdirSync(join(clone, "dist/assets"), { recursive: true });
+    writeFileSync(join(clone, "dist/index.html"), "interrupted candidate");
+    writeFileSync(join(clone, "dist/assets/interrupted.js"), "interrupted candidate");
+    run("git", ["add", "-f", "--all", "--", "dist"], clone);
+
+    run("make", ["dist-reset"], clone);
+
     expectPristineDist(clone, expected);
   });
 
@@ -250,6 +321,41 @@ describe("bundle release workflow", () => {
     expect(manifest(clone)).toEqual(before);
     expect(existsSync(env.BUNDLE_TEST_COUNT!)).toBe(false);
   });
+
+  it.each(["tracked", "ignored", "staged"] as const)(
+    "preserves a caller %s dist edit introduced during the builds",
+    (duringBuildEdit) => {
+      const clone = cloneWithCurrentWorkflow();
+      const env = installFakeReleaseTools(clone, "deterministic", { duringBuildEdit });
+
+      const result = spawnSync("make", ["release-dist"], { cwd: clone, env, encoding: "utf8" });
+
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain("dist must be clean");
+      expect(readFileSync(env.BUNDLE_TEST_COUNT!, "utf8")).toBe("2");
+      if (duringBuildEdit === "ignored") {
+        expect(readFileSync(join(clone, "dist/assets/caller-during-build.js"), "utf8")).toBe("caller edit during build");
+      } else {
+        expect(readFileSync(join(clone, "dist/index.html"), "utf8")).toBe("caller edit during build");
+      }
+      expect(existsSync(join(clone, "dist/assets/app.js"))).toBe(false);
+    },
+  );
+
+  it.each(["SIGINT", "SIGTERM"] as const)(
+    "rolls back publication and cleans temporary outputs on %s",
+    async (signal) => {
+      const clone = cloneWithCurrentWorkflow();
+
+      const interrupted = await interruptRelease(clone, signal);
+
+      expectPristineDist(clone, interrupted.expected);
+      expect(readdirSync(interrupted.temporaryRoot).filter((entry) => entry.startsWith("looprig-wui-release-dist-")))
+        .toStrictEqual([]);
+      expect(interrupted.result).toStrictEqual({ code: signal === "SIGINT" ? 130 : 143, signal: null });
+    },
+    20_000,
+  );
 
   it.each([
     ["post-stage Go gate", { gate: true }],

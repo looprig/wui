@@ -51,8 +51,12 @@ release-dist` is the only release path: it performs a clean dependency install,
 builds into two isolated output directories, refuses byte-different manifests,
 rejects symlinks and non-regular output, then transactionally replaces and stages
 `dist/` and runs the Go race/build gates against that embed. Any publication or
-gate failure restores the exact committed snapshot and index. The target also
-refuses to overwrite any caller change already present under `dist/`.
+gate failure, plus handled `SIGHUP`, `SIGINT`, or `SIGTERM`, restores the exact
+committed snapshot and index; signal exits retain their conventional nonzero
+status. `SIGKILL` and power loss cannot run rollback. After either, run `make
+dist-reset` to remove interrupted output and restore the committed snapshot before
+retrying. The target refuses caller changes found under `dist/` both before builds
+and immediately before publication; it does not claim to lock out editor writes.
 Use `make dist-reset` after an ordinary local app build to return to the committed
 release snapshot. Two consecutive isolated Vite builds from the same source must
 produce identical path-and-byte manifests; the target enforces that before it

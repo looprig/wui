@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,6 +8,16 @@ import { checkDist } from "./check-dist.mjs";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const dist = join(repository, "dist");
+const signalExitCode = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+
+class ReleaseSignalError extends Error {
+  constructor(signal) {
+    super(`release publication interrupted by ${signal}`);
+    this.name = "ReleaseSignalError";
+    this.signal = signal;
+    this.exitCode = signalExitCode[signal];
+  }
+}
 
 function manifest(directory) {
   const root = lstatSync(directory);
@@ -35,6 +45,22 @@ function runChecked(command, args, label, options = {}) {
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`${label} exited with status ${result.status}`);
   return result;
+}
+
+function runCheckedAsync(command, args, label, options, setActiveChild) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(command, args, { cwd: repository, stdio: "inherit", ...options });
+    setActiveChild(child);
+    child.once("error", (error) => {
+      setActiveChild(undefined);
+      rejectPromise(error);
+    });
+    child.once("close", (code, signal) => {
+      setActiveChild(undefined);
+      if (code === 0) resolvePromise();
+      else rejectPromise(new Error(`${label} exited with ${signal ?? `status ${code}`}`));
+    });
+  });
 }
 
 function assertDistClean() {
@@ -68,7 +94,7 @@ function build(command, args, output) {
   }
 }
 
-export function stageReproducibleDist(command, args) {
+export async function stageReproducibleDist(command, args) {
   if (command === undefined || !args.includes("{out}")) {
     throw new TypeError("usage: release-dist.mjs COMMAND ... {out} ...");
   }
@@ -84,8 +110,18 @@ export function stageReproducibleDist(command, args) {
     if (JSON.stringify(firstManifest) !== JSON.stringify(secondManifest)) {
       throw new Error("release bundle is not reproducible: two isolated builds produced different manifests");
     }
+    assertDistClean();
 
     let publicationStarted = false;
+    let activeChild;
+    let receivedSignal;
+    const signals = ["SIGHUP", "SIGINT", "SIGTERM"];
+    const handlers = new Map(signals.map((signal) => [signal, () => {
+      if (receivedSignal !== undefined) return;
+      receivedSignal = signal;
+      activeChild?.kill(signal);
+    }]));
+    for (const [signal, handler] of handlers) process.on(signal, handler);
     try {
       publicationStarted = true;
       rmSync(dist, { recursive: true, force: true });
@@ -101,13 +137,23 @@ export function stageReproducibleDist(command, args) {
         throw new Error("installed release bundle is still the placeholder");
       }
       runChecked("git", ["add", "-f", "--all", "--", "dist"], "git add dist");
-      runChecked("go", ["test", "-race", "-count=1", "./..."], "Go race gate", {
-        env: { ...process.env, GOWORK: "off" },
-      });
-      runChecked("go", ["build", "./..."], "Go build gate", {
-        env: { ...process.env, GOWORK: "off" },
-      });
+      await runCheckedAsync(
+        "go",
+        ["test", "-race", "-count=1", "./..."],
+        "Go race gate",
+        { env: { ...process.env, GOWORK: "off" } },
+        (child) => { activeChild = child; },
+      );
+      await runCheckedAsync(
+        "go",
+        ["build", "./..."],
+        "Go build gate",
+        { env: { ...process.env, GOWORK: "off" } },
+        (child) => { activeChild = child; },
+      );
       runChecked("git", ["diff", "--cached", "--stat", "--", "dist"], "git staged dist summary");
+      await new Promise((resolvePromise) => setImmediate(resolvePromise));
+      if (receivedSignal !== undefined) throw new ReleaseSignalError(receivedSignal);
     } catch (error) {
       if (publicationStarted) {
         try {
@@ -116,7 +162,10 @@ export function stageReproducibleDist(command, args) {
           throw new AggregateError([error, rollbackError], "release publication and dist rollback both failed");
         }
       }
+      if (receivedSignal !== undefined) throw new ReleaseSignalError(receivedSignal);
       throw error;
+    } finally {
+      for (const [signal, handler] of handlers) process.off(signal, handler);
     }
   } finally {
     rmSync(temporary, { recursive: true, force: true });
@@ -125,9 +174,9 @@ export function stageReproducibleDist(command, args) {
 
 if (import.meta.url === new URL(process.argv[1], "file:").href) {
   try {
-    stageReproducibleDist(process.argv[2], process.argv.slice(3));
+    await stageReproducibleDist(process.argv[2], process.argv.slice(3));
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);
-    process.exit(1);
+    process.exitCode = error instanceof ReleaseSignalError ? error.exitCode : 1;
   }
 }
