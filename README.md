@@ -49,7 +49,10 @@ committed, so the embed target always exists. That committed bundle is deliberat
 frozen between releases and may lag `app/` source during development. `make
 release-dist` is the only release path: it performs a clean dependency install,
 builds into two isolated output directories, refuses byte-different manifests,
-then replaces and stages `dist/` and runs the Go race suite against that embed.
+rejects symlinks and non-regular output, then transactionally replaces and stages
+`dist/` and runs the Go race/build gates against that embed. Any publication or
+gate failure restores the exact committed snapshot and index. The target also
+refuses to overwrite any caller change already present under `dist/`.
 Use `make dist-reset` after an ordinary local app build to return to the committed
 release snapshot. Two consecutive isolated Vite builds from the same source must
 produce identical path-and-byte manifests; the target enforces that before it

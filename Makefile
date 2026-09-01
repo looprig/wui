@@ -103,14 +103,10 @@ contract:
 release-dist:
 	npm ci
 	node app/scripts/release-dist.mjs npm run build --workspace app -- --outDir {out} --emptyOutDir
-	@echo "--- staged for release ---"
-	@git diff --cached --stat -- dist | tail -3
-	@grep -q 'placeholder' dist/index.html && { echo "REFUSING: dist/index.html is still the placeholder"; exit 1; } || true
-	GOWORK=off go test -race -count=1 ./...
-	@echo "OK: built SPA staged and the Go suite passes against it. Commit, then tag."
+	@echo "OK: reproducible SPA staged and the Go race/build gates pass. Commit, then tag."
 
 dist-reset:
-	git clean -fdx -- dist
+	git clean -ffdx -- dist
 	git restore --source=HEAD --staged --worktree -- dist
 	@echo "OK: restored the complete committed dist snapshot."
 

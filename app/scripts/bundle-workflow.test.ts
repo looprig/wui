@@ -65,12 +65,23 @@ function trackedJavaScript(root: string): string {
   return join(root, "dist", asset);
 }
 
-function installFakeReleaseTools(clone: string, mode: "deterministic" | "nondeterministic") {
+type BuildMode =
+  | "deterministic"
+  | "nondeterministic"
+  | "placeholder"
+  | "symlink-absolute-same"
+  | "symlink-absolute-different"
+  | "symlink-relative-same"
+  | "symlink-relative-different"
+  | "fifo";
+
+function installFakeReleaseTools(clone: string, mode: BuildMode, failures: { gate?: boolean; gitAdd?: boolean } = {}) {
   const bin = join(clone, ".test-bin");
   mkdirSync(bin);
   const npm = join(bin, "npm");
   writeFileSync(npm, `#!/usr/bin/env node
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 const args = process.argv.slice(2);
 if (args[0] === "ci") process.exit(0);
@@ -85,19 +96,51 @@ const out = resolve(outIndex === -1 ? "dist" : args[outIndex + 1]);
 rmSync(out, { recursive: true, force: true });
 mkdirSync(resolve(out, "assets"), { recursive: true });
 const marker = process.env.BUNDLE_TEST_MODE === "nondeterministic" ? String(count) : "stable";
-writeFileSync(resolve(out, "index.html"), '<script type="module" src="/assets/app.js"></script>');
+const index = process.env.BUNDLE_TEST_MODE === "placeholder"
+  ? "placeholder"
+  : '<script type="module" src="/assets/app.js"></script>';
+writeFileSync(resolve(out, "index.html"), index);
 writeFileSync(resolve(out, "assets/app.js"), 'export const marker = "' + marker + '";');
+const mode = process.env.BUNDLE_TEST_MODE;
+if (mode?.startsWith("symlink-")) {
+  const relative = mode.includes("relative");
+  const different = mode.includes("different");
+  const target = relative ? (different ? "target-" + count : "target") : (different && count === 2 ? "/etc/passwd" : "/etc/hosts");
+  symlinkSync(target, resolve(out, "assets/link"));
+}
+if (mode === "fifo") {
+  const result = spawnSync("mkfifo", [resolve(out, "assets/pipe")]);
+  if (result.status !== 0) process.exit(result.status ?? 1);
+}
 `);
   chmodSync(npm, 0o755);
   const go = join(bin, "go");
-  writeFileSync(go, "#!/bin/sh\nexit 0\n");
+  writeFileSync(go, '#!/bin/sh\necho "$@" >> "$BUNDLE_TEST_GO_CALLS"\nif [ "$BUNDLE_TEST_GATE_FAIL" = "1" ] && [ "$1" = "test" ]; then exit 42; fi\nexit 0\n');
   chmodSync(go, 0o755);
+  const realGit = run("which", ["git"], clone).trim();
+  const git = join(bin, "git");
+  writeFileSync(git, `#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+if (process.env.BUNDLE_TEST_GIT_ADD_FAIL === "1" && args[0] === "add") process.exit(43);
+const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: "inherit" });
+process.exit(result.status ?? 1);
+`);
+  chmodSync(git, 0o755);
   return {
     ...process.env,
     PATH: `${bin}:${process.env.PATH ?? ""}`,
     BUNDLE_TEST_COUNT: join(clone, ".build-count"),
     BUNDLE_TEST_MODE: mode,
+    BUNDLE_TEST_GO_CALLS: join(clone, ".go-calls"),
+    BUNDLE_TEST_GATE_FAIL: failures.gate ? "1" : "0",
+    BUNDLE_TEST_GIT_ADD_FAIL: failures.gitAdd ? "1" : "0",
   };
+}
+
+function expectPristineDist(clone: string, expected: Record<string, string>): void {
+  expect(manifest(clone)).toEqual(expected);
+  expect(run("git", ["status", "--porcelain=v1", "--", "dist"], clone)).toBe("");
 }
 
 describe("bundle release workflow", () => {
@@ -135,6 +178,20 @@ describe("bundle release workflow", () => {
     expect(run("git", ["status", "--porcelain=v1", "--", "dist"], clone)).toBe("");
   });
 
+  it("dist-reset removes a nested Git repository before restoring the snapshot", () => {
+    const clone = cloneWithCurrentWorkflow();
+    const expected = manifest(clone);
+    const nested = join(clone, "dist/generated-nested-repository");
+    mkdirSync(nested);
+    run("git", ["init", "--quiet"], nested);
+    writeFileSync(join(nested, "owned-by-generated-repo"), "extra");
+
+    run("make", ["dist-reset"], clone);
+
+    expect(existsSync(nested)).toBe(false);
+    expectPristineDist(clone, expected);
+  });
+
   it("release-dist stages one of two byte-identical isolated builds", () => {
     const clone = cloneWithCurrentWorkflow();
     const env = installFakeReleaseTools(clone, "deterministic");
@@ -143,6 +200,10 @@ describe("bundle release workflow", () => {
 
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(readFileSync(env.BUNDLE_TEST_COUNT!, "utf8")).toBe("2");
+    expect(readFileSync(env.BUNDLE_TEST_GO_CALLS!, "utf8").trim().split("\n")).toStrictEqual([
+      "test -race -count=1 ./...",
+      "build ./...",
+    ]);
     expect(readFileSync(join(clone, "dist/assets/app.js"), "utf8")).toContain('"stable"');
     expect(run("git", ["diff", "--name-only", "--cached", "--", "dist"], clone)).not.toBe("");
     expect(existsSync(join(clone, "dist/assets/app.js"))).toBe(true);
@@ -160,5 +221,76 @@ describe("bundle release workflow", () => {
     expect(readFileSync(env.BUNDLE_TEST_COUNT!, "utf8")).toBe("2");
     expect(manifest(clone)).toEqual(expected);
     expect(run("git", ["status", "--porcelain=v1", "--", "dist"], clone)).toBe("");
+  });
+
+  it("refuses to overwrite caller dist changes before it starts building", () => {
+    const clone = cloneWithCurrentWorkflow();
+    writeFileSync(join(clone, "dist/index.html"), "caller change");
+    const before = manifest(clone);
+    const env = installFakeReleaseTools(clone, "deterministic");
+
+    const result = spawnSync("make", ["release-dist"], { cwd: clone, env, encoding: "utf8" });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("dist must be clean");
+    expect(manifest(clone)).toEqual(before);
+    expect(existsSync(env.BUNDLE_TEST_COUNT!)).toBe(false);
+  });
+
+  it("also refuses ignored generated dist files owned by the caller", () => {
+    const clone = cloneWithCurrentWorkflow();
+    writeFileSync(join(clone, "dist/assets/caller-generated.js"), "caller change");
+    const before = manifest(clone);
+    const env = installFakeReleaseTools(clone, "deterministic");
+
+    const result = spawnSync("make", ["release-dist"], { cwd: clone, env, encoding: "utf8" });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("dist must be clean");
+    expect(manifest(clone)).toEqual(before);
+    expect(existsSync(env.BUNDLE_TEST_COUNT!)).toBe(false);
+  });
+
+  it.each([
+    ["post-stage Go gate", { gate: true }],
+    ["git add", { gitAdd: true }],
+  ] as const)("rolls back exact dist bytes and index when %s fails", (_name, failures) => {
+    const clone = cloneWithCurrentWorkflow();
+    const expected = manifest(clone);
+    const env = installFakeReleaseTools(clone, "deterministic", failures);
+
+    const result = spawnSync("make", ["release-dist"], { cwd: clone, env, encoding: "utf8" });
+
+    expect(result.status).not.toBe(0);
+    expectPristineDist(clone, expected);
+  });
+
+  it("rolls back a post-install bundle validation failure", () => {
+    const clone = cloneWithCurrentWorkflow();
+    const expected = manifest(clone);
+    const env = installFakeReleaseTools(clone, "placeholder");
+
+    const result = spawnSync("make", ["release-dist"], { cwd: clone, env, encoding: "utf8" });
+
+    expect(result.status).not.toBe(0);
+    expectPristineDist(clone, expected);
+  });
+
+  it.each([
+    "symlink-absolute-same",
+    "symlink-absolute-different",
+    "symlink-relative-same",
+    "symlink-relative-different",
+    "fifo",
+  ] as const)("rejects unsupported %s output before publication", (mode) => {
+    const clone = cloneWithCurrentWorkflow();
+    const expected = manifest(clone);
+    const env = installFakeReleaseTools(clone, mode);
+
+    const result = spawnSync("make", ["release-dist"], { cwd: clone, env, encoding: "utf8" });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("unsupported bundle entry");
+    expectPristineDist(clone, expected);
   });
 });
