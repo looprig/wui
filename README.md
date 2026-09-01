@@ -30,7 +30,7 @@ imports it.
 - `assets.go` — `Assets()`, the embedded SPA with a path-confined SPA-router fallback
 - `guard.go`, `csrf.go`, `errors.go` — browser guards (see Security below)
 - `handler.go` — `Handler()`, composing api + assets + guards
-- `dist/` — the `//go:embed all:dist` target; `index.html` is a committed placeholder
+- `dist/` — the `//go:embed all:dist` target; committed files are the last release bundle
 - `contract/` — schemas and fixtures vendored from harness at a pinned version
 - `packages/`, `app/` — the npm workspaces (protocol, React adapter, SPA)
 
@@ -44,8 +44,14 @@ blanket 403 before routing resolved. `GET /v1/csrf-token` delivers the token.
 
 ## Building
 
-The Go module builds with no Node toolchain installed: `dist/index.html` is committed
-so the embed target always exists.
+The Go module builds with no Node toolchain installed because a release bundle is
+committed, so the embed target always exists. That committed bundle is deliberately
+frozen between releases and may lag `app/` source during development. `make
+release-dist` is the only release path: it performs a clean dependency install,
+rebuilds and stages `dist/`, and runs the Go race suite against the staged embed.
+Use `make dist-reset` after an ordinary local app build to return to the committed
+release snapshot. Two consecutive Vite builds from the same source must produce the
+same hashed entry asset and `index.html`; do not commit a machine-dependent rewrite.
 
 ```sh
 make check                 # the full gate: fmt, vet, staticcheck, gosec, vuln, test, build
@@ -56,7 +62,8 @@ Building the real SPA:
 
 ```sh
 npm ci
-npm run build -w app     # writes ../dist, overwriting everything but index.html
+npm run build -w app     # writes ../dist for local inspection
+make dist-reset          # restore the committed release snapshot afterward
 ```
 
 ## Licence

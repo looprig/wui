@@ -10,7 +10,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { HostTransport, generateIdempotencyKey } from "../src/transport.js";
 import { createFactoryClient } from "../src/client.js";
 import { FactoryRestReads } from "../src/factory-rest.js";
@@ -152,6 +152,28 @@ describe("HostTransport.listSessions", () => {
 });
 
 describe("Factory durable reads", () => {
+  it("uses crypto.randomUUID by default for each command and the create SessionID", () => {
+    const randomUUID = vi.spyOn(globalThis.crypto, "randomUUID")
+      .mockReturnValueOnce("00000000-0000-4000-8000-000000000001")
+      .mockReturnValueOnce("00000000-0000-4000-8000-000000000002");
+    const client = createFactoryClient({
+      clientLinkFactory: () => ({
+        get state() { return "disconnected" as const; },
+        connect: async () => ({ version: 1 as const }),
+        disconnect: () => undefined,
+        subscribe: () => { throw new Error("unused"); },
+        rpc: async () => { throw new Error("unused"); },
+      }),
+    });
+
+    const pending = client.commands.create({ agentId: "agent-1" });
+
+    expect(pending.commandId).toBe("00000000-0000-4000-8000-000000000001");
+    expect(pending.sessionId).toBe("00000000-0000-4000-8000-000000000002");
+    expect(randomUUID).toHaveBeenCalledTimes(2);
+    randomUUID.mockRestore();
+  });
+
   it("constructs one application ClientLink while status/list/journal/gate reads never open it", async () => {
     const responses = new Map<string, unknown>([
       ["/v1/agents?limit=10", readFixture("department_capability_summary.json")],

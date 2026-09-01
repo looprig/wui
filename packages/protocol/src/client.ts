@@ -28,6 +28,7 @@ import {
   type ClientLinkCredentials,
   type ClientLinkConstructor,
 } from "./clientlink.js";
+import { createFactoryCommands, type FactoryCommands } from "./commands.js";
 
 export type LooprigClient = LooprigTransport;
 
@@ -66,6 +67,7 @@ export interface FactoryClientOptions {
 export interface FactoryClient {
   readonly reads: FactoryReads;
   readonly link: ClientLink;
+  readonly commands: FactoryCommands;
   readonly clock: Clock;
   readonly idGenerator: IdGenerator;
 }
@@ -87,5 +89,12 @@ export function createFactoryClient(options: FactoryClientOptions = {}): Factory
   });
   const clock = options.clock ?? Date.now;
   const idGenerator = options.idGenerator ?? (() => crypto.randomUUID());
-  return { reads, link, clock, idGenerator };
+  const commands = createFactoryCommands({
+    link,
+    fetch: options.fetch,
+    baseUrl: options.baseUrl,
+    credentials,
+    idGenerator,
+  });
+  return { reads, link, commands, clock, idGenerator };
 }

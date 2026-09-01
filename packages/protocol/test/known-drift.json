@@ -59,6 +59,7 @@
     "test/blocks.test.ts": 24,
     "test/conformance.test.ts": 40,
     "test/clientlink.test.ts": 6,
+    "test/commands.test.ts": 18,
     "test/contract.test.ts": 65,
     "test/enduring.test.ts": 62,
     "test/errors.test.ts": 10,
@@ -92,7 +93,7 @@
     "test/store.test.ts": 8,
     "test/surface.test.ts": 30,
     "test/toolsummary.test.ts": 25,
-    "test/transport.test.ts": 45
+    "test/transport.test.ts": 46
   },
   "fileGranular": [
     "test/host-transport-csrf.test.ts",

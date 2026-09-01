@@ -319,6 +319,7 @@ describe("@looprig/protocol public surface", () => {
       "ServeTransport",
       "createClient",
       "createFactoryClient",
+      "createFactoryCommands",
       "createClientLink",
       "FactoryRestReads",
       "createHostTransport",

@@ -39,6 +39,7 @@ export * from "./validate.js";
 export * from "./errors.js";
 export * from "./transport.js";
 export * from "./client.js";
+export * from "./commands.js";
 export * from "./factory-rest.js";
 export {
   createClientLink,
