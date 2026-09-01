@@ -204,6 +204,27 @@ export interface FactoryJoinOptions {
   tailLimit?: number;
   /** Maximum publications retained while the tail is in flight. Default 256. */
   maxPrejoinPublications?: number;
+  /**
+   * Consecutive repairs that make NO coverage progress before the join gives
+   * up and throws. Default 32. A repair cycle that advances `coveredThrough`
+   * past the sequence the generation started from resets the counter, so a
+   * slow-but-progressing recovery is never cut off; only a genuinely stuck
+   * loop (a Factory permanently behind the persisted cursor, a page whose
+   * coverage never reaches its own tip, a reset that repeats forever) is
+   * terminated. Without this the loop below is unbounded — see the "Repair is
+   * bounded" note on `joinFactorySessionView`.
+   */
+  maxRepairAttempts?: number;
+  /**
+   * Base delay before the SECOND and later consecutive non-progressing repair
+   * attempts, doubling per attempt and capped at eight times this value.
+   * Default 250 (milliseconds). The first repair after progress retries with
+   * a zero delay, exactly like the legacy join's clean-end reconnect. Note
+   * that a zero delay is still awaited through a real timer: every repair
+   * cycle yields a MACROTASK, which is what makes `options.signal`'s abort
+   * listener (and any test timer) reachable at all — see `joinFactorySessionView`.
+   */
+  repairDelayMs?: number;
   signal?: AbortSignal;
 }
 
@@ -240,10 +261,55 @@ type FactorySignal =
   | { kind: "repair"; error?: Error };
 
 const DEFAULT_FACTORY_TAIL_LIMIT = 256;
+const DEFAULT_MAX_REPAIR_ATTEMPTS = 32;
+const DEFAULT_REPAIR_DELAY_MS = 250;
+const MAX_REPAIR_BACKOFF_FACTOR = 8;
 
 /**
  * Subscribe-first Factory join. Each repair replaces the complete generation;
  * callbacks close over its token and are inert as soon as it is superseded.
+ *
+ * ## Repair is bounded, and every repair yields a macrotask
+ *
+ * Step 6 of the algorithm ("if a remaining gap appears, discard and repeat")
+ * is a loop with no natural fixed point: a Factory whose coverage sits behind
+ * the application's persisted cursor, or a tail page whose `covered_through`
+ * never reaches its own `journal_tip`, repairs on every attempt forever. Two
+ * bounds close that.
+ *
+ * FIRST, the loop yields a real timer on every repair, even a zero-delay one.
+ * This is not cosmetic. Every `await` in the loop body — subscription
+ * readiness, the two REST reads, the queue — resolves as a MICROTASK when the
+ * failure is immediate, so an unbounded loop drains the microtask queue
+ * forever and never reaches the timer queue. A `setTimeout`-driven
+ * `controller.abort()` therefore never runs: the abort path is structurally
+ * unreachable while the loop spins, which turns a livelock into a hang that
+ * cancellation cannot break. Measured before this delay existed: a join with
+ * `initialCoveredThrough: 40` against a page reporting `covered_through: 4`
+ * hung its worker until the process was killed, with the test runner's own
+ * timeout never firing.
+ *
+ * SECOND, consecutive repairs that make no coverage progress are counted and
+ * capped (`options.maxRepairAttempts`), with the delay doubling in between
+ * (`options.repairDelayMs`). Under real network latency the unbounded form
+ * does not freeze — it degrades into an unthrottled subscribe/REST storm, one
+ * full cycle per round trip, which is a client-caused outage amplifier. A
+ * cycle that advances `coveredThrough` past the sequence its generation
+ * started from resets the counter, so a legitimate slow recovery is never cut
+ * off; only a stuck loop terminates, and it terminates by THROWING, so the
+ * failure is reported rather than silently retried forever.
+ *
+ * ## `session.reset` lowers the cursor
+ *
+ * A `session.reset` names `last_contiguous`: the greatest sequence the
+ * Factory still holds contiguously. When it is BELOW this join's committed
+ * `coveredThrough` the session truncated behind us, and repairing from the
+ * unchanged cursor asks for coverage that no longer exists — every subsequent
+ * page fails `page.covered_through < coveredThrough` and repairs again. The
+ * validated reset is therefore applied as a floor on the cursor before the
+ * replacement generation starts. A reset that fails validation, or that names
+ * another tenant/session, still forces a repair (matching every publication
+ * path) but must NOT move the cursor.
  */
 export async function* joinFactorySessionView(
   reads: FactoryJoinReads,
@@ -254,14 +320,40 @@ export async function* joinFactorySessionView(
 ): AsyncGenerator<FactoryJoinEvent, void, void> {
   const tailLimit = positiveBound(options.tailLimit ?? DEFAULT_FACTORY_TAIL_LIMIT, "tailLimit");
   const maxBuffered = positiveBound(options.maxPrejoinPublications ?? DEFAULT_FACTORY_TAIL_LIMIT, "maxPrejoinPublications");
+  const maxRepairAttempts = positiveBound(options.maxRepairAttempts ?? DEFAULT_MAX_REPAIR_ATTEMPTS, "maxRepairAttempts");
+  const repairDelayMs = safeSequence(options.repairDelayMs ?? DEFAULT_REPAIR_DELAY_MS, "repairDelayMs");
   let coveredThrough = safeSequence(options.initialCoveredThrough ?? 0, "initialCoveredThrough");
   let generation = 0;
   let activeToken = 0;
+  let attempted = false;
+  /** The previous generation's `generationBase`, for the progress test below. */
+  let previousBase = coveredThrough;
+  let consecutiveRepairs = 0;
+  let resetFloor: number | undefined;
 
   while (!options.signal?.aborted) {
+    if (attempted) {
+      // Only reachable when the previous generation ended in repair. Coverage
+      // that moved past that generation's base is progress and clears the
+      // counter; anything else is one more step toward giving up.
+      consecutiveRepairs = coveredThrough > previousBase ? 0 : consecutiveRepairs + 1;
+      if (consecutiveRepairs > maxRepairAttempts) {
+        throw new Error(`factory join gave up after ${consecutiveRepairs} consecutive repairs without coverage progress`);
+      }
+      // Awaited unconditionally, including at zero: the macrotask is the point.
+      await repairDelay(repairBackoffMs(consecutiveRepairs, repairDelayMs), options.signal);
+      if (options.signal?.aborted) return;
+      if (resetFloor !== undefined) {
+        if (resetFloor < coveredThrough) coveredThrough = resetFloor;
+        resetFloor = undefined;
+      }
+    }
+    attempted = true;
     const token = ++activeToken;
     const currentGeneration = ++generation;
+    // Per-generation, and captured by this generation's callbacks below.
     const generationBase = coveredThrough;
+    previousBase = generationBase;
     const queue = new FactorySignalQueue(maxBuffered);
     let prejoinOpen = true;
     const push = (signal: FactorySignal): void => {
@@ -304,7 +396,20 @@ export async function* joinFactorySessionView(
       sessionId,
       onPublication: admitPublication,
       onReset: (value) => {
-        try { validateSessionReset(value); } catch { /* still repair */ }
+        // A reset ALWAYS repairs, but only a validated reset for this exact
+        // channel is allowed to move the durable cursor: a forged or
+        // wrong-session frame that lowered it would re-expose already-applied
+        // sequences. See "session.reset lowers the cursor" above.
+        try {
+          const parsed = validateSessionReset(value);
+          if (token === activeToken
+            && parsed.tenant_id === tenantId
+            && parsed.session_id === sessionId) {
+            resetFloor = resetFloor === undefined
+              ? parsed.last_contiguous
+              : Math.min(resetFloor, parsed.last_contiguous);
+          }
+        } catch { /* still repair, but never move the cursor */ }
         push({ kind: "repair" });
       },
       onError: (error) => push({ kind: "repair", error }),
@@ -340,8 +445,21 @@ export async function* joinFactorySessionView(
 
       status = validateFactorySessionStatus(status);
       page = validatePublicJournalPage(page);
+      // `page.covered_through !== page.journal_tip` is the fail-CLOSED half of
+      // taking T from `journal_tip`. Only events at or below `covered_through`
+      // are attested by this page (the validator rejects any event above it),
+      // so a tail page reporting a lower coverage than its own tip leaves
+      // (covered_through, T] neither in the page, nor necessarily in the
+      // prejoin buffer — anything that committed there BEFORE subscribe was
+      // never buffered — nor repaired. Measured without this guard, a page
+      // {journal_tip: 5, covered_through: 2, events: [1, 2]} plus a prejoin
+      // publication at 4 rendered [1, 2, 4], silently dropping public
+      // sequence 5, and then walked the durable cursor over it to 6. That is
+      // the fail-open direction twice: a missing event AND a persisted cursor
+      // asserting it was covered, which licenses never fetching it again.
       if (status.session_id !== sessionId
         || status.journal_tip !== page.journal_tip
+        || page.covered_through !== page.journal_tip
         || page.covered_through < coveredThrough
         || page.events.length > tailLimit) {
         repair = true;
@@ -372,6 +490,14 @@ export async function* joinFactorySessionView(
       const aboveTip = enduring.filter((item) => item.journal_seq > tip).sort((a, b) => a.journal_seq - b.journal_seq);
       for (const item of aboveTip) {
         const parsed = validateEnduringPublication(item);
+        // `parsed.covered_through < parsed.journal_seq` is UNREACHABLE while
+        // Core enforces `covered_through === journal_seq` on every
+        // enduring_publication (validate.ts rejects any inequality before this
+        // line, and the contract schema documents the invariant), which also
+        // makes step 5's "otherwise repair from SessionStore" unable to fire
+        // on the live path. Do not delete it: a guard whose input is currently
+        // impossible is not a redundant guard, and it is the fail-closed
+        // reading if that Core invariant is ever relaxed.
         if (parsed.tenant_id !== tenantId || parsed.session_id !== sessionId || parsed.covered_through < parsed.journal_seq) {
           repair = true;
           break;
@@ -427,6 +553,29 @@ export async function* joinFactorySessionView(
     }
     if (!repair) return;
   }
+}
+
+/**
+ * Zero for the first repair after progress (retry immediately, as the legacy
+ * join does on a clean end); from the second consecutive non-progressing
+ * repair onward, `base` doubling per attempt and capped at eight times base.
+ */
+function repairBackoffMs(consecutiveRepairs: number, base: number): number {
+  if (consecutiveRepairs <= 1) return 0;
+  return base * Math.min(2 ** (consecutiveRepairs - 2), MAX_REPAIR_BACKOFF_FACTOR);
+}
+
+/** Always a real timer, so the repair loop reaches the macrotask queue. */
+function repairDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, delayMs);
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }
 
 function positiveBound(value: number, name: string): number {

@@ -355,6 +355,53 @@ const tipPublication = (tip: number): FactoryPublication => ({
   journal_tip: tip,
 });
 
+/**
+ * A link that hands every generation its own already-authorized subscription,
+ * so a test can drive many repair cycles without wiring one `FakeFactoryLink`
+ * per generation by hand. `links[i]` is generation i+1's.
+ */
+class ScriptedFactoryLink implements FactoryJoinLink {
+  readonly links: FakeFactoryLink[] = [];
+  subscribe(options: SubscribeOptions): ClientSubscription {
+    const link = new FakeFactoryLink();
+    link.ready.resolve();
+    this.links.push(link);
+    return link.subscribe(options);
+  }
+}
+
+/**
+ * Resolves each generation's status/tail pair from a script, repeating the
+ * last entry forever. Unlike `FakeFactoryReads` these resolve on their own —
+ * which is the point for the repair-bound tests, where the failure is
+ * immediate and every await in the join is a microtask.
+ */
+class ScriptedFactoryReads implements FactoryJoinReads {
+  statusCalls = 0;
+  readonly journalOptions: Array<{ tail?: number; limit?: number; signal?: AbortSignal }> = [];
+  private index = 0;
+  constructor(private readonly script: Array<{ status: FactorySessionStatus; page: PublicJournalPage }>) {}
+  private step(): { status: FactorySessionStatus; page: PublicJournalPage } {
+    return this.script[Math.min(this.index, this.script.length - 1)]!;
+  }
+  async readStatus(): Promise<FactorySessionStatus> {
+    this.statusCalls += 1;
+    return this.step().status;
+  }
+  async readJournal(
+    _sessionId: string,
+    options: { tail?: number; limit?: number; signal?: AbortSignal } = {},
+  ): Promise<PublicJournalPage> {
+    this.journalOptions.push(options);
+    const step = this.step();
+    this.index += 1;
+    return step.page;
+  }
+}
+
+/** A tail page that fails a coverage guard on every generation. */
+const behindPage: PublicJournalPage = { journal_tip: 4, covered_through: 4, events: [] };
+
 async function factoryNext(gen: AsyncGenerator<FactoryJoinEvent>): Promise<FactoryJoinEvent> {
   const next = await gen.next();
   if (next.done) throw new Error("factory join ended unexpectedly");
@@ -378,6 +425,16 @@ describe("joinFactorySessionView", () => {
     expect(reads.journalOptions).toStrictEqual([]);
 
     link.publish(publication(5));
+    // The synchronous assertions above only prove the reads were not issued
+    // SYNCHRONOUSLY; they say nothing about "not before authorization", since
+    // no microtask has drained yet. Drain the microtask queue AND a real timer
+    // with `ready` still pending, so the assertion is about the ordering this
+    // row is named for.
+    for (let drain = 0; drain < 50; drain += 1) await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(reads.statusCalls).toBe(0);
+    expect(reads.journalOptions).toStrictEqual([]);
+
     link.ready.resolve();
     await vi.waitFor(() => expect(reads.statusCalls).toBe(1));
     expect(reads.journalOptions).toMatchObject([{ tail: 3, limit: 3 }]);
@@ -747,6 +804,232 @@ describe("joinFactorySessionView", () => {
     await expect(pending).resolves.toMatchObject({ done: true });
     expect(reads.journalOptions[0]!.signal?.aborted).toBe(true);
     expect(link.unsubscribed).toBe(1);
+  });
+
+  // --- Coverage that stops short of the tip ------------------------------------
+
+  it("repairs a tail page whose coverage stops short of the immutable tip", async () => {
+    // The exact fail-open shape: T comes from `journal_tip` (5) but only
+    // events at or below `covered_through` (2) are attested, and sequence 5
+    // committed BEFORE this join subscribed, so it is in neither the page nor
+    // the prejoin buffer. Measured without the guard: the join rendered
+    // [1, 2, 4], silently dropping public sequence 5, and the next live
+    // publication walked the durable cursor over it to 6 — a transcript
+    // missing an event plus a persisted claim that it was covered.
+    const generation1 = new FakeFactoryReads();
+    const generation2 = new ScriptedFactoryReads([{
+      status: factoryStatus(5),
+      page: { journal_tip: 5, covered_through: 5, events: [publicEvent(1), publicEvent(2), publicEvent(4), publicEvent(5)] },
+    }]);
+    let read = 0;
+    const reads: FactoryJoinReads = {
+      readStatus: (...args) => (read === 0 ? generation1 : generation2).readStatus(...args),
+      readJournal: (...args) => (read++ === 0 ? generation1 : generation2).readJournal(...args),
+    };
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { repairDelayMs: 0 });
+    const first = gen.next();
+    await vi.waitFor(() => expect(generation1.statusCalls).toBe(1));
+    link.links[0]!.publish(publication(4));
+    generation1.status.resolve(factoryStatus(5));
+    generation1.journal.resolve({ journal_tip: 5, covered_through: 2, events: [publicEvent(1), publicEvent(2)] });
+
+    // Nothing at all is emitted from the doomed generation: the first update a
+    // consumer ever sees is generation 2's projection. Asserted BEFORE pulling
+    // the rest, so the unguarded behaviour fails on this line rather than by
+    // waiting out a timeout for a fifth update that never arrives.
+    expect(await factoryResult(first)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 0 });
+    const events = [await factoryNext(gen), await factoryNext(gen), await factoryNext(gen), await factoryNext(gen)];
+    expect(events.map((event) => event.generation)).toStrictEqual([2, 2, 2, 2]);
+    expect(events.map((event) => event.kind)).toStrictEqual(["public", "public", "public", "public"]);
+    expect(events.filter((event): event is Extract<FactoryJoinEvent, { kind: "public" }> => event.kind === "public")
+      .map((event) => event.event.journal_seq))
+      .toStrictEqual([1, 2, 4, 5]);
+    expect(link.links[0]!.unsubscribed).toBe(1);
+    await gen.return();
+  });
+
+  it("repairs when the projection and the tail page disagree about the tip", async () => {
+    const reads = new ScriptedFactoryReads([
+      { status: factoryStatus(6), page: { journal_tip: 5, covered_through: 5, events: [] } },
+      { status: factoryStatus(5), page: { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] } },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { repairDelayMs: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 5 });
+    await gen.return();
+  });
+
+  it("repairs a tail page whose coverage is behind the committed cursor", async () => {
+    const reads = new ScriptedFactoryReads([
+      { status: factoryStatus(3), page: { journal_tip: 3, covered_through: 3, events: [] } },
+      { status: factoryStatus(5), page: { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] } },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 4,
+      repairDelayMs: 0,
+    });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 4 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 5 });
+    await gen.return();
+  });
+
+  it("repairs a live publication at a sequence the page watermark already covered", async () => {
+    // Sequence 3 was withheld as private (the page bridges it via
+    // `covered_through`) and then arrives live as a public record. Applying it
+    // would move the durable cursor BACKWARD from 5 to 3.
+    const reads = new ScriptedFactoryReads([
+      { status: factoryStatus(5), page: { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] } },
+      { status: factoryStatus(5), page: { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] } },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { repairDelayMs: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 1, coveredThrough: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 1, coveredThrough: 5 });
+    const next = gen.next();
+    link.links[0]!.publish(publication(3));
+    expect(await factoryResult(next)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 5 });
+    expect(link.links[0]!.unsubscribed).toBe(1);
+    await gen.return();
+  });
+
+  // --- Bounded repair ----------------------------------------------------------
+
+  it("lowers the committed cursor to a truncating reset's last_contiguous", async () => {
+    // The direction that livelocks without this: the session truncated behind
+    // the persisted cursor, so every page the replacement generation reads
+    // reports LESS coverage than the cursor demands and repairs again forever.
+    const reads = new ScriptedFactoryReads([
+      { status: factoryStatus(5), page: { journal_tip: 5, covered_through: 5, events: [] } },
+      { status: factoryStatus(3), page: { journal_tip: 3, covered_through: 3, events: [publicEvent(3)] } },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 5,
+      maxRepairAttempts: 2,
+      repairDelayMs: 0,
+    });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 1, coveredThrough: 5 });
+    const repairing = gen.next();
+    link.links[0]!.reset({
+      type: "session.reset", tenant_id: "tenant-1", session_id: "session-1", last_contiguous: 2, journal_tip: 2,
+    });
+    expect(await factoryResult(repairing)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 2 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 3 });
+    await gen.return();
+  });
+
+  it("repairs a reset for another session without moving the committed cursor", async () => {
+    const reads = new ScriptedFactoryReads([
+      { status: factoryStatus(5), page: { journal_tip: 5, covered_through: 5, events: [] } },
+      { status: factoryStatus(5), page: { journal_tip: 5, covered_through: 5, events: [] } },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 5,
+      maxRepairAttempts: 2,
+      repairDelayMs: 0,
+    });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 1, coveredThrough: 5 });
+    const repairing = gen.next();
+    link.links[0]!.reset({
+      type: "session.reset", tenant_id: "tenant-2", session_id: "session-9", last_contiguous: 0, journal_tip: 0,
+    });
+    expect(await factoryResult(repairing)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 5 });
+    await gen.return();
+  });
+
+  it("yields a macrotask on every repair, so a timer-driven abort can still run", async () => {
+    // The reviewer's probe shape: a persisted cursor ahead of this Factory's
+    // coverage repairs on every attempt. Every await in the loop resolves as a
+    // microtask, so without a real timer in the cycle the loop never reaches
+    // the timer queue and `controller.abort()` below never runs at all — the
+    // measured behaviour was a worker that hung until it was killed, with the
+    // runner's own test timeout never firing. `maxRepairAttempts` is set high
+    // enough that the CAP is not what ends this: if the abort is unreachable
+    // the join gives up and this rejects, rather than passing for the wrong
+    // reason.
+    const reads = new ScriptedFactoryReads([{ status: factoryStatus(4), page: behindPage }]);
+    const link = new ScriptedFactoryLink();
+    const controller = new AbortController();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 40,
+      maxRepairAttempts: 1000,
+      repairDelayMs: 0,
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 0);
+    await expect(gen.next()).resolves.toMatchObject({ done: true });
+    expect(link.links.length).toBeLessThan(1000);
+  });
+
+  it("keeps repairing at the configured attempt threshold", async () => {
+    const reads = new ScriptedFactoryReads([
+      { status: factoryStatus(4), page: behindPage },
+      { status: factoryStatus(4), page: behindPage },
+      { status: factoryStatus(41), page: { journal_tip: 41, covered_through: 41, events: [] } },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 40,
+      maxRepairAttempts: 2,
+      repairDelayMs: 0,
+    });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 3, coveredThrough: 40 });
+    expect(link.links).toHaveLength(3);
+    await gen.return();
+  });
+
+  it("gives up one repair past the configured attempt threshold", async () => {
+    const reads = new ScriptedFactoryReads([{ status: factoryStatus(4), page: behindPage }]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 40,
+      maxRepairAttempts: 2,
+      repairDelayMs: 0,
+    });
+    // Raced against a timer rather than awaited outright, so an unbounded loop
+    // fails THIS assertion in milliseconds instead of running until the test
+    // runner's own timeout expires.
+    const outcome = await Promise.race([
+      gen.next().then(() => "resolved" as const, (error: unknown) => String(error)),
+      new Promise<string>((resolve) => { setTimeout(() => resolve("still repairing"), 50); }),
+    ]);
+    expect(outcome).toMatch(/gave up after 3 consecutive repairs without coverage progress/);
+    expect(link.links).toHaveLength(3);
+    expect(link.links.every((entry) => entry.unsubscribed === 1)).toBe(true);
+  });
+
+  it("does not charge a repair that advanced coverage against the attempt cap", async () => {
+    // Three generations, each of which applies a real event and is then forced
+    // to repair by a conflicting resend. A counter that ignored progress would
+    // give up at the second repair; a legitimate slow recovery must not be.
+    const reads = new ScriptedFactoryReads([
+      { status: factoryStatus(5), page: { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] } },
+      { status: factoryStatus(6), page: { journal_tip: 6, covered_through: 6, events: [publicEvent(6)] } },
+      { status: factoryStatus(7), page: { journal_tip: 7, covered_through: 7, events: [publicEvent(7)] } },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      maxRepairAttempts: 1,
+      repairDelayMs: 0,
+    });
+    const applied: number[] = [];
+    let event = await factoryNext(gen);
+    for (const [index, seq] of [5, 6].entries()) {
+      expect(event).toMatchObject({ kind: "projection", generation: index + 1 });
+      expect(await factoryNext(gen)).toMatchObject({ kind: "public", coveredThrough: seq });
+      applied.push(seq);
+      const pending = gen.next();
+      link.links[index]!.publish(publication(seq, "conflicting-event"));
+      event = await factoryResult(pending);
+    }
+    expect(applied).toStrictEqual([5, 6]);
+    expect(event).toMatchObject({ kind: "projection", generation: 3, coveredThrough: 6 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 3, coveredThrough: 7 });
+    await gen.return();
   });
 });
 
