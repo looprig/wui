@@ -32,15 +32,23 @@ import * as protocol from "../src/index.js";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const workspaceRoot = resolve(packageRoot, "../..");
-const forbiddenPackageRoots = new Set([
-  "@looprig/harness",
-  "@looprig/react",
-  "@looprig/svelte",
-  "harness",
-  "react",
-  "react-dom",
-  "svelte",
-]);
+// An ALLOWLIST, not a denylist of framework package roots. The invariant this
+// file guards is not "no React" but design §1's "zero framework deps", and only
+// an allowlist states that: anything not named here is a violation, so a package
+// enters the public module graph by being added on purpose or not at all.
+//
+// The denylist this replaced was already stale on the day it was written -- it
+// named `svelte` but not `@sveltejs/kit` or any other `@sveltejs/*` entry point,
+// which are as Svelte as `svelte` is -- and it would have silently admitted
+// `centrifuge` the moment the transport spike approved it, which is the opposite
+// of a review. A denylist has to be extended for every framework that will ever
+// exist; this list has to be extended for every dependency this package takes.
+//
+// This is not maintained by hand against package.json: the "has no framework
+// dependencies" test asserts this set and the manifest's `dependencies` keys are
+// the SAME set, in both directions, so admitting a package here without
+// declaring it (or declaring one without admitting it) fails.
+const allowedPackageRoots = new Set(["ajv", "json-schema-to-ts"]);
 
 function packageRootOf(specifier: string): string {
   const parts = specifier.split("/");
@@ -66,6 +74,26 @@ function moduleSpecifiers(sourcePath: string): string[] {
     } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
       const [argument] = node.arguments;
       if (argument !== undefined && ts.isStringLiteral(argument)) found.push(argument.text);
+    } else if (ts.isImportTypeNode(node)) {
+      // `type X = import("react").ReactNode` -- an import that appears in the
+      // TYPE position and has no import statement at all. This is the form a
+      // framework dependency is most likely to arrive in here, because these
+      // DTOs are type-level, and it was invisible to the first version of this
+      // walker: the whole test passed with `import("react").ReactNode` sitting
+      // in src/types.ts. Nothing else caught it either. The packed-consumer
+      // test happened to fail, but only because that fixture does not install
+      // React's types -- a reason that evaporates for any forbidden package
+      // whose types a consumer already has transitively.
+      if (ts.isLiteralTypeNode(node.argument) && ts.isStringLiteral(node.argument.literal)) {
+        found.push(node.argument.literal.text);
+      }
+    } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
+      // `import x = require("react")`. Not reachable from this package's own
+      // sources (ESM + isolatedModules), but the walker's job is to describe
+      // the language, not this month's source tree.
+      if (ts.isStringLiteral(node.moduleReference.expression)) {
+        found.push(node.moduleReference.expression.text);
+      }
     }
     ts.forEachChild(node, visit);
   };
@@ -90,7 +118,7 @@ function forbiddenImports(entrypoint: string): string[] {
     for (const specifier of moduleSpecifiers(current)) {
       if (specifier.startsWith(".")) {
         pending.push(resolveRelativeModule(current, specifier));
-      } else if (forbiddenPackageRoots.has(packageRootOf(specifier))) {
+      } else if (!allowedPackageRoots.has(packageRootOf(specifier))) {
         violations.push(`${relative(dirname(entrypoint), current)} -> ${specifier}`);
       }
     }
@@ -237,8 +265,13 @@ describe("@looprig/protocol public surface", () => {
     ) as { dependencies?: Record<string, string>; scripts?: Record<string, string> };
     // design §1: "Zero framework deps. A Vue or Solid author installs that one
     // package." That is the package's whole reason to exist.
-    expect(Object.keys(manifest.dependencies ?? {}).sort()).toStrictEqual(["ajv", "json-schema-to-ts"]);
     expect(manifest.dependencies).toStrictEqual({ ajv: "8.20.0", "json-schema-to-ts": "3.1.1" });
+    // The import allowlist and the declared dependencies are one fact stated
+    // twice, so assert them equal in BOTH directions rather than asserting a
+    // second hand-written list. An entry admitted to the allowlist but never
+    // declared is an undeclared runtime import; a dependency declared but not
+    // admitted is dead weight in every consumer's install.
+    expect([...allowedPackageRoots].sort()).toStrictEqual(Object.keys(manifest.dependencies ?? {}).sort());
     expect(manifest.scripts?.prepack).toBe(
       "npm run build && npm run typecheck && npm run test:package",
     );
@@ -286,6 +319,27 @@ describe("@looprig/protocol public surface", () => {
         "index.ts": 'import type { Readable } from "svelte/store"; export type Public = Readable<string>;\n',
       },
       want: "index.ts -> svelte/store",
+    },
+    {
+      name: "inline import() type",
+      files: {
+        "index.ts": 'export type Public = import("react").ReactNode;\n',
+      },
+      want: "index.ts -> react",
+    },
+    {
+      name: "import-equals require",
+      files: {
+        "index.ts": 'import react = require("react");\nexport const r = react;\n',
+      },
+      want: "index.ts -> react",
+    },
+    {
+      name: "scoped SvelteKit import a framework denylist would have missed",
+      files: {
+        "index.ts": 'import { error } from "@sveltejs/kit"; export { error };\n',
+      },
+      want: "index.ts -> @sveltejs/kit",
     },
     {
       name: "transitive Harness re-export",
