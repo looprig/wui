@@ -17,12 +17,34 @@
  * cause is how a permanent exemption is born; retiring an entry is a one-line
  * edit in the commit that fixes the drift.
  *
- * File granularity, not failure counts, and not individual test names: three of
- * the drifted files drive real HTTP servers under timeouts, so their counts
- * vary with the machine. Recording counts would trade a real gate for a flaky
- * one. The cost is honest and stated: a NEW failure inside an already-drifted
- * file is not distinguished from the drift. Nothing that ships to a consumer
- * lives only in those ten files.
+ * TWO floors, because the first version of this script had neither and the
+ * failure its own docstring names came back one level down.
+ *
+ * FLOOR 1 -- WHICH FILES RAN. The script derived `seen`, printed "26 of 36 test
+ * files pass", and asserted NOTHING about it. `git mv test/surface.test.ts
+ * test/surface.spec.ts` puts the file outside vitest.config.ts's
+ * `include: ["test/**\/*.test.ts"]`; the run reports `10 failed | 25 passed
+ * (35)` and this gate exits 0. The entire export-surface guard stops running
+ * and nothing says so. So test/known-drift.json records `suiteFiles`, the full
+ * expected file-NAME set, and any mismatch in either direction fails. Names,
+ * not a count, and names because they are machine-independent -- unlike the
+ * per-test counts inside the three HTTP files.
+ *
+ * FLOOR 2 -- WHICH TESTS FAIL INSIDE A DRIFTED FILE. File granularity alone
+ * means a new failing `it` in an already-drifted file is invisible: a fresh
+ * broken test in test/errors.test.ts took the run to 155 failures and this gate
+ * still exited 0. That is defensible ONLY for the three files that drive real
+ * HTTP servers under timeouts (transport, host-transport-csrf,
+ * serve-transport: 85-90s each, machine-dependent counts) -- and it was applied
+ * to all ten, including seven that run in 3-24ms with counts reproduced
+ * identically across independent runs. So the seven fast files record the exact
+ * SET OF FAILING TEST NAMES plus the total number of tests collected, and the
+ * three slow ones keep file granularity and must say why, per file, in
+ * `granularityReason`. A file may not have both and may not have neither.
+ *
+ * The residual cost, stated: inside the three HTTP files a new failure is still
+ * indistinguishable from the drift, and for the 26 healthy files this script
+ * asserts only that the file ran and passed, not how many tests it contains.
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, mkdtempSync, rmSync } from "node:fs";
@@ -42,7 +64,34 @@ if (vitestBin === undefined) {
   process.exit(1);
 }
 const drift = JSON.parse(readFileSync(join(packageRoot, "test/known-drift.json"), "utf8"));
-const allowed = new Set(drift.files);
+const allowed = new Map(Object.entries(drift.files));
+const suiteFiles = new Set(drift.suiteFiles);
+
+/** Sorted `a` minus `b`. */
+const missingFrom = (a, b) => [...a].filter((item) => !b.has(item)).sort();
+
+// Shape check first: an entry that carries neither a failing-test-name set nor
+// a stated reason for staying file-granular would be a silent downgrade back to
+// the granularity FLOOR 2 exists to end, and it would look like a passing gate.
+for (const [file, entry] of allowed) {
+  const hasNames = Array.isArray(entry.failingTests);
+  const hasReason = typeof entry.granularityReason === "string" && entry.granularityReason.length > 0;
+  if (hasNames === hasReason) {
+    console.error(
+      `\nFAIL: test/known-drift.json entry ${file} must have EXACTLY one of` +
+        ` "failingTests" (the exact set of failing test names) or "granularityReason"` +
+        ` (why this file stays file-granular). It has ${hasNames && hasReason ? "both" : "neither"}.\n`,
+    );
+    process.exit(1);
+  }
+  if (hasNames && typeof entry.tests !== "number") {
+    console.error(
+      `\nFAIL: test/known-drift.json entry ${file} records failing test names but no "tests"` +
+        ` count. Without it a file that stops COLLECTING its passing tests still matches.\n`,
+    );
+    process.exit(1);
+  }
+}
 
 const reportDir = mkdtempSync(join(tmpdir(), "looprig-protocol-drift-"));
 const reportPath = join(reportDir, "vitest.json");
@@ -67,19 +116,43 @@ try {
   const report = JSON.parse(readFileSync(reportPath, "utf8"));
   const failing = new Set();
   const seen = new Set();
+  /** file -> { failed: Set<fullName>, tests: number } */
+  const detail = new Map();
   for (const suite of report.testResults ?? []) {
     const file = relative(packageRoot, suite.name);
     seen.add(file);
     if (suite.status === "failed") failing.add(file);
+    const assertions = suite.assertionResults ?? [];
+    detail.set(file, {
+      failed: new Set(assertions.filter((a) => a.status === "failed").map((a) => a.fullName)),
+      tests: assertions.length,
+    });
   }
 
   const unexpected = [...failing].filter((file) => !allowed.has(file)).sort();
   // An allowed file that is absent from the report is as much a stale entry as
   // one that passes -- a deleted or renamed test file must not keep its
   // exemption alive under a name nothing runs.
-  const recovered = [...allowed].filter((file) => !failing.has(file)).sort();
+  const recovered = [...allowed.keys()].filter((file) => !failing.has(file)).sort();
 
   const lines = [];
+  // FLOOR 1. Before any verdict about failures, assert WHICH FILES RAN. A file
+  // renamed out of vitest.config.ts's include glob, deleted, or added is not a
+  // pass and not a failure -- it is an absence, and an absence is what every
+  // vacuous guard in this repository has looked like.
+  const vanished = missingFrom(suiteFiles, seen);
+  const appeared = missingFrom(seen, suiteFiles);
+  if (vanished.length > 0 || appeared.length > 0) {
+    lines.push(
+      `FAIL: the test files vitest RAN are not the files test/known-drift.json expects` +
+        ` (${seen.size} ran, ${suiteFiles.size} expected):`,
+      ...vanished.map((file) => `  - ${file} (expected, did not run)`),
+      ...appeared.map((file) => `  + ${file} (ran, not expected)`),
+      "A file that stops running stops guarding, silently, and this gate would",
+      "otherwise report OK. Add or remove the name in \"suiteFiles\" in the same",
+      "commit that adds or removes the file.",
+    );
+  }
   if (unexpected.length > 0) {
     lines.push(
       `FAIL: ${unexpected.length} test file(s) failed that the known-drift allowance does not cover:`,
@@ -96,15 +169,45 @@ try {
     );
   }
 
+  // FLOOR 2. Inside each drifted file that is fast and deterministic, the exact
+  // set of failing test names and the number of tests collected. A new failure
+  // is a name not on the list; a suite that stops collecting is a count that
+  // dropped; a fixed test is a name on the list that no longer fails.
+  for (const [file, entry] of allowed) {
+    if (!Array.isArray(entry.failingTests)) continue;
+    const observed = detail.get(file);
+    if (observed === undefined) continue; // already reported by FLOOR 1
+    const expectedFailing = new Set(entry.failingTests);
+    const newlyFailing = missingFrom(observed.failed, expectedFailing);
+    const noLongerFailing = missingFrom(expectedFailing, observed.failed);
+    if (newlyFailing.length > 0 || noLongerFailing.length > 0 || observed.tests !== entry.tests) {
+      lines.push(`FAIL: ${file} does not match its recorded per-test drift:`);
+      if (observed.tests !== entry.tests) {
+        lines.push(
+          `  collected ${observed.tests} test(s); test/known-drift.json records ${entry.tests}.`,
+          `  A file whose tests stop being COLLECTED is the failure this whole gate exists`,
+          `  to catch -- test/sse.test.ts reported "(0 test)" for exactly this reason.`,
+        );
+      }
+      lines.push(
+        ...newlyFailing.map((name) => `  NEW failure, not part of the U0.1 drift: ${name}`),
+        ...noLongerFailing.map((name) => `  recorded as failing but now passes: ${name}`),
+      );
+    }
+  }
+
   if (lines.length > 0) {
     console.error(`\n${lines.join("\n")}\n`);
     process.exit(1);
   }
 
+  const perTest = [...allowed.values()].filter((entry) => Array.isArray(entry.failingTests));
   console.error(
-    `\nOK: every failing test file is covered by test/known-drift.json` +
-      ` (recorded ${drift.recordedOn}, ${allowed.size} files, retire in ${drift.retireIn}).` +
-      `\n     ${seen.size - failing.size} of ${seen.size} test files pass and gate normally.` +
+    `\nOK: all ${suiteFiles.size} expected test files ran.` +
+      `\n     ${seen.size - failing.size} of ${seen.size} pass and gate normally.` +
+      `\n     ${allowed.size} are covered by test/known-drift.json (recorded ${drift.recordedOn},` +
+      ` retire in ${drift.retireIn}), of which ${perTest.length} are gated to an exact` +
+      ` failing-test-name set and ${allowed.size - perTest.length} stay file-granular.` +
       `\n     Reason: ${drift.reason}\n`,
   );
 } finally {
