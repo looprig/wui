@@ -451,11 +451,39 @@ describe("@looprig/protocol public surface", () => {
       expect(installedPackage).not.toContain(workspaceRoot);
       const installedManifest = JSON.parse(
         readFileSync(join(installedPackage, "package.json"), "utf8"),
-      ) as { exports?: { "."?: { types?: string; default?: string } } };
+      ) as {
+        dependencies?: Record<string, string>;
+        exports?: { "."?: { types?: string; default?: string } };
+      };
       expect(installedManifest.exports?.["."]).toStrictEqual({
         types: "./dist/index.d.ts",
         default: "./dist/index.js",
       });
+      // Every declared runtime dependency must arrive for a consumer of the
+      // TARBALL -- which carries none of them; the file list asserted above is
+      // dist/ plus package.json -- at the version the COMMITTED LOCKFILE pins.
+      //
+      // The lockfile half is what makes this more than a tautology. A consumer
+      // resolves the manifest, so "declared version == installed version" holds
+      // for any exact pin, including one typed in by hand. The workspace's own
+      // reproducibility rests on package-lock.json, not on the manifest: the
+      // exact top-level pins say nothing about `centrifuge`'s own ranged
+      // `events ^3.3.0` and `protobufjs ^7.6.0`. A manifest pin moved without
+      // regenerating the lock is the one way the two disagree, and it is the
+      // failure this catches. Derived from the manifest, not a second list.
+      const lockfile = JSON.parse(readFileSync(join(workspaceRoot, "package-lock.json"), "utf8")) as {
+        packages?: Record<string, { version?: string }>;
+      };
+      for (const [name, version] of Object.entries(installedManifest.dependencies ?? {})) {
+        const dependency = JSON.parse(
+          readFileSync(join(consumerDir, "node_modules", name, "package.json"), "utf8"),
+        ) as { version?: string };
+        expect(dependency.version, `${name} did not resolve for a tarball consumer`).toBe(version);
+        expect(
+          lockfile.packages?.[`node_modules/${name}`]?.version,
+          `${name} is pinned to ${version} but the committed lockfile says otherwise`,
+        ).toBe(version);
+      }
       run(join(workspaceRoot, "node_modules/.bin/tsc"), ["-p", "tsconfig.json"], consumerDir);
       run(process.execPath, ["consumer.mjs"], consumerDir);
     } finally {
