@@ -195,6 +195,43 @@ describe("ephemeral coalescing by declared key", () => {
     expect(selectFrameToDrop(frames as never)).toBe(1);
   });
 
+  it("breaks a tie between equally noisy keys toward the OLDEST frame", () => {
+    // Two keys, one frame each. Nothing is noisier than anything else, so the
+    // choice must be the oldest buffered frame — and it must be a choice, not
+    // whichever key the map happened to yield last.
+    expect(selectFrameToDrop([tokenA, toolB] as never)).toBe(0);
+    expect(selectFrameToDrop([toolB, tokenA] as never)).toBe(0);
+  });
+
+  it("keys on the full producing coordinates, not the loop alone", () => {
+    // `header` carries turn and step as well. Two token_deltas from different
+    // STEPS of one loop are different streams, and thinning one must not be
+    // charged to the other.
+    const step = (stepId: string) =>
+      ({
+        type: "ephemeral",
+        data: {
+          kind: "token_delta",
+          delta: { chunk_type: "text", text: "x" },
+          header: { session_id: "s", loop_id: LOOP_A, turn_id: "t-1", step_id: stepId },
+        },
+      }) as never;
+    expect(ephemeralDropKey(step("s-1"))).not.toBe(ephemeralDropKey(step("s-2")));
+    const turn = (turnId: string) =>
+      ({
+        type: "ephemeral",
+        data: {
+          kind: "token_delta",
+          delta: { chunk_type: "text", text: "x" },
+          header: { session_id: "s", loop_id: LOOP_A, turn_id: turnId, step_id: "s-1" },
+        },
+      }) as never;
+    expect(ephemeralDropKey(turn("t-1"))).not.toBe(ephemeralDropKey(turn("t-2")));
+    // ...and the noisiest-key pick follows the full key: two frames of one step
+    // outweigh one frame of another, so the lone frame survives.
+    expect(selectFrameToDrop([step("s-2"), step("s-1"), step("s-1")] as never)).toBe(1);
+  });
+
   it("classifies exactly heartbeat and ephemeral frames as droppable", () => {
     expect(isDroppableFrame(heartbeatFrame())).toBe(true);
     expect(isDroppableFrame(textFrame("a", LOOP_A))).toBe(true);

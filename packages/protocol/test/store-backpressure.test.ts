@@ -34,7 +34,7 @@
  * (the consumer) while its pump keeps relaying, which is exactly the real
  * shape of the problem and is fully deterministic.
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_MAX_QUEUED_FRAMES,
   joinSessionView,
@@ -51,6 +51,7 @@ import {
   errorFrame,
   heartbeatFrame,
   manualScheduler,
+  microtasks,
   pageOf,
   textFrame,
   tick,
@@ -128,6 +129,10 @@ async function parkedJoin(options: Record<string, unknown>, journal?: JournalRea
   // The generator is now suspended at its yield; its pump keeps relaying.
   return { generator, live };
 }
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("joinSessionView: bounded live queue", () => {
   it("drops frames and reports a cumulative, ascending total once over the bound", async () => {
@@ -315,6 +320,7 @@ describe("joinSessionView: bounded live queue", () => {
     // queue and a live connection this test can still push into.
     void generator.next();
     await tick();
+    await tick();
     expect(call).toBe(2);
     for (const seq of [13, 14, 15]) live.push(enduring(seq));
     await tick();
@@ -329,6 +335,124 @@ describe("joinSessionView: bounded live queue", () => {
     releaseSecondRead();
     live.close();
     await tick();
+    void generator.return();
+  });
+
+  it("does not clear repair_required from a cold read that started BEFORE the refusal", async () => {
+    // The read already in flight when the buffer was refused began before it
+    // and cannot have repaired anything, so it must not announce `live`.
+    // Measured before the epoch stamp: this sequence produced
+    // ["repair_required", "live"] off that same page with coldReads === 1.
+    let releaseFirstRead = (): void => {};
+    let coldReads = 0;
+    const journal: JournalReader = {
+      readHistory: async () => {
+        coldReads += 1;
+        if (coldReads > 1) return emptyPage;
+        return new Promise((resolve) => {
+          releaseFirstRead = () => resolve(emptyPage);
+        });
+      },
+    };
+    const states: string[] = [];
+    const live = controllableLive();
+    const generator = joinSessionView(journal, "s1", live.source, {
+      autoReconnect: false,
+      maxQueuedFrames: 2,
+      onBindingState: (state: string) => states.push(state),
+    } as never);
+    const first = generator.next();
+    await tick();
+    // The cold read is HELD. Flood the live buffer underneath it.
+    for (const seq of [10, 11, 12]) live.push(enduring(seq));
+    await tick();
+    expect(states).toStrictEqual(["repair_required"]);
+
+    releaseFirstRead();
+    await expect(first).rejects.toThrow(/cannot be dropped/);
+    expect(coldReads).toBe(1);
+    // The held read returned, and it must NOT have cleared the refusal.
+    expect(states).toStrictEqual(["repair_required"]);
+    await generator.return();
+  });
+
+  it("closes the queue WITH the overflow error, so the consumer's next read rejects", async () => {
+    // Closing without the error is silently different: the follow loop would
+    // read `{done: true}`, which looks like a clean end of connection, and the
+    // error-triggered reconnect delay would not apply.
+    const states: string[] = [];
+    const { generator, live } = await parkedJoin({
+      maxQueuedFrames: 2,
+      onBindingState: (state: string) => states.push(state),
+    });
+    for (const seq of [10, 11, 12]) live.push(enduring(seq));
+    await tick();
+    await expect(generator.next()).rejects.toMatchObject({
+      name: "LiveQueueOverflowError",
+      buffered: 3,
+    });
+    await generator.return();
+  });
+
+  it("rejects a bound that is not a positive safe integer", async () => {
+    // `NaN` is the dangerous one: `items.length > NaN` is always false, so the
+    // queue would never overflow and would grow without limit — the leak the
+    // bound exists to prevent, reached by a typo.
+    for (const bound of [0, -5, 1.5, Number.NaN]) {
+      const generator = joinSessionView(
+        { readHistory: async () => emptyPage },
+        "s1",
+        controllableLive().source,
+        { autoReconnect: false, maxQueuedFrames: bound } as never,
+      );
+      // Raced against a timer rather than awaited: an UNVALIDATED `NaN` bound
+      // parks the join forever instead of rejecting, and a hang is not an
+      // assertion. This turns it into one.
+      const outcome = await Promise.race([
+        generator.next().then(
+          () => "resolved",
+          (error: Error) => error.message,
+        ),
+        new Promise<string>((resolve) => setTimeout(() => resolve("stalled"), 100)),
+      ]);
+      expect(outcome, `bound ${String(bound)}`).toMatch(
+        /maxQueuedFrames must be a positive safe integer/,
+      );
+      void generator.return();
+    }
+  });
+
+  it("waits on a REAL timer before a repair reconnect, even at zero delay", async () => {
+    // Every other await in the repair loop settles as a MICROTASK when the
+    // failure is immediate, so a zero-delay repair drains the microtask queue
+    // forever: a `setTimeout`-driven abort never runs, and the livelock becomes
+    // a hang cancellation cannot break. Measured at `reconnectDelayMs: 0`
+    // before this: a 4 GB heap exhausted in 65 s with the test's own timeout
+    // never firing. `joinFactorySessionView` documents the same hazard.
+    //
+    // Asserted as "a timer was REGISTERED" rather than by observing the
+    // starvation, because observing it is precisely a hang.
+    vi.useFakeTimers();
+    const live = controllableLive();
+    const generator = joinSessionView(
+      { readHistory: async () => emptyPage },
+      "s1",
+      live.source,
+      { autoReconnect: true, reconnectDelayMs: 0, maxQueuedFrames: 2 } as never,
+    );
+    // Park the generator at a yield first, so the flood BUFFERS instead of
+    // being handed straight to a waiting consumer (which never overflows).
+    const first = generator.next();
+    await microtasks();
+    live.push(textFrame("prime", LOOP_A));
+    await first;
+    for (const seq of [10, 11, 12]) live.push(enduring(seq));
+    await microtasks();
+    // Resume: the refused queue rejects and the join reconnects.
+    void generator.next();
+    await microtasks();
+
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
     void generator.return();
   });
 
@@ -494,8 +618,8 @@ describe("SessionViewStore: two simultaneous bindings", () => {
     for (const store of flip ? [peer, overflowing] : [overflowing, peer]) store.start();
     for (let i = 0; i < 10; i++) await tick();
 
-    expect(overflowing.bindingState()).toBe("repair_required");
-    expect(floodedStates).toStrictEqual(["repair_required"]);
+    expect(floodedStates[0]).toBe("repair_required");
+    expect(overflowing.bindingState()).not.toBe("live");
 
     // The peer is not merely un-errored: it is still DELIVERING.
     expect(peer.bindingState()).toBe("live");

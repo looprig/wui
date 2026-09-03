@@ -767,6 +767,14 @@ export interface JoinOptions {
    * binding, so a caller holding several never has to infer which one degraded.
    */
   onBindingState?: (state: BindingState, cause?: LiveQueueOverflowError) => void;
+  /**
+   * Consecutive refused backlogs that move `cursor` nowhere before the join
+   * gives up and throws. Default `DEFAULT_MAX_REFUSAL_REPAIRS`. A refusal after
+   * the cursor advanced resets the count, so a slow-but-progressing recovery is
+   * never cut off. Only consulted when `autoReconnect` is on — without it the
+   * first refusal already ends the join.
+   */
+  maxRepairAttempts?: number;
   /** Aborts the join. Checked between steps; does not preempt an in-flight `readHistory`/live `next()` call already awaited (those should honor their own cancellation, e.g. via `RequestOptions.signal` on the transport call a caller wires up). Also cuts short an in-progress error-triggered reconnect delay. */
   signal?: AbortSignal;
 }
@@ -799,25 +807,58 @@ export async function* joinSessionView(
   const signal = options.signal;
   const autoReconnect = options.autoReconnect ?? false;
   const reconnectDelayMs = options.reconnectDelayMs ?? 250;
-  /** True from a refused-overflow until a later cold read has re-read past it. */
+  // Validated, not merely defaulted. `0` and `-5` make every push overflow, so
+  // with `autoReconnect` the binding would refuse and repair forever; `NaN`
+  // makes `items.length > max` ALWAYS false, so the queue would never overflow AT
+  // ALL and grow without limit — the exact leak this bound exists to prevent,
+  // reached by a typo. `joinFactorySessionView` validates every bound the same
+  // way.
+  const maxQueuedFrames = positiveBound(options.maxQueuedFrames ?? DEFAULT_MAX_QUEUED_FRAMES, "maxQueuedFrames");
+  const maxRepairAttempts = positiveBound(options.maxRepairAttempts ?? DEFAULT_MAX_REFUSAL_REPAIRS, "maxRepairAttempts");
+  /** True from a refused-overflow until a LATER connection's cold read returns. */
   let repairPending = false;
+  /**
+   * Counts connection attempts. A refusal stamps the epoch it happened in, and
+   * only a cold read from a STRICTLY LATER epoch may clear it.
+   *
+   * Without the stamp, `repairPending` was cleared by whatever `readHistory`
+   * returned next — including the read that was ALREADY IN FLIGHT when the
+   * refusal happened, which by definition started before it and cannot have
+   * repaired anything. Measured: a journal whose first cold read is still
+   * pending when the flood overflows announced `["repair_required", "live"]`
+   * off that same page with `coldReads === 1`, and under
+   * `autoReconnect: false` the last thing a consumer was told was `live` on a
+   * binding that had already thrown and would never repair.
+   */
+  let connectionEpoch = 0;
+  let repairEpoch = -1;
+  /** Consecutive refusals that did not move `cursor`, and the cursor at the last one. */
+  let refusalsWithoutProgress = 0;
+  let cursorAtLastRefusal = -1;
 
   for (;;) {
     if (signal?.aborted) return;
+    const epoch = ++connectionEpoch;
 
     // --- Step 1: subscribe live FIRST. Buffering starts the instant liveSource() returns. ---
     const queue = new AsyncQueue<SseFrame, DroppableFrame>({
-      max: options.maxQueuedFrames ?? DEFAULT_MAX_QUEUED_FRAMES,
+      max: maxQueuedFrames,
       isDroppable: isDroppableFrame,
       selectVictim: selectFrameToDrop,
       onDrop: (droppedTotal) => options.onQueueOverflow?.(droppedTotal),
       onIrreducible: (error) => {
         // Only the FIRST transition is announced: `repairPending` is cleared by
-        // the next connection's cold read, not by this callback, so a binding
+        // a LATER connection's cold read, not by this callback, so a binding
         // that overflows again before it has recovered does not re-announce a
         // state it is already in.
         if (repairPending) return;
         repairPending = true;
+        repairEpoch = epoch;
+        // A refusal that did not move the cursor since the last one is no
+        // progress. `cursor` advancing means the repair really did re-read
+        // something, so a slow-but-recovering binding is never cut off.
+        refusalsWithoutProgress = cursor > cursorAtLastRefusal ? 1 : refusalsWithoutProgress + 1;
+        cursorAtLastRefusal = cursor;
         options.onBindingState?.("repair_required", error);
       },
     });
@@ -838,12 +879,16 @@ export async function* joinSessionView(
       for (;;) {
         if (signal?.aborted) return;
         const page = await journal.readHistory(sessionId, { fromJournalSeq: cursor, limit: options.pageLimit });
-        if (repairPending) {
+        if (repairPending && epoch > repairEpoch) {
           // The repair is complete the moment a page comes back for `cursor` —
-          // the last sequence this join actually applied. Announced HERE rather
-          // than after the page's events are yielded, so a consumer that reads
-          // the state alongside the first repaired event sees `live`, and so a
-          // repair whose page happens to be empty still recovers.
+          // the last sequence this join actually applied — on a connection
+          // opened AFTER the refusal. `epoch > repairEpoch` is what makes that
+          // "after" true: a read already in flight when the buffer was refused
+          // started before it and repaired nothing, so it must not clear the
+          // state. Announced before the page's events are yielded, so a
+          // consumer reading the state alongside the first repaired event sees
+          // `live`, and so a repair whose page happens to be empty still
+          // recovers.
           repairPending = false;
           options.onBindingState?.("live");
         }
@@ -929,12 +974,46 @@ export async function* joinSessionView(
 
     if (!autoReconnect) return;
 
+    if (repairPending && refusalsWithoutProgress > maxRepairAttempts) {
+      // A binding that keeps refusing without the cursor ever moving is not
+      // recovering, and repair cannot make it recover: the clearest case is a
+      // source emitting nothing but unparseable frames, where every `error`
+      // frame is undroppable by design and re-reading the journal fixes
+      // nothing at all. Give up by THROWING, exactly as
+      // `joinFactorySessionView` does, so the failure is reported once instead
+      // of flapping forever.
+      throw new Error(
+        `live frame queue refused ${refusalsWithoutProgress} backlogs without journal progress`,
+      );
+    }
+
     if (reconnectAfterError) {
-      // Minimal hot-loop guard for a persistently-failing server — see
-      // `reconnectDelayMs`'s doc comment for why this is a fixed delay, not
-      // a real backoff policy. A clean end (reconnectAfterError === false)
-      // intentionally retries immediately, unchanged from before.
-      await delay(reconnectDelayMs, signal);
+      // Two different delays, because the two failures have different shapes.
+      //
+      // A REFUSAL is a client-side backlog, and repeating it at a fixed cadence
+      // is a flap, not a retry: measured at the default 250 ms against a
+      // producer keeping five undroppable frames in flight per connection, the
+      // binding produced 15 state transitions and 8 overflow errors in two
+      // seconds — ~4 Hz, indefinitely. So consecutive refusals that make no
+      // progress back off by doubling, capped, and are counted out above.
+      //
+      // And a refusal ALWAYS waits on a real timer, including at zero. Every
+      // other await in this loop settles as a MICROTASK when the failure is
+      // immediate, so a zero-delay repair drains the microtask queue forever:
+      // the `setTimeout`-driven abort a caller relies on never runs, which
+      // turns a livelock into a hang cancellation cannot break. Measured at
+      // `reconnectDelayMs: 0`, this loop exhausted a 4 GB heap in 65 s with the
+      // test's own timeout never firing. `joinFactorySessionView` documents the
+      // same hazard; this path used to reintroduce it.
+      if (repairPending) {
+        await macrotaskDelay(refusalBackoffMs(refusalsWithoutProgress, reconnectDelayMs), signal);
+      } else {
+        // Minimal hot-loop guard for a persistently-failing server — see
+        // `reconnectDelayMs`'s doc comment for why this is a fixed delay, not
+        // a real backoff policy. A clean end (reconnectAfterError === false)
+        // intentionally retries immediately, unchanged from before.
+        await delay(reconnectDelayMs, signal);
+      }
       if (signal?.aborted) return;
     }
     // Loop again: liveSource() is called afresh at the top, and the cold walk
@@ -953,6 +1032,18 @@ export async function* joinSessionView(
  * (see the module comment's "Backpressure" section).
  */
 export const DEFAULT_MAX_QUEUED_FRAMES = 512;
+
+/**
+ * Consecutive refusals that move the journal cursor nowhere before the join
+ * gives up and throws. Mirrors `joinFactorySessionView`'s
+ * `maxRepairAttempts` default, and exists for the same reason: repair is a
+ * loop with no natural fixed point, and a binding whose backlog cannot be
+ * repaired away flaps at the reconnect cadence forever.
+ */
+export const DEFAULT_MAX_REFUSAL_REPAIRS = 32;
+
+/** Ceiling on the refusal backoff, as a multiple of `reconnectDelayMs`. */
+const MAX_REFUSAL_BACKOFF_FACTOR = 8;
 
 /**
  * Which buffered frame to evict when the live queue is over its bound, as an
@@ -1036,8 +1127,16 @@ export class LiveQueueOverflowError extends Error {
   }
 }
 
-/** The state of one session binding's live plane. */
-export type BindingState = "live" | "repair_required";
+/**
+ * The state of one session binding's live plane.
+ *
+ * `joinSessionView` produces only `live` and `repair_required` — a running join
+ * is one or the other. `inactive` has no join-level meaning and is never passed
+ * to `JoinOptions.onBindingState`; it is produced by `SessionViewStore` when the
+ * binding stops running at all, so a consumer watching the state channel alone
+ * is not left reading a repair that nothing is still attempting.
+ */
+export type BindingState = "live" | "repair_required" | "inactive";
 
 // --- Internals ------------------------------------------------------------------
 
@@ -1062,6 +1161,35 @@ function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
       },
       { once: true },
     );
+  });
+}
+
+/**
+ * Zero for the first refusal after progress; from the second consecutive
+ * non-progressing refusal onward, `base` doubling per attempt and capped at
+ * eight times base. The same shape as `joinFactorySessionView`'s
+ * `repairBackoffMs`, for the same reason.
+ */
+function refusalBackoffMs(consecutiveRefusals: number, base: number): number {
+  if (consecutiveRefusals <= 1) return 0;
+  const bounded = base > 0 ? base : 0;
+  return bounded * Math.min(2 ** (consecutiveRefusals - 2), MAX_REFUSAL_BACKOFF_FACTOR);
+}
+
+/**
+ * Always a real timer, even at zero, so the repair loop reaches the MACROTASK
+ * queue and a `setTimeout`-driven abort can actually run. `delay()` above
+ * deliberately skips the timer at `ms <= 0`; this one deliberately does not.
+ */
+function macrotaskDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms > 0 ? ms : 0);
+    signal?.addEventListener("abort", done, { once: true });
   });
 }
 

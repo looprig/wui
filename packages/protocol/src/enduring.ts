@@ -709,9 +709,6 @@ export function rejectReasonText(reason: number): string {
  */
 export type DroppableFrame = Extract<SseFrame, { type: "heartbeat" } | { type: "ephemeral" }>;
 
-/** The frames a bounded queue must refuse to drop. */
-export type DurableFrame = Exclude<SseFrame, DroppableFrame>;
-
 /** The one narrowing predicate. Everything not named here is durable. */
 export function isDroppableFrame(frame: SseFrame): frame is DroppableFrame {
   return frame.type === "heartbeat" || frame.type === "ephemeral";

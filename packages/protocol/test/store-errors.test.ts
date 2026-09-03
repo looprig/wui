@@ -225,6 +225,7 @@ describe("SessionViewStore: binding state", () => {
   it("transitions to repair_required when the enduring backlog cannot be evicted", async () => {
     const { store } = floodedStore({
       liveSource: burstOf([enduring(1), enduring(2), enduring(3), enduring(4), enduring(5)]),
+      join: { autoReconnect: false },
     });
     const states: string[] = [];
     store.subscribeBindingState((state) => states.push(state));
@@ -232,12 +233,60 @@ describe("SessionViewStore: binding state", () => {
     store.subscribeErrors(onError);
     store.start();
     for (let i = 0; i < 6; i++) await tick();
-    expect(store.bindingState()).toBe("repair_required");
-    expect(states).toStrictEqual(["repair_required"]);
-    // Announced on the error channel too: a repair the user cannot see is
-    // indistinguishable from a session that quietly stopped catching up.
+    // With `autoReconnect` off the refusal is terminal, so the binding reports
+    // the repair AND then that nothing is still attempting it.
+    expect(states).toStrictEqual(["repair_required", "inactive"]);
+    expect(store.bindingState()).toBe("inactive");
+    expect(store.isActive()).toBe(false);
+    // Surfaced on the error channel too — a repair the user cannot see is
+    // indistinguishable from a session that quietly stopped catching up — and
+    // exactly ONCE, not once as an echo and again as the fatal join failure.
+    expect(onError).toHaveBeenCalledTimes(1);
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({ name: "LiveQueueOverflowError" }));
+  });
+
+  it("damps the error echo while the state channel keeps reporting every flap", async () => {
+    // A backlog that repair cannot fix re-enters the episode once per
+    // reconnect. The STATE must keep telling the truth about that; the error
+    // channel must not turn it into a notification storm on an already
+    // overloaded main thread.
+    const { store } = floodedStore({
+      liveSource: () => burstOf([enduring(1), enduring(2), enduring(3), enduring(4), enduring(5)])(),
+      join: { autoReconnect: true, reconnectDelayMs: 0, maxRepairAttempts: 64 },
+    });
+    const states: string[] = [];
+    store.subscribeBindingState((state) => states.push(state));
+    const onError = vi.fn();
+    store.subscribeErrors(onError);
+    store.start();
+    for (let i = 0; i < 40; i++) await tick();
+
+    const episodes = states.filter((state) => state === "repair_required").length;
+    const overflows = onError.mock.calls.filter(
+      ([error]) => (error as Error).name === "LiveQueueOverflowError",
+    ).length;
+    expect(episodes).toBeGreaterThan(2);
+    // Doubling schedule: the 1st, 2nd, 4th, 8th ... episode, so strictly fewer
+    // reports than episodes the moment there are more than two.
+    expect(overflows).toBeGreaterThan(0);
+    expect(overflows).toBeLessThan(episodes);
     store.stop();
+  });
+
+  it("gives up instead of flapping forever when repair moves the cursor nowhere", async () => {
+    const { store } = floodedStore({
+      liveSource: () => burstOf([enduring(1), enduring(2), enduring(3), enduring(4), enduring(5)])(),
+      join: { autoReconnect: true, reconnectDelayMs: 0, maxRepairAttempts: 2 },
+    });
+    const onError = vi.fn();
+    store.subscribeErrors(onError);
+    store.start();
+    for (let i = 0; i < 40; i++) await tick();
+    expect(store.isActive()).toBe(false);
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining("without journal progress") }),
+    );
+    expect(store.bindingState()).toBe("inactive");
   });
 
   it("a repair does NOT stop the join and does not fabricate view state", async () => {
@@ -257,16 +306,17 @@ describe("SessionViewStore: binding state", () => {
   it("re-arms to live on a restart", async () => {
     const { store } = floodedStore({
       liveSource: burstOf([enduring(1), enduring(2), enduring(3), enduring(4), enduring(5)]),
+      join: { autoReconnect: false },
     });
     const states: string[] = [];
     store.subscribeBindingState((state) => states.push(state));
     store.subscribeErrors(() => {});
     store.start();
     for (let i = 0; i < 6; i++) await tick();
-    expect(states).toStrictEqual(["repair_required"]);
-    store.stop();
+    expect(states).toStrictEqual(["repair_required", "inactive"]);
     store.start();
-    expect(states).toStrictEqual(["repair_required", "live"]);
+    expect(states).toStrictEqual(["repair_required", "inactive", "live"]);
+    expect(store.bindingState()).toBe("live");
     store.stop();
   });
 
@@ -280,8 +330,11 @@ describe("SessionViewStore: binding state", () => {
     store.subscribeBindingState((state) => states.push(state));
     store.stop();
     for (let i = 0; i < 6; i++) await tick();
-    expect(states).toStrictEqual([]);
-    expect(store.bindingState()).toBe("live");
+    // `stop()` itself is a real transition and is announced. What must NOT
+    // arrive is the refusal from the join the stop superseded.
+    expect(states).toStrictEqual(["inactive"]);
+    expect(states).not.toContain("repair_required");
+    expect(store.bindingState()).toBe("inactive");
   });
 
   it("unsubscribing stops binding-state delivery", async () => {
@@ -297,6 +350,20 @@ describe("SessionViewStore: binding state", () => {
     expect(states).toStrictEqual([]);
     expect(store.bindingState()).toBe("repair_required");
     store.stop();
+  });
+
+  it("does not leave a stopped binding reporting a repair nothing is attempting", async () => {
+    const { store } = floodedStore({
+      liveSource: burstOf([enduring(1), enduring(2), enduring(3), enduring(4), enduring(5)]),
+    });
+    store.subscribeErrors(() => {});
+    store.start();
+    for (let i = 0; i < 6; i++) await tick();
+    expect(store.bindingState()).toBe("repair_required");
+    store.stop();
+    // A badge wired to this channel ALONE must not read "repairing" forever on
+    // a store that is not running.
+    expect(store.bindingState()).toBe("inactive");
   });
 });
 

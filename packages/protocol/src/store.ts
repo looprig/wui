@@ -261,6 +261,21 @@ export class SessionViewStore {
    * cold read has come back from the last committed sequence.
    */
   private binding: BindingState = "live";
+  /**
+   * Repair episodes so far, and the next one worth echoing on the error
+   * channel. Reported on the SAME doubling schedule `nextOverflowReport` uses —
+   * the 1st, 2nd, 4th, 8th episode — and for the same reason.
+   *
+   * The transitions themselves are NOT damped: a flapping binding really is
+   * flapping, and a state channel that lied about it would be worse than
+   * noisy. What is damped is the error-channel echo, because a binding whose
+   * backlog cannot be repaired away re-enters the episode once per reconnect,
+   * and an unthrottled echo of that is a notification storm on an already
+   * overloaded main thread. Measured before this: 8 `LiveQueueOverflowError`s
+   * in two seconds at the default reconnect cadence.
+   */
+  private repairEpisodes = 0;
+  private nextRepairReport = 1;
 
   constructor(options: SessionViewStoreOptions) {
     this.options = options;
@@ -346,12 +361,20 @@ export class SessionViewStore {
    *
    * `repair_required` is ALSO announced on `subscribeErrors` as a
    * `LiveQueueOverflowError`, because a repair a user cannot see is
-   * indistinguishable from a session that quietly stopped catching up. It
-   * cannot storm: the echo is gated on the TRANSITION, and the join announces
-   * `repair_required` at most once per repair episode — a second refusal before
-   * the repairing cold read has returned is suppressed, which is pinned by
-   * test/store-backpressure.test.ts's "announces repair_required ONCE across
-   * two overflows with no repair in between".
+   * indistinguishable from a session that quietly stopped catching up.
+   *
+   * THIS CHANNEL FLAPS, and a consumer must expect it to. A binding whose
+   * backlog cannot be repaired away re-enters the episode once per reconnect:
+   * measured at the default 250 ms cadence against a producer keeping five
+   * undroppable frames in flight, 15 transitions in two seconds. The join
+   * announcing `repair_required` at most once per EPISODE does not bound that,
+   * because episodes recur — an earlier version of this comment said "it cannot
+   * storm" on exactly that reasoning and was wrong. What bounds it is
+   * elsewhere: `JoinOptions.maxRepairAttempts` counts consecutive refusals that
+   * move the journal cursor nowhere and gives up, and the refusal backoff
+   * doubles in between. The error ECHO is additionally damped on the same
+   * doubling schedule `onQueueOverflow` uses, so the notification cost stays
+   * logarithmic even while the state channel keeps telling the truth.
    */
   subscribeBindingState(listener: (state: BindingState) => void): () => void {
     this.bindingListeners.add(listener);
@@ -396,7 +419,8 @@ export class SessionViewStore {
       this.stalePublication = false;
     }
     this.nextOverflowReport = 1;
-    this.setBindingState("live");
+    this.repairEpisodes = 0;
+    this.nextRepairReport = 1;
     const generation = ++this.generation;
 
     const abortController = new AbortController();
@@ -444,7 +468,16 @@ export class SessionViewStore {
           // The error echo is gated on the TRANSITION, never on a repeat of a
           // state already held, so it cannot storm on a binding that is already
           // repairing.
-          if (this.setBindingState(state) && cause !== undefined) this.emitError(cause);
+          if (!this.setBindingState(state) || cause === undefined) return;
+          // Echoed only when the join will SWALLOW the refusal. With
+          // `autoReconnect` off it does not: the same error object propagates
+          // out of the generator and the pump's own catch surfaces it, so
+          // echoing here too would deliver one failure twice.
+          if (!(this.options.join?.autoReconnect ?? true)) return;
+          this.repairEpisodes += 1;
+          if (this.repairEpisodes < this.nextRepairReport) return;
+          this.nextRepairReport = this.repairEpisodes * 2;
+          this.emitError(cause);
         },
       },
     );
@@ -519,6 +552,13 @@ export class SessionViewStore {
   private setActive(active: boolean): void {
     if (this.active === active) return;
     this.active = active;
+    // The binding state follows liveness, because a state that outlives the
+    // join it describes is stale by construction: before this, a store that
+    // stopped while repairing reported `repair_required` forever, and a badge
+    // wired to `subscribeBindingState` alone had no way to know nothing was
+    // still repairing. `isActive()` disambiguated it, but only for a consumer
+    // that knew to combine the two channels.
+    this.setBindingState(active ? "live" : "inactive");
     for (const listener of [...this.lifecycleListeners]) listener(active);
   }
 
