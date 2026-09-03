@@ -23,7 +23,7 @@
  *
  * Reading a retained tool-result object lives in `tool-capture.ts`; it is a
  * user-initiated, bounded, authorized Factory read and shares nothing with
- * request-block construction but this file's former name.
+ * request-block construction but the file they used to share.
  */
 
 /**

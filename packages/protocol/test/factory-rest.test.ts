@@ -319,12 +319,16 @@ describe("FactoryRestReads bounded object ranges", () => {
   });
 
   // The response bound is DERIVED from the inclusive range, so the only way to
-  // ask for an illegal number of bytes is to describe an illegal range. Each
-  // row breaks exactly one of the retained conditions: a non-integer or
+  // ask for an illegal number of bytes is to describe an illegal range. The
+  // rows cover: a start that is not a safe integer even though the derived
+  // length is (1e-17 rounds away in `end - start + 1`, so the start guard is
+  // the SOLE check that rejects it — `{ start: 1.5, end: 3 }` does not isolate
+  // it, because 2.5 is not a safe integer either), a non-integer start, a
   // negative start, an end below the start, a non-safe-integer end, and a range
   // whose LENGTH leaves the safe-integer domain even though both endpoints are
   // inside it (0..MAX_SAFE_INTEGER is MAX_SAFE_INTEGER + 1 bytes).
   it.each([
+    { start: 1e-17, end: 5 },
     { start: 1.5, end: 3 },
     { start: -1, end: 3 },
     { start: 3, end: 2 },

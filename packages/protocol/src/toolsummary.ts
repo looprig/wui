@@ -86,11 +86,10 @@ export interface ToolResultCaptureSummary {
    * is DERIVED, not declared: no field on the wire carries a ceiling and this
    * decoder reads none, so it is equal to `capturedBytes` by construction and
    * is a LOWER BOUND on whatever ceiling a producer actually applied, never
-   * the ceiling itself. A producer that stops at its ceiling and then trims
-   * back to a whole UTF-8 rune (`encoding` is `"utf-8"` as often as
-   * `"binary"`) emits strictly fewer bytes than its ceiling. No harness
-   * producer emits `truncation_reason: "capture_ceiling"` today, so against
-   * every current producer this is `undefined`.
+   * *known* to be the ceiling — no better than a lower bound. A producer that
+   * stops at its ceiling and then trims back to a whole UTF-8 rune (`encoding`
+   * is `"utf-8"` as often as `"binary"`) emits strictly fewer bytes than its
+   * ceiling.
    */
   capturedBytesAtCeiling: number | undefined;
   truncated: boolean;

@@ -11,6 +11,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import * as protocol from "../src/index.js";
 import {
   CSRFRejectedError,
   errorFromResponse,
@@ -21,6 +22,10 @@ import {
   LooprigError,
   OriginNotAllowedError,
   SessionNotFoundError,
+  ToolCaptureError,
+  ToolCaptureIntegrityError,
+  ToolCaptureTooLargeError,
+  ToolCaptureUnavailableError,
   UnknownLooprigError,
 } from "../src/errors.js";
 import { validateBFFErrorResponse, validateErrorResponse } from "../src/validate.js";
@@ -147,5 +152,46 @@ describe("errorFromResponse forward compatibility", () => {
     expect(err).toBeInstanceOf(LooprigError);
     expect(err.code).toBe("some_future_code");
     expect(err.retryable).toBe(true);
+  });
+});
+
+describe("the retained-tool-capture read errors are one catchable family without losing their identities", () => {
+  // The membership list is DERIVED from the barrel, not typed out here: a
+  // guard that names its own subjects cannot fail for a subject that did not
+  // exist when it was written, and the whole point of the base class is the
+  // FOURTH capture error someone adds later. Anything exported as
+  // `ToolCapture*Error` other than the base must be in the family.
+  const family = Object.entries(protocol).filter(
+    ([name, value]) => /^ToolCapture.+Error$/.test(name) && typeof value === "function" && value !== ToolCaptureError,
+  ) as Array<[string, new () => Error]>;
+
+  it("covers every exported capture error, and is not vacuous", () => {
+    expect(family.map(([name]) => name).sort()).toStrictEqual([
+      "ToolCaptureIntegrityError",
+      "ToolCaptureTooLargeError",
+      "ToolCaptureUnavailableError",
+    ]);
+  });
+
+  it.each(family)("%s is catchable as ToolCaptureError and as Error, but is not a LooprigError", (_name, ctor) => {
+    const err = new ctor();
+    expect(err).toBeInstanceOf(ToolCaptureError);
+    expect(err).toBeInstanceOf(Error);
+    // These are decided client-side and carry no server error envelope, so
+    // `LooprigError`'s `code`/`retryable`/`status`/`body` would all be lies.
+    expect(err).not.toBeInstanceOf(LooprigError);
+    expect(err.message).not.toBe("");
+  });
+
+  it("keeps the three mutually distinguishable, which is what the shared base must not cost", () => {
+    // `ToolCaptureUnavailableError` was split out of `ToolCaptureIntegrityError`
+    // precisely so a missing object is not read as untrusted bytes; a base class
+    // that collapsed that discrimination would undo the split.
+    expect(new ToolCaptureUnavailableError()).not.toBeInstanceOf(ToolCaptureIntegrityError);
+    expect(new ToolCaptureIntegrityError()).not.toBeInstanceOf(ToolCaptureUnavailableError);
+    expect(new ToolCaptureTooLargeError()).not.toBeInstanceOf(ToolCaptureIntegrityError);
+    expect(new ToolCaptureIntegrityError()).not.toBeInstanceOf(ToolCaptureTooLargeError);
+    expect(new ToolCaptureUnavailableError()).not.toBeInstanceOf(ToolCaptureTooLargeError);
+    expect(new ToolCaptureTooLargeError()).not.toBeInstanceOf(ToolCaptureUnavailableError);
   });
 });

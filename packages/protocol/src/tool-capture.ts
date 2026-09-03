@@ -65,6 +65,8 @@ export async function readToolCapturePages(
   if (!Number.isSafeInteger(options.ceilingBytes) || options.ceilingBytes < 0) {
     throw new RangeError("tool capture ceilingBytes must be a non-negative safe integer");
   }
+  // Split into three guards, not collapsed into one `if`, so each bound has a
+  // sole killer: a mutation to any one of them fails a test of its own.
   if (!Number.isSafeInteger(options.pageBytes)) {
     throw new RangeError("tool capture pageBytes must be a positive safe integer within ceilingBytes");
   }

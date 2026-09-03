@@ -301,11 +301,24 @@ export class LiveConnectionError extends Error {
 }
 
 /**
+ * Base class for every failure of an explicit retained-tool-result read.
+ *
+ * It extends `Error` rather than `LooprigError` because none of these carry a
+ * server error envelope — like `RequestAbortedError`, `NetworkError` and
+ * `MalformedResponseError`, they are decided client-side. It exists so a UI
+ * can catch "the capture read failed" as a family; without it a handler must
+ * name all three subclasses and a fourth added later would silently escape
+ * every such handler. The subclasses stay separately catchable: this is an
+ * ADDITIONAL discrimination, not a replacement for `instanceof` on them.
+ */
+export abstract class ToolCaptureError extends Error {}
+
+/**
  * Thrown when a retained tool result is LARGER than the ceiling the caller
  * declared for this read. An explicit refusal before any object I/O, not a
  * failure of the object.
  */
-export class ToolCaptureTooLargeError extends Error {
+export class ToolCaptureTooLargeError extends ToolCaptureError {
   constructor() {
     super("retained tool result exceeds the requested read ceiling");
     this.name = "ToolCaptureTooLargeError";
@@ -324,9 +337,9 @@ export class ToolCaptureTooLargeError extends Error {
  * indistinguishable from the check that would have caught its absence one
  * request later.
  */
-export class ToolCaptureIntegrityError extends Error {
-  constructor(detail = "retained tool result failed integrity verification") {
-    super(detail);
+export class ToolCaptureIntegrityError extends ToolCaptureError {
+  constructor() {
+    super("retained tool result failed integrity verification");
     this.name = "ToolCaptureIntegrityError";
   }
 }
@@ -338,7 +351,7 @@ export class ToolCaptureIntegrityError extends Error {
  * checked before any request is issued, and deliberately not an integrity
  * failure.
  */
-export class ToolCaptureUnavailableError extends Error {
+export class ToolCaptureUnavailableError extends ToolCaptureError {
   constructor() {
     super("tool result has no retained object");
     this.name = "ToolCaptureUnavailableError";

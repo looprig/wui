@@ -64,9 +64,8 @@ async function sha256Hex(text: string): Promise<string> {
 
 interface CaptureFixture {
   readonly capture: ToolResultCaptureSummary;
-  /** The object's real digest — "" until `computeDigest` has run. */
+  /** The object's real digest, computed from the bytes the doubles serve. */
   readonly digest: string;
-  computeDigest(): Promise<void>;
   reads(overrides?: Partial<FactoryReads>): FactoryReads;
   factory(requests: RecordedRequest[]): FactoryRestReads;
 }
@@ -76,18 +75,21 @@ interface CaptureFixture {
  * produce for it, a `FactoryReads` double, and a real `FactoryRestReads` over a
  * `fetch` double that records what it was asked for.
  *
- * The digest is COMPUTED from the same bytes the doubles serve, in `beforeAll`,
- * rather than pasted in as a constant. Two hand-computed SHA-256 literals used
- * to sit here; both were correct, which is exactly the problem — a reader
- * cannot check them, and the first payload someone adds with a wrong one fails
- * as a confusing `ToolCaptureIntegrityError` about the code under test. The
- * NEGATIVE cases deliberately do not derive anything (see the all-zeros digest
- * below): an expected value a failing test computes for itself is no longer an
- * expectation.
+ * The digest is COMPUTED from the same bytes the doubles serve rather than
+ * pasted in as a constant. Two hand-computed SHA-256 literals used to sit here;
+ * both were correct, which is exactly the problem — a reader cannot check them,
+ * and the first payload someone adds with a wrong one fails as a confusing
+ * `ToolCaptureIntegrityError` about the code under test. This is an ASYNC
+ * factory, not a value plus a `computeDigest()` step, so there is no window in
+ * which a fixture exists carrying an empty digest: a fixture someone forgets to
+ * initialise does not compile rather than reproducing the same confusing
+ * failure the constants did. The NEGATIVE cases deliberately do not derive
+ * anything (see the all-zeros digest below): an expected value a failing test
+ * computes for itself is no longer an expectation.
  */
-function captureFixture(text: string): CaptureFixture {
+async function captureFixture(text: string): Promise<CaptureFixture> {
   const source = encoder.encode(text);
-  let digest = "";
+  const digest = `sha256:${await sha256Hex(text)}`;
   const metadataBody = (): Record<string, unknown> => ({
     reference: { object_id: "object-1" },
     size_bytes: source.length,
@@ -108,12 +110,7 @@ function captureFixture(text: string): CaptureFixture {
       truncationReason: "capture_ceiling",
       encoding: "utf-8",
     },
-    get digest(): string {
-      return digest;
-    },
-    async computeDigest(): Promise<void> {
-      digest = `sha256:${await sha256Hex(text)}`;
-    },
+    digest,
     reads: (overrides: Partial<FactoryReads> = {}): FactoryReads => ({
       listAgents: vi.fn(),
       listRecentSessions: vi.fn(),
@@ -149,20 +146,24 @@ function captureFixture(text: string): CaptureFixture {
 }
 
 describe("retained tool-result content", () => {
-  const main = captureFixture("abcdefghij");
+  let main: CaptureFixture;
   /**
    * Deliberately SMALLER than the ceiling every test declares. Every other
    * fixture would have `capturedBytes` and `ceilingBytes` equal, which makes
    * the two bounds indistinguishable: replacing `options.ceilingBytes` with
    * `capture.capturedBytes` in the `pageBytes` guard survives all of them.
    */
-  const small = captureFixture("abcde");
+  let small: CaptureFixture;
+  // Bound here, not at collection time: `captureFixture` is async because the
+  // digest is computed from the bytes. Every reader below is a test body, which
+  // runs after this hook.
+  let capture: ToolResultCaptureSummary;
+  let reads: CaptureFixture["reads"];
   beforeAll(async () => {
-    await main.computeDigest();
-    await small.computeDigest();
+    main = await captureFixture("abcdefghij");
+    small = await captureFixture("abcde");
+    ({ capture, reads } = main);
   });
-
-  const { capture, reads } = main;
 
   it("continues exact inclusive ranges through the captured byte count, naming Factory and only Factory", async () => {
     const requests: RecordedRequest[] = [];
