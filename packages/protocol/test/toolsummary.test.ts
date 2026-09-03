@@ -84,7 +84,7 @@ describe("retained tool-result content", () => {
     } as FactoryReads;
   }
 
-  it("continues exact inclusive ranges through the captured byte count after Host/workspace deletion", async () => {
+  it("continues exact inclusive ranges through the captured byte count, naming Factory and only Factory", async () => {
     const requests: Array<{ url: string; authorization: string | null; range: string | null }> = [];
     const source = new TextEncoder().encode("abcdefghij");
     const factory = new FactoryRestReads({
@@ -120,6 +120,52 @@ describe("retained tool-result content", () => {
     expect(new TextDecoder().decode(loaded.bytes)).toBe("abcdefghij");
     expect(loaded.metadata.digest).toBe(digest);
   });
+
+  /**
+   * `pageBytes` is bounded by the caller's DECLARED CEILING, never by the size
+   * this particular capture happens to have. Every other read fixture in this
+   * file sets `capturedBytes` and `ceilingBytes` to the same number, so the two
+   * bounds are indistinguishable there: replacing `options.ceilingBytes` with
+   * `capture.capturedBytes` in that guard survives all of them. Here the
+   * capture is deliberately SMALLER than the ceiling, and the whole small space
+   * of page sizes either side of both numbers is enumerated rather than one
+   * more fixed triple — a page size between 5 and 10 is legal and must read.
+   */
+  const smallCapture: ToolResultCaptureSummary = { ...capture, capturedBytes: 5, declaredCeilingBytes: 10 };
+  const smallDigest = "sha256:36bbe50ed96841d10443bcb670d6554f0a34b761be67ec9c4a8ad2c0c44ca42c";
+
+  function smallReads(): FactoryReads {
+    return reads({
+      readObjectMetadata: vi.fn(async () => ({
+        reference: { object_id: "object-1" }, size_bytes: 5, media_type: "text/plain", digest: smallDigest,
+      })),
+      readObjectRange: vi.fn(async (_sessionId, _objectId, options) => ({
+        bytes: new TextEncoder().encode("abcde").slice(options.start, options.end + 1),
+        contentRange: `bytes ${options.start}-${options.end}/5`,
+        mediaType: "text/plain",
+      })),
+    });
+  }
+
+  it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])(
+    "bounds pageBytes %i by the declared ceiling of 10 rather than the captured 5 bytes",
+    async (pageBytes) => {
+      const factory = smallReads();
+      const attempt = readToolCapturePages(factory, "session-1", smallCapture, { pageBytes, ceilingBytes: 10 });
+      if (pageBytes > 10) {
+        await expect(attempt).rejects.toBeInstanceOf(RangeError);
+        expect(factory.readObjectMetadata).not.toHaveBeenCalled();
+        expect(factory.readObjectRange).not.toHaveBeenCalled();
+        return;
+      }
+      await expect(attempt).resolves.toBeTruthy();
+      const loaded = await attempt;
+      const expected: Array<[number, number]> = [];
+      for (let start = 0; start < 5; start += pageBytes) expected.push([start, Math.min(4, start + pageBytes - 1)]);
+      expect(loaded.pages.map(({ start, end }) => [start, end])).toStrictEqual(expected);
+      expect(new TextDecoder().decode(loaded.bytes)).toBe("abcde");
+    },
+  );
 
   it("allows a capture exactly at the caller's declared ceiling", async () => {
     const factory = reads();
@@ -190,6 +236,14 @@ describe("retained tool-result content", () => {
     ["missing", undefined],
     ["malformed", "sha256:not-a-digest"],
     ["unsupported", `sha512:${"0".repeat(128)}`],
+    // Well-formed hex, but not 64 of them. This is the exact value
+    // contract/fixtures/object_metadata.json carries ("sha256:abc"), so a
+    // length bound written `{1,64}` instead of `{64}` would let the pinned Core
+    // fixture's own digest through to a range read before failing — which is
+    // what the `readObjectRange` assertion below exists to forbid.
+    ["short but well-formed", "sha256:abc"],
+    ["over-long", `sha256:${"0".repeat(65)}`],
+    ["upper-case", `sha256:${"A".repeat(64)}`],
   ])("requires a supported sha256 digest before object-range I/O when metadata is %s", async (_name, metadataDigest) => {
     const factory = reads({ readObjectMetadata: vi.fn(async () => ({
       reference: { object_id: "object-1" }, size_bytes: 10, digest: metadataDigest,
@@ -239,6 +293,37 @@ describe("retained tool-result content", () => {
     await expect(readToolCapturePages(factory, "session-1", capture, {
       pageBytes: 4, ceilingBytes: 10,
     })).rejects.toBeInstanceOf(ToolCaptureIntegrityError);
+  });
+
+  /**
+   * A capture with no retained object at all — the fold genuinely produces this
+   * (see rows-tools.test.ts's `use-b`, whose capture carries no `reference`).
+   * Deleting the guard is masked by an identical error CLASS raised later: with
+   * `objectId` undefined, `encodeURIComponent` yields the literal "undefined"
+   * and a Factory metadata request goes out for a bogus object id before the
+   * `reference.object_id` comparison rejects with the same
+   * `ToolCaptureIntegrityError`. So a bare `rejects.toThrow` proves nothing
+   * here. The two things that distinguish the guard from its mask are the
+   * specific message and the fact that NO request was issued.
+   */
+  it("refuses a capture with no retained object before any Factory request", async () => {
+    const requests: string[] = [];
+    const factory = new FactoryRestReads({
+      baseUrl: "https://factory.example",
+      fetch: async (url) => {
+        requests.push(url);
+        return new Response(JSON.stringify({
+          reference: { object_id: "undefined" }, size_bytes: 10, media_type: "text/plain", digest,
+        }), { status: 200 });
+      },
+    });
+    await expect(readToolCapturePages(factory, "session-1", { ...capture, objectId: undefined }, {
+      pageBytes: 4, ceilingBytes: 10,
+    })).rejects.toMatchObject({
+      constructor: ToolCaptureIntegrityError,
+      message: "tool result has no retained object",
+    });
+    expect(requests).toStrictEqual([]);
   });
 
   it("surfaces a missing retained object and never attempts a range", async () => {
