@@ -186,3 +186,135 @@ export function decodeGate(raw: unknown): Gate {
 export function isAnswerableGate(gate: Gate): boolean {
   return gate.kind === GATE_KIND_PERMISSION;
 }
+
+// --- The COLD public gate projection ----------------------------------------
+
+/**
+ * `Factory`'s answerability enum, spelled exactly as
+ * `public_gate_page.schema.json` declares it and meaning exactly what the
+ * durable gate companion's §5.3 table says:
+ *
+ *   resident    a live Host owns the gate and can apply a response
+ *   suspended   a committed continuation can accept a cold response
+ *   submitted   a response is durably accepted and awaiting application
+ *   unavailable the prompt is in history, but no live waiter or valid
+ *               continuation exists
+ *   expired     the response deadline passed; a new answer will be rejected
+ *
+ * This is Factory's state, not a property of the prompt. An open journal event
+ * proves PRESENTATION and never answerability, so a gate this SDK knows only
+ * from a `GateOpened` carries no answerability at all (`""`).
+ */
+export const GATE_ANSWERABILITY_VALUES = [
+  "resident",
+  "suspended",
+  "submitted",
+  "unavailable",
+  "expired",
+] as const;
+
+/** One of the five values above. See `PublicGateProjection.answerability` for why the field is not typed as this. */
+export type GateAnswerability = (typeof GATE_ANSWERABILITY_VALUES)[number];
+
+/** True for a value this build recognises. A `false` here is "not known", never "not allowed". */
+export function isGateAnswerability(value: unknown): value is GateAnswerability {
+  return typeof value === "string" && (GATE_ANSWERABILITY_VALUES as readonly string[]).includes(value);
+}
+
+/**
+ * Every property `public_gate_page.schema.json` declares on a gate record, on
+ * its prompt, and on one prompt control — PARTITIONED into what
+ * `decodeGateProjection` carries and what it deliberately drops.
+ *
+ * This exists because redaction is a claim about a SET, and the vendored record
+ * is `additionalProperties: true` at all three of those levels. A decoder that
+ * filtered a denylist would forward whatever a Factory (or a compromised one)
+ * chose to add; `decodeGateProjection` instead builds a fresh object from named
+ * keys, and this table is pinned against the schema's own property set in both
+ * directions by test/gate.test.ts. A property Core adds later is therefore
+ * either classified here — projected, and then carried — or classified as
+ * withheld, and then dropped on purpose. It cannot be silently neither.
+ *
+ * `prompt.schema` is the one declared-but-withheld field, for the reason
+ * `GatePrompt` already gives for the live envelope: a form gate is answered
+ * out-of-band, so wui renders the title rather than building inputs it will not
+ * submit. Redacting it here keeps the two paths saying the same thing.
+ */
+export const GATE_PROJECTION_WIRE_FIELDS = {
+  gate: {
+    projected: [
+      "gate_id",
+      "kind",
+      "prompt",
+      "opened_event_id",
+      "opened_journal_seq",
+      "deadline",
+      "answerability",
+    ],
+    withheld: [],
+  },
+  prompt: { projected: ["title", "body", "origin", "controls"], withheld: ["schema"] },
+  control: { projected: ["action", "label"], withheld: [] },
+} as const;
+
+/**
+ * One gate as Factory's durable read plane projects it — the shape a client
+ * renders when NO Host is reachable and there is no live stream to fold.
+ *
+ * The prompt is the same `GatePrompt` the live envelope decodes to, because a
+ * renderer must not care which source a gate arrived from.
+ *
+ * `kind` and `answerability` stay plain strings rather than literal unions, for
+ * the same reason `Gate.kind` does: an unrecognized value must survive decoding
+ * so a caller can say "unknown" instead of silently reading it as one of the
+ * values this build happens to know. `""` additionally means "Factory has
+ * attested nothing about this gate" — see `acceptsResidentResponse`.
+ */
+export interface PublicGateProjection {
+  gateId: string;
+  kind: string;
+  prompt: GatePrompt;
+  /** The `event_id` of the durable `GateOpened` this projection was built from. */
+  openedEventId: string;
+  /** That event's durable journal sequence. Part of the board's public ordering. */
+  openedJournalSeq: number;
+  /** The EFFECTIVE response deadline, RFC 3339. Empty when no page has attested one. */
+  deadline: string;
+  /** Factory's answerability state, verbatim. Empty when no page has attested one. */
+  answerability: string;
+}
+
+/**
+ * Decodes one gate record from `GET /v1/sessions/{sid}/gates`.
+ *
+ * Every field is read by NAME from `GATE_PROJECTION_WIRE_FIELDS.*.projected`
+ * into a fresh object; nothing is spread. That is what makes the output's field
+ * set a constant rather than a function of the input, which is the property the
+ * redaction claim is actually about.
+ *
+ * A non-object, or a nested non-object, collapses to its zero value rather than
+ * throwing — the same fail-secure rule `decodeGate` follows, and for the same
+ * reason: one bad record must not take down a whole gate list, and an empty
+ * projection is not `resident`, so nothing is offered for it.
+ */
+export function decodeGateProjection(raw: unknown): PublicGateProjection {
+  const g = isRecord(raw) ? raw : {};
+  const prompt = isRecord(g["prompt"]) ? g["prompt"] : {};
+  const controls = Array.isArray(prompt["controls"]) ? prompt["controls"] : [];
+  return {
+    gateId: str(g["gate_id"]),
+    kind: str(g["kind"]),
+    prompt: {
+      title: str(prompt["title"]),
+      body: str(prompt["body"]),
+      origin: str(prompt["origin"]),
+      controls: controls
+        .filter(isRecord)
+        .map((c) => ({ action: str(c["action"]), label: str(c["label"]) })),
+    },
+    openedEventId: str(g["opened_event_id"]),
+    openedJournalSeq: num(g["opened_journal_seq"]),
+    deadline: str(g["deadline"]),
+    answerability: str(g["answerability"]),
+  };
+}

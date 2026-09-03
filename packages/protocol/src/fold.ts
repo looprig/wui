@@ -83,10 +83,11 @@
  * prepared record, the replayer filters it out of journal pages, and it never
  * fans out to SSE.
  */
-import type { EphemeralFrame, EventEnvelope, EventHeader, StatusEvent } from "./types.js";
+import type { EphemeralFrame, EventEnvelope, EventHeader, PublicGatePage, StatusEvent } from "./types.js";
 import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "./sse.js";
 import { decodeEnduring, isZeroUUID, turnFailureText } from "./enduring.js";
-import type { Gate } from "./gate.js";
+import { decodeGateProjection, type Gate, type PublicGateProjection } from "./gate.js";
+import { str } from "./blocks.js";
 import type { ContentBlock } from "./blocks.js";
 import type { AssistantRow, LoopInfo, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft } from "./rows.js";
 import {
@@ -1557,4 +1558,211 @@ function foldEnduringEnvelopeFrame(view: SessionView, frame: EnduringSseFrame): 
 
 function foldEphemeralFrame(view: SessionView, frame: EphemeralSseFrame): FoldResult {
   return foldEphemeral(view, frame.data);
+}
+
+// --- The public gate board ---------------------------------------------------
+
+/**
+ * ## Why this is not `SessionView.gates`
+ *
+ * `SessionView.gates` is the per-session LIVE fold: it exists only where a
+ * journal replay or an SSE stream exists, and it holds the full runtime
+ * `gate.Gate` envelope. The board below answers a different question — what
+ * gates are open, across sessions, for a client that has just loaded and has
+ * no Host, no live subscription and no journal at all. Its only required source
+ * is `GET /v1/sessions/{sid}/gates`, which spec §7 makes a pure durable read.
+ *
+ * Two consequences follow, and both are why this is a separate structure
+ * rather than a second map on `SessionView`:
+ *
+ *  - it is keyed by `(SessionID, GateID)`, because it spans sessions and a
+ *    GateID is only unique within one;
+ *  - it holds the REDACTED `PublicGateProjection`, not `Gate`, because the cold
+ *    source is `additionalProperties: true` at every level and the only safe
+ *    thing to keep is a named allowlist (see gate.ts's
+ *    `GATE_PROJECTION_WIRE_FIELDS`).
+ *
+ * ## Merge rules
+ *
+ * An entry has three parts, each with its own writer:
+ *
+ *  - IDENTITY AND OPEN POSITION (`sessionId`, `gateId`, `openedEventId`,
+ *    `openedJournalSeq`) are written ONCE, on first observation, and never
+ *    rewritten. They are facts about one durable `GateOpened`. Writing them
+ *    once is also what makes the public order stable under a duplicate.
+ *  - ATTESTED STATE (`deadline`, `answerability`) is written ONLY by a gate
+ *    page, last page wins. A live journal event never writes it: an open event
+ *    proves presentation and never answerability, so a gate seen only live is
+ *    unattested and `acceptsResidentResponse` refuses it.
+ *  - PRESENTATION (`kind`, `prompt`) is written by a page, and by a live open
+ *    only when the entry is new.
+ *
+ * A live `GateResolved` removes its own key. A page merge never removes: a gate
+ * that resolved while this client was offline stays until its `GateResolved` is
+ * folded or the board is rebuilt from `emptyPublicGateBoard()`. That is a
+ * stated limitation, pinned by test, not an oversight — a page can be one
+ * cursor page of several, so "absent from this page" does not mean "closed".
+ */
+export interface PublicGateEntry extends PublicGateProjection {
+  sessionId: string;
+}
+
+/**
+ * The open public gates, keyed by `publicGateKey(sessionId, gateId)`.
+ *
+ * There is deliberately no stored order. `publicGates` sorts on read, so the
+ * presentation order is a pure function of the entries and cannot drift from
+ * them the way a maintained index can.
+ */
+export interface PublicGateBoard {
+  entries: ReadonlyMap<string, PublicGateEntry>;
+}
+
+/**
+ * The board key: `(SessionID, GateID)`.
+ *
+ * LENGTH-PREFIXED, not joined with a separator. Both ids are opaque wire
+ * strings (`minLength: 1` and nothing else), so `${sessionId}:${gateId}` maps
+ * `("a:b","c")` and `("a","b:c")` to one key — and a collision here silently
+ * drops a gate a human still has to answer, which is precisely the failure the
+ * pair key exists to prevent.
+ */
+export function publicGateKey(sessionId: string, gateId: string): string {
+  return `${sessionId.length}:${sessionId}:${gateId}`;
+}
+
+export function emptyPublicGateBoard(): PublicGateBoard {
+  return { entries: new Map() };
+}
+
+/**
+ * Merges one `GET /v1/sessions/{sid}/gates` page into the board.
+ *
+ * `sessionId` is a parameter because the page does not carry one: it is
+ * addressed by URL, so only the caller knows which session it read. An empty
+ * one is a caller error and throws — folding two sessions' pages under `""`
+ * would merge them, which is the exact confusion the pair key exists to stop.
+ * (A gate EVENT, by contrast, names its own session, so `foldPublicGateEvent`
+ * reads it from the envelope and never takes it from a caller.)
+ *
+ * Returns the same board object when the page changes nothing.
+ */
+export function foldPublicGatePage(
+  board: PublicGateBoard,
+  page: PublicGatePage,
+  sessionId: string,
+): PublicGateBoard {
+  if (sessionId === "") {
+    throw new RangeError("a public gate page must be folded under the session id it was read for");
+  }
+  const records: unknown = (page as unknown as Record<string, unknown>)["gates"];
+  if (!Array.isArray(records) || records.length === 0) return board;
+  const entries = new Map(board.entries);
+  for (const record of records) {
+    const projection = decodeGateProjection(record);
+    // Unkeyable. `gate_id` has minLength 1, so this is not real wire; keying it
+    // under "" would make two such records overwrite each other.
+    if (projection.gateId === "") continue;
+    const key = publicGateKey(sessionId, projection.gateId);
+    const prior = entries.get(key);
+    entries.set(
+      key,
+      prior === undefined
+        ? { sessionId, ...projection }
+        : {
+            ...projection,
+            sessionId,
+            // Identity and open position are written once. Both records
+            // describe the same durable GateOpened, so a disagreement is a
+            // Factory bug rather than a move; keeping the first keeps the
+            // public order stable across a reload.
+            openedEventId: prior.openedEventId,
+            openedJournalSeq: prior.openedJournalSeq,
+          },
+    );
+  }
+  return { entries };
+}
+
+/**
+ * Folds one journal item — cold `history` or live `enduring` — into the board.
+ * Anything that is not a public gate event returns the SAME board object.
+ *
+ * The session id is read from the event's own envelope. An event that names no
+ * session is IGNORED rather than keyed under `""`, which would merge every
+ * unaddressed gate in the process into one bucket.
+ */
+export function foldPublicGateEvent(board: PublicGateBoard, input: FoldInput): PublicGateBoard {
+  const item = enduringItemOf(input);
+  if (item === undefined) return board;
+  const sessionId = str((item.envelope as unknown as Record<string, unknown>)["session_id"]);
+  if (sessionId === "") return board;
+  const decoded = decodeEnduring(item.envelope);
+  if (decoded.payload.kind === "GateOpened") {
+    const gate = decoded.payload.gate;
+    if (gate.id === "") return board;
+    const key = publicGateKey(sessionId, gate.id);
+    // A duplicate: identity and open position are already written and the
+    // attestation is not this source's to touch, so there is nothing to apply.
+    // Returning the identical board keeps a subscriber from re-rendering.
+    if (board.entries.has(key)) return board;
+    const entries = new Map(board.entries);
+    entries.set(key, {
+      sessionId,
+      gateId: gate.id,
+      kind: gate.kind,
+      prompt: gate.prompt,
+      openedEventId: decoded.eventId,
+      openedJournalSeq: item.journalSeq,
+      // Unattested. An open journal event proves presentation, never that
+      // anyone can apply a response.
+      deadline: "",
+      answerability: "",
+    });
+    return { entries };
+  }
+  if (decoded.payload.kind === "GateResolved") {
+    const key = publicGateKey(sessionId, decoded.payload.gateId);
+    if (!board.entries.has(key)) return board;
+    const entries = new Map(board.entries);
+    entries.delete(key);
+    return { entries };
+  }
+  return board;
+}
+
+/**
+ * The board's entries in STABLE PUBLIC ORDER: ascending over the triple
+ * `(sessionId, openedJournalSeq, gateId)`.
+ *
+ * It is a total order — the first and third components are the map key, so no
+ * two entries tie on all three — and it is a pure function of the entry set, so
+ * it does not depend on arrival order and cannot be stale.
+ *
+ * Strings are compared by code unit, deliberately NOT with `localeCompare`: an
+ * order that varies with the browser's locale is not a stable public order.
+ */
+export function publicGates(board: PublicGateBoard): PublicGateEntry[] {
+  return [...board.entries.values()].sort(comparePublicGates);
+}
+
+function comparePublicGates(a: PublicGateEntry, b: PublicGateEntry): number {
+  if (a.sessionId !== b.sessionId) return a.sessionId < b.sessionId ? -1 : 1;
+  if (a.openedJournalSeq !== b.openedJournalSeq) return a.openedJournalSeq - b.openedJournalSeq;
+  if (a.gateId !== b.gateId) return a.gateId < b.gateId ? -1 : 1;
+  return 0;
+}
+
+/** The durable envelope and journal sequence of one enduring item, from either segment. */
+function enduringItemOf(input: FoldInput): { envelope: EventEnvelope; journalSeq: number } | undefined {
+  // `event` is optional on both `status_event.schema.json` and
+  // `enduring_frame.schema.json`. An item carrying none names no gate and no
+  // session, so there is nothing to fold.
+  if (input.segment === "history") {
+    const envelope = input.event.event;
+    return envelope === undefined ? undefined : { envelope, journalSeq: input.event.journal_seq };
+  }
+  if (input.frame.type !== "enduring") return undefined;
+  const envelope = input.frame.data.event;
+  return envelope === undefined ? undefined : { envelope, journalSeq: input.frame.journalSeq };
 }

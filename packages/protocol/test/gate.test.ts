@@ -20,16 +20,24 @@
  * Cases labelled NOT REAL WIRE are shapes a corrupted or legacy record would
  * produce, kept so a decoder reading the wrong key could not pass this file.
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { decodeEnduring } from "../src/enduring.js";
+import { acceptsResidentResponse } from "../src/gate-actions.js";
 import {
+  GATE_ANSWERABILITY_VALUES,
   GATE_KIND_ASK_USER,
   GATE_KIND_FORM,
   GATE_KIND_OPEN_URL,
   GATE_KIND_PERMISSION,
+  GATE_PROJECTION_WIRE_FIELDS,
   decodeGate,
+  decodeGateProjection,
   isAnswerableGate,
+  isGateAnswerability,
 } from "../src/gate.js";
+import { factoryPublicGatePageSchema } from "../src/schema.js";
 import type { EventEnvelope } from "../src/types.js";
 import { LOOP_A, envelope } from "./helpers.js";
 
@@ -332,5 +340,264 @@ describe("decodeEnduring: gate events", () => {
     if (decoded.payload.kind !== "GateOpened") throw new Error("unreachable");
     expect(decoded.payload.gate.id).toBe("");
     expect(isAnswerableGate(decoded.payload.gate)).toBe(false);
+  });
+});
+
+/**
+ * ## The COLD gate projection (`public_gate_page.schema.json`'s gate record)
+ *
+ * Everything above this line reads the durable gate envelope off a journal
+ * event. The cases below read the OTHER source of the same gate: Factory's
+ * `GET /v1/sessions/{sid}/gates` page, which is a pure durable read and is
+ * therefore the only source available when no Host is reachable at all.
+ *
+ * Two properties are load-bearing and are asserted rather than described.
+ *
+ * REDACTION IS A CLAIM ABOUT A SET, not about the fields someone remembered.
+ * The vendored record is `additionalProperties: true` at every level — gate,
+ * prompt and control — so a Factory that put a prepared payload, a raw answer,
+ * a grant, a credential or a continuation pointer on the wire would hand it
+ * straight to a renderer if this decoder filtered a denylist. It does not: it
+ * builds a fresh object from a NAMED allowlist, and the allowlist is pinned
+ * against the schema's own declared property set in both directions, so a
+ * property Core adds later is either classified here or fails
+ * "partitions every property".
+ *
+ * ANSWERABILITY IS NOT THE PROMPT. An open journal event proves presentation,
+ * never that anyone can apply a response (gate companion §5.3). So the
+ * projection carries Factory's `answerability` verbatim as a plain string —
+ * an unrecognized value must survive decoding, exactly as `kind` does — and
+ * `acceptsResidentResponse` reads it as permission for ONE thing only.
+ */
+describe("decodeGateProjection", () => {
+  const PAGE_GATE_SCHEMA = factoryPublicGatePageSchema.$defs.gate;
+  const PROMPT_SCHEMA = factoryPublicGatePageSchema.$defs.prompt;
+  const CONTROL_SCHEMA = factoryPublicGatePageSchema.$defs.prompt.properties.controls.items;
+
+  const SCHEMA_LEVELS = {
+    gate: Object.keys(PAGE_GATE_SCHEMA.properties),
+    prompt: Object.keys(PROMPT_SCHEMA.properties),
+    control: Object.keys(CONTROL_SCHEMA.properties),
+  } as const;
+
+  /** The vendored page fixture's single gate record — real Core bytes. */
+  function fixtureGateRecord(): Record<string, unknown> {
+    const page = object(
+      JSON.parse(
+        readFileSync(fileURLToPath(new URL("../../../contract/fixtures/public_gate_page.json", import.meta.url)), "utf8"),
+      ) as unknown,
+    );
+    const gates = page["gates"];
+    if (!Array.isArray(gates) || gates.length !== 1) throw new Error("fixture shape changed");
+    return object(gates[0]);
+  }
+
+  /**
+   * A shape signature: every key path reachable in `value`, with array indices
+   * collapsed to `[]`. Two values with the same signature expose the same set
+   * of fields regardless of what either one CONTAINS, which is the property a
+   * redaction claim is actually about.
+   */
+  function keyPaths(value: unknown, prefix = ""): string[] {
+    if (Array.isArray(value)) return value.flatMap((item) => keyPaths(item, `${prefix}[]`));
+    if (typeof value !== "object" || value === null) return [];
+    return Object.keys(value).flatMap((key) => {
+      const path = prefix === "" ? key : `${prefix}.${key}`;
+      return [path, ...keyPaths((value as Record<string, unknown>)[key], path)];
+    });
+  }
+
+  function shape(value: unknown): string[] {
+    return [...new Set(keyPaths(value))].sort();
+  }
+
+  /**
+   * Every private thing the spec names (§13's "Private gate payloads, raw
+   * answers, tool secrets, and signed action URLs stay in private storage",
+   * §16's "raw gate answers and other private command payloads are not exposed
+   * by the public journal") plus the continuation pointer the gate companion
+   * adds, each under a UNIQUE sentinel so a leak names itself.
+   */
+  const PRIVATE_POISON: Record<string, unknown> = {
+    prepared: "SENTINEL-prepared-record",
+    prepared_payload: { secret: "SENTINEL-prepared-payload" },
+    payload: "SENTINEL-private-payload",
+    answer: "SENTINEL-raw-answer",
+    raw_answer: "SENTINEL-raw-answer-2",
+    response: { action: "SENTINEL-submitted-response" },
+    grant: "SENTINEL-grant",
+    grants: ["SENTINEL-grants"],
+    credential: "SENTINEL-credential",
+    credentials: { token: "SENTINEL-credentials" },
+    continuation: { pointer: "SENTINEL-continuation" },
+    continuation_token: "SENTINEL-continuation-token",
+    url: "https://example.invalid/SENTINEL-signed-url",
+    signed_url: "https://example.invalid/SENTINEL-signed-url-2",
+    audit: { data: "SENTINEL-audit" },
+  };
+
+  /** The fixture record, poisoned at all three levels of the record. */
+  function poisonedRecord(): Record<string, unknown> {
+    const record = fixtureGateRecord();
+    const prompt = object(record["prompt"]);
+    const controls = (prompt["controls"] as unknown[]).map((c) => ({ ...object(c), ...PRIVATE_POISON }));
+    return {
+      ...record,
+      ...PRIVATE_POISON,
+      prompt: { ...prompt, ...PRIVATE_POISON, controls },
+    };
+  }
+
+  it("decodes the vendored Core gate page fixture's record", () => {
+    expect(decodeGateProjection(fixtureGateRecord())).toStrictEqual({
+      gateId: "gate-1",
+      kind: GATE_KIND_ASK_USER,
+      prompt: {
+        title: "Continue?",
+        body: "Choose a public option.",
+        origin: "https://example.test",
+        controls: [
+          { action: "approve", label: "Approve" },
+          { action: "cancel", label: "Cancel" },
+        ],
+      },
+      openedEventId: "event-6",
+      openedJournalSeq: 6,
+      deadline: "2026-08-29T13:00:00Z",
+      answerability: "resident",
+    });
+  });
+
+  it("partitions every property the vendored schema declares, at all three levels", () => {
+    // The anti-drift half. If Core adds a property to the gate record, the
+    // prompt or a control, it is either named `projected` (and then the
+    // decoder must carry it) or named `withheld` (and then it is redacted on
+    // purpose) — never silently neither.
+    for (const level of ["gate", "prompt", "control"] as const) {
+      const { projected, withheld } = GATE_PROJECTION_WIRE_FIELDS[level];
+      const declared = SCHEMA_LEVELS[level];
+      expect(declared.length, `${level}: schema declares no properties`).toBeGreaterThan(0);
+      expect([...projected, ...withheld].sort(), `${level}: allowlist/withheld does not partition the schema`)
+        .toStrictEqual([...declared].sort());
+      expect(
+        projected.filter((name) => (withheld as readonly string[]).includes(name)),
+        `${level}: a property is both projected and withheld`,
+      ).toStrictEqual([]);
+    }
+  });
+
+  it("withholds at least one DECLARED property, so the withheld side is not vacuous", () => {
+    // `prompt.schema` is real, public, and deliberately not projected: a form
+    // is answered out-of-band, so wui renders the title rather than building
+    // inputs it will not submit (see the `Gate` decoder's own note). Without
+    // this case the partition test would pass with every `withheld` list
+    // empty and prove only that nothing was dropped.
+    expect(GATE_PROJECTION_WIRE_FIELDS.prompt.withheld).toStrictEqual(["schema"]);
+    const record = fixtureGateRecord();
+    expect(Object.hasOwn(object(record["prompt"]), "schema")).toBe(true);
+    expect(shape(decodeGateProjection(record))).not.toContain("prompt.schema");
+  });
+
+  it("emits the SAME field set whatever the record carries, at every level", () => {
+    // `additionalProperties: true` at all three levels means the input space is
+    // unbounded, so the assertion is on the OUTPUT: its key-path signature is a
+    // constant, independent of the input. A decoder that copied unknown keys
+    // through — or spread the record — cannot satisfy this.
+    const expected = [
+      "answerability",
+      "deadline",
+      "gateId",
+      "kind",
+      "openedEventId",
+      "openedJournalSeq",
+      "prompt",
+      "prompt.body",
+      "prompt.controls",
+      "prompt.controls[].action",
+      "prompt.controls[].label",
+      "prompt.origin",
+      "prompt.title",
+    ];
+    for (const record of [fixtureGateRecord(), poisonedRecord()]) {
+      expect(shape(decodeGateProjection(record))).toStrictEqual(expected);
+    }
+  });
+
+  it("leaks no private field the spec names — gate, prompt or control level", () => {
+    const decoded = JSON.stringify(decodeGateProjection(poisonedRecord()));
+    // Anti-vacuity: the poison really is in the input, at all three levels.
+    const poisoned = JSON.stringify(poisonedRecord());
+    for (const key of Object.keys(PRIVATE_POISON)) {
+      expect(Object.hasOwn(poisonedRecord(), key), `poison missing from the gate level: ${key}`).toBe(true);
+    }
+    expect(poisoned.match(/SENTINEL-/g)?.length ?? 0).toBeGreaterThanOrEqual(3 * Object.keys(PRIVATE_POISON).length);
+    expect(decoded).not.toMatch(/SENTINEL-/);
+  });
+
+  it("collapses a junk record to the empty projection instead of throwing", () => {
+    // NOT REAL WIRE. Same fail-secure rule decodeGate follows: a renderer must
+    // not lose the whole session view to one bad record, and an empty
+    // projection is not `resident`, so nothing is offered for it.
+    for (const junk of [undefined, null, "gate", 7, [], { prompt: 5, gate_id: 9 }]) {
+      const projection = decodeGateProjection(junk);
+      expect(projection.gateId).toBe("");
+      expect(projection.openedJournalSeq).toBe(0);
+      expect(projection.prompt.controls).toStrictEqual([]);
+      expect(acceptsResidentResponse(projection)).toBe(false);
+    }
+    // A control that is not an object is DROPPED, not coerced to an empty
+    // pair: `{action:"",label:""}` would render a nameless button that harness
+    // rejects with `gate_action_invalid`. (`decodeGate` drops the same way.)
+    expect(
+      decodeGateProjection({ prompt: { controls: ["approve", null, 7, { action: "Deny" }] } }).prompt.controls,
+    ).toStrictEqual([{ action: "Deny", label: "" }]);
+  });
+});
+
+describe("gate answerability", () => {
+  it("mirrors the vendored schema's enum exactly, in order", () => {
+    expect(GATE_ANSWERABILITY_VALUES).toStrictEqual([
+      "resident",
+      "suspended",
+      "submitted",
+      "unavailable",
+      "expired",
+    ]);
+    // And the literals above are not just a copy of themselves: they are the
+    // schema's own enum, so a Core rename fails here rather than in a renderer.
+    expect([...GATE_ANSWERABILITY_VALUES]).toStrictEqual([
+      ...factoryPublicGatePageSchema.$defs.gate.properties.answerability.enum,
+    ]);
+  });
+
+  it("keeps an unrecognized answerability rather than normalising it away", () => {
+    // Same rule as `kind`: the value set can grow, and a value this build does
+    // not know must survive decoding so a renderer can say "unknown" instead of
+    // silently reading it as one of the five.
+    expect(decodeGateProjection({ answerability: "quarantined" }).answerability).toBe("quarantined");
+    expect(isGateAnswerability("quarantined")).toBe(false);
+    for (const value of GATE_ANSWERABILITY_VALUES) expect(isGateAnswerability(value)).toBe(true);
+    for (const junk of [undefined, null, 7, ["resident"], { answerability: "resident" }]) {
+      expect(isGateAnswerability(junk)).toBe(false);
+    }
+  });
+
+  it("exposes a resident response for `resident` and for NOTHING else", () => {
+    // The whole declared space is five values; it is small, so it is enumerated
+    // rather than sampled. "" is the sixth case and is not wire: it is what a
+    // gate observed only through a journal event carries, because an open event
+    // proves presentation and never answerability (gate companion §5.3).
+    //
+    // `suspended` is the interesting negative. It IS the state in which a cold
+    // answer can resume — and it is still false here, because this task exposes
+    // the RESIDENT capability only. Widening it is a separate change with its
+    // own continuation requirements.
+    const permitted = GATE_ANSWERABILITY_VALUES.filter((value) => acceptsResidentResponse({ answerability: value }));
+    expect(permitted).toStrictEqual(["resident"]);
+    for (const value of ["", "Resident", "RESIDENT", "resident ", "quarantined", "suspended"]) {
+      expect(acceptsResidentResponse({ answerability: value }), `answerability ${JSON.stringify(value)}`).toBe(
+        value === "resident",
+      );
+    }
   });
 });
