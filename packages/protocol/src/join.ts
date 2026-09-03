@@ -107,9 +107,23 @@
  * trivial relay that awaits the source and immediately pushes, so it is never
  * itself the slow stage. A wrapper upstream of it would never see any backlog
  * at all (its own buffer would never exceed one frame) while this queue grew
- * without limit behind it. `options.maxQueuedFrames` caps this queue and
- * `options.onQueueOverflow` reports every drop; `selectFrameToDrop` states the
- * policy.
+ * without limit behind it. `options.maxQueuedFrames` caps this queue.
+ *
+ * The cap is LOSSLESS BY REPAIR, not lossy. Only `heartbeat` and `ephemeral`
+ * frames are ever evicted — `selectFrameToDrop` states that policy and
+ * `options.onQueueOverflow` reports those drops. When the buffer is over its
+ * bound and holds nothing droppable, the queue drops NOTHING: it discards the
+ * buffer unapplied, closes with a `LiveQueueOverflowError`, and this connection
+ * attempt ends, so the cold walk repeats from `cursor` — the last journal
+ * sequence this join actually applied — and the refused events come back from
+ * the journal. `options.onBindingState` announces that as `repair_required`,
+ * and `live` again once the repairing connection's cold read returns.
+ *
+ * Before U2.2 the same condition evicted the OLDEST ENDURING frame and reported
+ * it as a drop. That is silent durable loss with a receipt: nothing re-delivers
+ * the frame (the tip filter will not, and the reconnect cursor advances past it
+ * as soon as any later frame is applied), so the transcript had a hole and the
+ * cursor asserted the hole was covered.
  *
  * ## Reconnect
  *
@@ -153,6 +167,7 @@
 import type { SessionView, FoldInput, FoldResult, FoldError } from "./fold.js";
 import { emptySessionView, fold } from "./fold.js";
 import type { SseFrame } from "./sse.js";
+import { ephemeralDropKey, isDroppableFrame, type DroppableFrame } from "./enduring.js";
 import type { EventJournalPage } from "./types.js";
 import type {
   EnduringPublication,
@@ -741,6 +756,17 @@ export interface JoinOptions {
    * content. Never called while the buffer stays under the bound.
    */
   onQueueOverflow?: (droppedTotal: number) => void;
+  /**
+   * Announces this binding's live-plane state. `repair_required` when the live
+   * buffer overflowed with nothing droppable in it: the buffer was discarded
+   * UNAPPLIED and this connection attempt ends, so no cursor moved and no event
+   * is claimed to have been delivered. `live` again once a subsequent
+   * connection's cold read has returned from the last committed sequence.
+   *
+   * Not an error channel and not a drop report. It is a property of THIS
+   * binding, so a caller holding several never has to infer which one degraded.
+   */
+  onBindingState?: (state: BindingState, cause?: LiveQueueOverflowError) => void;
   /** Aborts the join. Checked between steps; does not preempt an in-flight `readHistory`/live `next()` call already awaited (those should honor their own cancellation, e.g. via `RequestOptions.signal` on the transport call a caller wires up). Also cuts short an in-progress error-triggered reconnect delay. */
   signal?: AbortSignal;
 }
@@ -773,15 +799,27 @@ export async function* joinSessionView(
   const signal = options.signal;
   const autoReconnect = options.autoReconnect ?? false;
   const reconnectDelayMs = options.reconnectDelayMs ?? 250;
+  /** True from a refused-overflow until a later cold read has re-read past it. */
+  let repairPending = false;
 
   for (;;) {
     if (signal?.aborted) return;
 
     // --- Step 1: subscribe live FIRST. Buffering starts the instant liveSource() returns. ---
-    const queue = new AsyncQueue<SseFrame>({
+    const queue = new AsyncQueue<SseFrame, DroppableFrame>({
       max: options.maxQueuedFrames ?? DEFAULT_MAX_QUEUED_FRAMES,
+      isDroppable: isDroppableFrame,
       selectVictim: selectFrameToDrop,
       onDrop: (droppedTotal) => options.onQueueOverflow?.(droppedTotal),
+      onIrreducible: (error) => {
+        // Only the FIRST transition is announced: `repairPending` is cleared by
+        // the next connection's cold read, not by this callback, so a binding
+        // that overflows again before it has recovered does not re-announce a
+        // state it is already in.
+        if (repairPending) return;
+        repairPending = true;
+        options.onBindingState?.("repair_required", error);
+      },
     });
     const liveIterator = liveSource()[Symbol.asyncIterator]();
     const pumpDone = pumpLiveConnection(liveIterator, queue);
@@ -800,6 +838,15 @@ export async function* joinSessionView(
       for (;;) {
         if (signal?.aborted) return;
         const page = await journal.readHistory(sessionId, { fromJournalSeq: cursor, limit: options.pageLimit });
+        if (repairPending) {
+          // The repair is complete the moment a page comes back for `cursor` —
+          // the last sequence this join actually applied. Announced HERE rather
+          // than after the page's events are yielded, so a consumer that reads
+          // the state alongside the first repaired event sees `live`, and so a
+          // repair whose page happens to be empty still recovers.
+          repairPending = false;
+          options.onBindingState?.("live");
+        }
         for (const event of page.events) {
           const input: FoldInput = { segment: "history", event };
           const result = fold(view, input);
@@ -901,42 +948,96 @@ export async function* joinSessionView(
  * Default cap on live frames buffered ahead of the fold, per connection.
  * Roughly eight seconds of a fast token stream: long enough to ride out a
  * multi-second main-thread stall without dropping anything, short enough that
- * the buffer is a bounded, bounded-size object rather than a leak.
+ * the buffer is a bounded object rather than a leak. A backlog of DURABLE
+ * frames this deep is not dropped at all — it ends the connection and repairs
+ * (see the module comment's "Backpressure" section).
  */
 export const DEFAULT_MAX_QUEUED_FRAMES = 512;
 
 /**
  * Which buffered frame to evict when the live queue is over its bound, as an
- * index into `frames` (oldest first). This is the drop policy, stated:
+ * index into `frames` — or -1 when NOTHING in the buffer may be dropped.
  *
- *  1. `heartbeat` — a pure keepalive carrying no content at all. Free to drop.
- *  2. `ephemeral` — unsequenced, best-effort content. Losing one is ALREADY a
- *     tolerated condition: a reconnect replays enduring frames only, so deltas
- *     emitted during an outage are lost regardless, and the following
- *     `StepDone` snaps the live segment wholesale and repairs the transcript
- *     (design §9).
- *  3. `enduring` — the durable content, and it has NO such repair: the tip
- *     filter will not re-deliver it and the reconnect cursor advances past it
- *     once a later frame is applied. Dropping one leaves a real gap, which is
- *     why it goes only after every ephemeral frame is gone, and why every drop
- *     is reported through `onQueueOverflow`.
- *  4. `error` — dropped last, because a dropped error is a silent failure. It
- *     is not dropped NEVER, though: a queue that grows without limit kills the
- *     tab, which is strictly worse than a reported gap, and the overflow report
- *     itself keeps the loss from being silent.
+ * The domain is `DroppableFrame` (enduring.ts): `heartbeat` and `ephemeral`
+ * only. An `enduring` frame is durable content with no in-band repair — the tip
+ * filter will not re-deliver it and the reconnect cursor advances past it once
+ * a later frame is applied — and an `error` frame is a frame that failed to
+ * parse, which MAY have been an enduring one with nothing able to tell after
+ * the fact. Neither is dropped; a buffer holding only those returns -1, and the
+ * queue repairs from its last committed cursor instead (see `AsyncQueue`).
  *
- * Oldest-first within each class, so the queue always keeps the most recent
- * state — which is what the consumer is about to render.
+ * Within the domain:
+ *
+ *  1. `heartbeat` first — it carries no content at all, so it is free.
+ *  2. otherwise, the OLDEST frame of the NOISIEST declared key
+ *     (`ephemeralDropKey`: the wire's own `kind` plus the producing header's
+ *     loop/turn/step). Thinning the busiest stream against itself is what makes
+ *     this coalescing rather than truncation: a fast `token_delta` run on one
+ *     loop is charged for its own backlog, and a single `tool_call_started` on
+ *     a quiet peer loop is not evicted to make room for it. Ties go to the key
+ *     whose oldest member is oldest, so the choice is deterministic.
+ *
+ * The parameter type is the compile-time half of "ephemeral coalescing cannot
+ * remove an enduring frame". The -1 return is the runtime half: types are
+ * erased, so a JavaScript caller (or a test reaching past the type through a
+ * cast) still gets a fail-closed answer rather than an index that names durable
+ * content. When such a caller passes a MIXED array, the index returned is into
+ * the array as given — the droppable entries are selected with their original
+ * positions, never renumbered.
  */
-export function selectFrameToDrop(frames: readonly SseFrame[]): number {
-  for (const type of FRAME_EVICTION_ORDER) {
-    const index = frames.findIndex((frame) => frame.type === type);
-    if (index !== -1) return index;
+export function selectFrameToDrop(frames: readonly DroppableFrame[]): number {
+  const candidates: Array<{ frame: DroppableFrame; index: number }> = [];
+  frames.forEach((frame, index) => {
+    // Re-narrowed rather than trusted: this is the only place the domain is
+    // decided, and it must hold for an erased caller too.
+    if (isDroppableFrame(frame)) candidates.push({ frame, index });
+  });
+  if (candidates.length === 0) return -1;
+  const heartbeat = candidates.find((candidate) => candidate.frame.type === "heartbeat");
+  if (heartbeat !== undefined) return heartbeat.index;
+
+  const byKey = new Map<string, Array<{ frame: DroppableFrame; index: number }>>();
+  for (const candidate of candidates) {
+    const key = ephemeralDropKey(candidate.frame);
+    const bucket = byKey.get(key);
+    if (bucket === undefined) byKey.set(key, [candidate]);
+    else bucket.push(candidate);
   }
-  return 0;
+  let chosen = candidates[0] as { frame: DroppableFrame; index: number };
+  let best = 0;
+  for (const bucket of byKey.values()) {
+    const oldest = bucket[0] as { frame: DroppableFrame; index: number };
+    if (bucket.length > best || (bucket.length === best && oldest.index < chosen.index)) {
+      best = bucket.length;
+      chosen = oldest;
+    }
+  }
+  return chosen.index;
 }
 
-const FRAME_EVICTION_ORDER: ReadonlyArray<SseFrame["type"]> = ["heartbeat", "ephemeral", "enduring", "error"];
+/**
+ * Raised when the live buffer is over its bound and holds nothing droppable.
+ *
+ * It is not a report that frames were LOST — the whole point is that none were
+ * applied and none were claimed to be. It ends this connection attempt so the
+ * join re-reads from its last committed journal sequence.
+ */
+export class LiveQueueOverflowError extends Error {
+  /** How many frames were buffered, and discarded unapplied, at the overflow. */
+  readonly buffered: number;
+
+  constructor(buffered: number) {
+    super(
+      `live frame queue overflow: ${buffered} buffered frame(s) cannot be dropped;` +
+        ` repairing from the last committed journal sequence`,
+    );
+    this.name = "LiveQueueOverflowError";
+    this.buffered = buffered;
+  }
+}
+
+/** The state of one session binding's live plane. */
+export type BindingState = "live" | "repair_required";
 
 // --- Internals ------------------------------------------------------------------
 
@@ -988,16 +1089,31 @@ function toJoinEvent(result: FoldResult, input: FoldInput, view: SessionView): J
  * comment; `AsyncQueue` itself only guarantees each item is handed to the
  * caller exactly once, not which of the two loops that happens to be.)
  */
-interface QueueBound<T> {
+interface QueueBound<T, D extends T> {
   /** Maximum buffered items. Exceeding it evicts until the buffer is back at the bound. */
   max: number;
-  /** Index of the item to evict, oldest-first within the caller's own priority. */
-  selectVictim: (items: readonly T[]) => number;
+  /**
+   * Narrows the buffer to the items eviction is allowed to consider. This is
+   * the structural half of "coalescing cannot remove durable content": the
+   * victim selector below is only ever handed the output of this predicate, and
+   * its parameter type is that narrowed type, so nothing outside the domain can
+   * reach it — from a TypeScript call site by the type, and from any call site
+   * by the re-check `push()` performs on the item it is about to splice.
+   */
+  isDroppable: (item: T) => item is D;
+  /** Index of the item to evict WITHIN the narrowed candidates, or -1 for none. */
+  selectVictim: (items: readonly D[]) => number;
   /** Called once per eviction with the cumulative count dropped by this queue. */
   onDrop: (droppedTotal: number) => void;
+  /**
+   * The buffer is over its bound and holds nothing droppable. The queue has
+   * discarded it UNAPPLIED and closed; the caller must repair from its last
+   * committed cursor rather than pretend anything was delivered.
+   */
+  onIrreducible: (error: LiveQueueOverflowError) => void;
 }
 
-class AsyncQueue<T> {
+class AsyncQueue<T, D extends T = T> {
   private readonly items: T[] = [];
   private readonly waiters: Array<{ resolve: (r: IteratorResult<T, undefined>) => void; reject: (e: unknown) => void }> = [];
   private closed = false;
@@ -1005,7 +1121,7 @@ class AsyncQueue<T> {
   private hasCloseError = false;
   private dropped = 0;
 
-  constructor(private readonly bound: QueueBound<T>) {}
+  constructor(private readonly bound: QueueBound<T, D>) {}
 
   push(item: T): void {
     if (this.closed) return; // a well-behaved pump never pushes after close; ignored defensively rather than throwing
@@ -1018,11 +1134,51 @@ class AsyncQueue<T> {
     // Only a BUFFERED item can overflow: an item handed straight to a waiting
     // consumer never occupies the buffer at all.
     while (this.items.length > this.bound.max) {
-      const victim = this.bound.selectVictim(this.items);
-      this.items.splice(victim >= 0 && victim < this.items.length ? victim : 0, 1);
+      // The candidate list is built by the narrowing predicate and carries each
+      // candidate's ORIGINAL position, so the index that comes back is
+      // translated through an entry that was already narrowed — never
+      // renumbered and never re-derived from the raw buffer.
+      const candidates: Array<{ item: D; index: number }> = [];
+      this.items.forEach((entry, index) => {
+        if (this.bound.isDroppable(entry)) candidates.push({ item: entry, index });
+      });
+      if (candidates.length === 0) return this.irreducible();
+      const choice = this.bound.selectVictim(candidates.map((candidate) => candidate.item));
+      if (choice < 0 || choice >= candidates.length) return this.irreducible();
+      const victim = candidates[choice] as { item: D; index: number };
+      const buffered = this.items[victim.index];
+      // Fail closed rather than trust the arithmetic: if the item about to be
+      // removed is not droppable, drop NOTHING and repair.
+      //
+      // This condition is UNREACHABLE with this module's own wiring, and
+      // deleting the line does not fail a single test — measured, not assumed.
+      // `candidates` is built from `this.items` and spliced from it in one
+      // synchronous run, and the only `selectVictim` ever injected is
+      // `selectFrameToDrop`, which is pure over the COPY it is handed. So
+      // nothing can move an item under `victim.index` in between. It is kept
+      // because the thing it guards is a silent durable drop that would look
+      // like a successful eviction on every channel, and because the two
+      // premises above are properties of the current single construction site
+      // rather than of the class.
+      if (buffered === undefined || !this.bound.isDroppable(buffered)) return this.irreducible();
+      this.items.splice(victim.index, 1);
       this.dropped += 1;
       this.bound.onDrop(this.dropped);
     }
+  }
+
+  /**
+   * The buffer is over its bound and nothing in it may be dropped. Discard it
+   * UNAPPLIED and close with an error, so the consumer's next read fails and
+   * the join repairs from its last committed cursor. Nothing here reports a
+   * DROP: `onDrop`'s cumulative count is a claim about content that is gone,
+   * and this path makes no such claim.
+   */
+  private irreducible(): void {
+    const error = new LiveQueueOverflowError(this.items.length);
+    this.items.length = 0;
+    this.bound.onIrreducible(error);
+    this.close(error);
   }
 
   /** Marks the queue closed. `error`, if provided, is thrown by every subsequent (and any currently-pending) `next()` call once the buffer is exhausted. */
@@ -1059,7 +1215,7 @@ class AsyncQueue<T> {
  * awaiting this promise in a `finally` block (defensively, since this
  * function is designed never to reject) can do so without a `.catch()`.
  */
-async function pumpLiveConnection(iterator: AsyncIterator<SseFrame>, queue: AsyncQueue<SseFrame>): Promise<void> {
+async function pumpLiveConnection(iterator: AsyncIterator<SseFrame>, queue: AsyncQueue<SseFrame, DroppableFrame>): Promise<void> {
   try {
     for (;;) {
       const { value, done } = await iterator.next();

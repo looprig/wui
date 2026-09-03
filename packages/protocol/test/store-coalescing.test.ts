@@ -14,8 +14,19 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { SessionViewStore } from "../src/store.js";
-import { controllableLive, emptyPage, manualScheduler, textFrame, tick } from "./store-fakes.js";
-import { LOOP_A } from "./helpers.js";
+import { selectFrameToDrop } from "../src/join.js";
+import { ephemeralDropKey, isDroppableFrame } from "../src/enduring.js";
+import {
+  controllableLive,
+  emptyPage,
+  enduringFrame,
+  errorFrame,
+  heartbeatFrame,
+  manualScheduler,
+  textFrame,
+  tick,
+} from "./store-fakes.js";
+import { LOOP_A, LOOP_B, envelope } from "./helpers.js";
 
 function makeStore() {
   const scheduler = manualScheduler();
@@ -136,5 +147,66 @@ describe("SessionViewStore: rAF coalescing", () => {
     expect(first).toHaveBeenCalledTimes(1);
     expect(second).toHaveBeenCalledTimes(1);
     store.stop();
+  });
+});
+
+/**
+ * Ephemeral coalescing, and the boundary it cannot cross.
+ *
+ * ## What the eviction domain is, and what "cannot" means here
+ *
+ * `selectFrameToDrop`'s parameter type is `readonly DroppableFrame[]`, which is
+ * `Extract<SseFrame, { type: "heartbeat" } | { type: "ephemeral" }>` — an
+ * `EnduringSseFrame` is not assignable to it, so no TypeScript call site can
+ * pass one. That is checked by `npm run typecheck`, which compiles `test/` as
+ * well as `src/` (tsconfig.typecheck.json), so the `@ts-expect-error` below
+ * fails the build the day the parameter widens.
+ *
+ * TypeScript types are erased, so that argument covers TypeScript call sites
+ * and nothing else. Two runtime properties carry the rest, and both are
+ * asserted below rather than argued: the policy returns -1 ("no victim") rather
+ * than an index when handed a buffer with nothing droppable in it, and the
+ * queue's own eviction step re-checks `isDroppableFrame` on the item it is
+ * about to splice and repairs instead of dropping if it is not.
+ *
+ * What this does NOT establish: anything about loss inside `fold`, anything
+ * about a consumer that builds its own queue, and any claim that an enduring
+ * frame is never lost — the whole point of U2.2 is that it CAN be refused, and
+ * that refusing it is reported as `repair_required` instead of being applied.
+ */
+describe("ephemeral coalescing by declared key", () => {
+  const tokenA = textFrame("a", LOOP_A);
+  const toolB = {
+    type: "ephemeral",
+    data: { kind: "tool_call_started", delta: {}, header: { session_id: "s", loop_id: LOOP_B } },
+  } as never;
+
+  it("keys a frame by its DECLARED kind and producing loop, not by its payload", () => {
+    expect(ephemeralDropKey(textFrame("a", LOOP_A) as never)).toBe(ephemeralDropKey(textFrame("bbb", LOOP_A) as never));
+    expect(ephemeralDropKey(textFrame("a", LOOP_A) as never)).not.toBe(ephemeralDropKey(textFrame("a", LOOP_B) as never));
+    expect(ephemeralDropKey(textFrame("a", LOOP_A) as never)).not.toBe(ephemeralDropKey(toolB));
+    expect(ephemeralDropKey(heartbeatFrame() as never)).toBe("heartbeat");
+  });
+
+  it("evicts from the NOISIEST key, leaving a quiet peer stream intact", () => {
+    const frames = [toolB, tokenA, textFrame("b", LOOP_A), textFrame("c", LOOP_A)];
+    // Three token_deltas on loop A, one tool_call_started on loop B. The victim
+    // is the oldest of the busy key, never the lone frame of the quiet one.
+    expect(selectFrameToDrop(frames as never)).toBe(1);
+  });
+
+  it("classifies exactly heartbeat and ephemeral frames as droppable", () => {
+    expect(isDroppableFrame(heartbeatFrame())).toBe(true);
+    expect(isDroppableFrame(textFrame("a", LOOP_A))).toBe(true);
+    expect(isDroppableFrame(enduringFrame(1, envelope({ type: "TurnDone", loopId: LOOP_A })))).toBe(false);
+    expect(isDroppableFrame(errorFrame("x"))).toBe(false);
+  });
+
+  it("cannot be handed an enduring frame, and names no victim if erasure hands it one anyway", () => {
+    const enduring = enduringFrame(1, envelope({ type: "TurnDone", loopId: LOOP_A }));
+    // @ts-expect-error an EnduringSseFrame is not a DroppableFrame. If this
+    // line ever compiles, `npm run typecheck` fails on the unused suppression.
+    const chosen: number = selectFrameToDrop([enduring]);
+    expect(chosen).toBe(-1);
   });
 });

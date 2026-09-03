@@ -48,6 +48,7 @@ import { emptySessionView, type FoldInput, type SessionView } from "./fold.js";
 import {
   joinFactorySessionView,
   joinSessionView,
+  type BindingState,
   type FactoryJoinEvent,
   type FactoryJoinLink,
   type FactoryJoinOptions,
@@ -207,11 +208,16 @@ export interface SessionViewStoreOptions {
    * overflow lands on this store's error channel — all three are excluded from
    * the caller's reach rather than silently overridden.
    */
-  join?: Omit<JoinOptions, "signal" | "maxQueuedFrames" | "onQueueOverflow">;
+  join?: Omit<JoinOptions, "signal" | "maxQueuedFrames" | "onQueueOverflow" | "onBindingState">;
   /**
    * Upper bound on live frames buffered ahead of the fold. Defaults to
-   * `DEFAULT_MAX_QUEUED_FRAMES`. Overflow is reported on `subscribeErrors`; see
-   * `selectFrameToDrop` for the drop policy.
+   * `DEFAULT_MAX_QUEUED_FRAMES`.
+   *
+   * Evicting an EPHEMERAL frame is reported on `subscribeErrors`, on a doubling
+   * schedule; see `selectFrameToDrop` for which frames that policy may touch.
+   * A backlog of DURABLE frames is not evicted at all — the binding transitions
+   * to `repair_required` (see `subscribeBindingState`) and re-reads from its
+   * last committed journal sequence.
    */
   maxQueuedFrames?: number;
   scheduler?: FrameScheduler;
@@ -223,6 +229,7 @@ export class SessionViewStore {
   private readonly listeners = new Set<() => void>();
   private readonly errorListeners = new Set<(error: Error) => void>();
   private readonly lifecycleListeners = new Set<(active: boolean) => void>();
+  private readonly bindingListeners = new Set<(state: BindingState) => void>();
 
   private current: SessionView = emptySessionView();
   private published: SessionViewSnapshot;
@@ -248,6 +255,12 @@ export class SessionViewStore {
   private urgentFlush = false;
   /** True once a publication reflects a completed run, so `start()` knows to reset it. */
   private stalePublication = false;
+  /**
+   * This binding's live-plane state. `repair_required` from the moment the live
+   * buffer refused to drop durable content until the repairing connection's
+   * cold read has come back from the last committed sequence.
+   */
+  private binding: BindingState = "live";
 
   constructor(options: SessionViewStoreOptions) {
     this.options = options;
@@ -315,6 +328,43 @@ export class SessionViewStore {
     };
   }
 
+  /**
+   * Subscribes to this binding's live-plane state. Returns an unsubscribe.
+   *
+   * This is a THIRD channel, and it is neither of the other two on purpose. It
+   * is not view state: a view carries no trace of a frame that was never
+   * applied, so a repair coalesced into the snapshot would be invisible by
+   * construction. It is not a fold error either: nothing was malformed, and the
+   * join keeps running. What it reports is that this binding's live buffer
+   * refused to drop durable content, discarded its buffer UNAPPLIED, and is
+   * re-reading from the last committed journal sequence.
+   *
+   * Per BINDING, never global: a store holding one session's join announces
+   * only its own state, so a consumer with several never has to infer which one
+   * degraded. Fires only on a REAL transition and, like `subscribeErrors`, is
+   * not coalesced.
+   *
+   * `repair_required` is ALSO announced on `subscribeErrors` as a
+   * `LiveQueueOverflowError`, because a repair a user cannot see is
+   * indistinguishable from a session that quietly stopped catching up. It
+   * cannot storm: the echo is gated on the TRANSITION, and the join announces
+   * `repair_required` at most once per repair episode — a second refusal before
+   * the repairing cold read has returned is suppressed, which is pinned by
+   * test/store-backpressure.test.ts's "announces repair_required ONCE across
+   * two overflows with no repair in between".
+   */
+  subscribeBindingState(listener: (state: BindingState) => void): () => void {
+    this.bindingListeners.add(listener);
+    return () => {
+      this.bindingListeners.delete(listener);
+    };
+  }
+
+  /** This binding's live-plane state. See `subscribeBindingState`. */
+  bindingState(): BindingState {
+    return this.binding;
+  }
+
   /** The current published snapshot. Its reference changes only at notify. */
   snapshot(): SessionViewSnapshot {
     return this.published;
@@ -346,6 +396,7 @@ export class SessionViewStore {
       this.stalePublication = false;
     }
     this.nextOverflowReport = 1;
+    this.setBindingState("live");
     const generation = ++this.generation;
 
     const abortController = new AbortController();
@@ -385,6 +436,15 @@ export class SessionViewStore {
           this.emitError(
             new Error(`live frame queue overflow: ${droppedTotal} live frame(s) dropped`),
           );
+        },
+        onBindingState: (state, cause) => {
+          // Generation-guarded exactly like every other callback here: a
+          // superseded join must not be able to flip a state a newer cycle owns.
+          if (generation !== this.generation) return;
+          // The error echo is gated on the TRANSITION, never on a repeat of a
+          // state already held, so it cannot storm on a binding that is already
+          // repairing.
+          if (this.setBindingState(state) && cause !== undefined) this.emitError(cause);
         },
       },
     );
@@ -430,6 +490,19 @@ export class SessionViewStore {
         this.finalize();
       }
     }
+  }
+
+  /**
+   * The ONE place `binding` is written, so every transition is announced
+   * exactly once and a no-op assignment announces nothing. Returns whether the
+   * state actually moved, which is what gates the error-channel echo at the
+   * call site.
+   */
+  private setBindingState(state: BindingState): boolean {
+    if (this.binding === state) return false;
+    this.binding = state;
+    for (const listener of [...this.bindingListeners]) listener(state);
+    return true;
   }
 
   private emitError(error: Error): void {

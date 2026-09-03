@@ -1,5 +1,19 @@
 /**
- * The live frame queue is BOUNDED, and every drop is reported.
+ * The live frame queue is BOUNDED, and the bound is LOSSLESS BY REPAIR.
+ *
+ * Two halves. Ephemeral and heartbeat frames are evicted under pressure and
+ * every eviction is reported (`onQueueOverflow`) — losing one is already a
+ * tolerated condition, since a reconnect replays enduring frames only and the
+ * following `StepDone` snaps the live segment wholesale. Durable frames —
+ * `enduring`, and `error`, which may BE an unparseable enduring frame — are
+ * never evicted: the queue discards its buffer unapplied and the binding
+ * repairs from its last committed journal sequence.
+ *
+ * U2.2 inverted the second half. It used to drop the oldest enduring frame and
+ * report it, which is silent durable loss with a receipt attached: nothing
+ * re-delivers the frame and the reconnect cursor advances past it as soon as a
+ * later frame is applied, so the transcript had a hole AND a persisted cursor
+ * asserting the hole was covered.
  *
  * `join.ts`'s internal `AsyncQueue.push()` never blocks and had no drop policy,
  * so the buffer grew for exactly as long as the network outran `fold` — on a
@@ -25,6 +39,7 @@ import {
   DEFAULT_MAX_QUEUED_FRAMES,
   joinSessionView,
   selectFrameToDrop,
+  type JournalReader,
   type LiveFrameSource,
 } from "../src/join.js";
 import { SessionViewStore } from "../src/store.js";
@@ -36,42 +51,54 @@ import {
   errorFrame,
   heartbeatFrame,
   manualScheduler,
+  pageOf,
   textFrame,
   tick,
 } from "./store-fakes.js";
-import { LOOP_A, envelope } from "./helpers.js";
+import { LOOP_A, LOOP_B, envelope } from "./helpers.js";
 
 const enduring = (seq: number): SseFrame => enduringFrame(seq, envelope({ type: "TurnDone", loopId: LOOP_A }));
 
 describe("selectFrameToDrop", () => {
   it("drops a heartbeat before anything else — it carries no content at all", () => {
     const frames = [enduring(1), textFrame("a", LOOP_A), heartbeatFrame(), errorFrame("x")];
-    expect(selectFrameToDrop(frames)).toBe(2);
+    expect(selectFrameToDrop(frames as never)).toBe(2);
   });
 
   it("drops the OLDEST ephemeral frame once no heartbeat remains", () => {
     const frames = [enduring(1), textFrame("a", LOOP_A), textFrame("b", LOOP_A), errorFrame("x")];
-    expect(selectFrameToDrop(frames)).toBe(1);
+    expect(selectFrameToDrop(frames as never)).toBe(1);
   });
 
   it("never drops an enduring frame while any ephemeral frame remains", () => {
     const frames = [textFrame("a", LOOP_A), enduring(1), enduring(2)];
-    expect(selectFrameToDrop(frames)).toBe(0);
+    expect(selectFrameToDrop(frames as never)).toBe(0);
   });
 
-  it("drops the oldest enduring frame once nothing cheaper remains", () => {
+  it("names NO victim rather than the oldest enduring frame once nothing cheaper remains", () => {
+    // The inversion. Before U2.2 this returned 1 -- the oldest enduring frame,
+    // dropped and never re-delivered, with the reconnect cursor free to walk
+    // past it. -1 is "nothing here may be dropped", which is what makes the
+    // queue repair instead.
     const frames = [errorFrame("x"), enduring(1), enduring(2)];
-    expect(selectFrameToDrop(frames)).toBe(1);
+    expect(selectFrameToDrop(frames as never)).toBe(-1);
   });
 
-  it("drops an error frame only when the buffer holds nothing else", () => {
+  it("names NO victim in a buffer of error frames either", () => {
+    // An error frame is a frame that failed to parse. It MAY have been an
+    // enduring event, and nothing can tell after the fact, so it is outside the
+    // eviction domain for the same reason: dropping it loses durable content
+    // silently. Before U2.2 this returned 0.
     const frames = [errorFrame("x"), errorFrame("y")];
-    expect(selectFrameToDrop(frames)).toBe(0);
+    expect(selectFrameToDrop(frames as never)).toBe(-1);
   });
 
-  it("returns a valid index for a single-element buffer of any type", () => {
-    for (const frame of [heartbeatFrame(), textFrame("a", LOOP_A), enduring(1), errorFrame("x")]) {
-      expect(selectFrameToDrop([frame])).toBe(0);
+  it("returns index 0 for a single droppable frame and -1 for a single durable one", () => {
+    for (const frame of [heartbeatFrame(), textFrame("a", LOOP_A)]) {
+      expect(selectFrameToDrop([frame] as never)).toBe(0);
+    }
+    for (const frame of [enduring(1), errorFrame("x")]) {
+      expect(selectFrameToDrop([frame] as never)).toBe(-1);
     }
   });
 
@@ -86,13 +113,13 @@ describe("selectFrameToDrop", () => {
  * the live handle so the caller can keep pushing into a consumer that is not
  * reading.
  */
-async function parkedJoin(options: { maxQueuedFrames: number; onQueueOverflow: (total: number) => void }) {
+async function parkedJoin(options: Record<string, unknown>, journal?: JournalReader) {
   const live = controllableLive();
   const generator = joinSessionView(
-    { readHistory: async () => emptyPage },
+    journal ?? { readHistory: async () => emptyPage },
     "s1",
     live.source,
-    { autoReconnect: false, ...options },
+    { autoReconnect: false, ...options } as never,
   );
   const first = generator.next();
   await tick();
@@ -145,6 +172,164 @@ describe("joinSessionView: bounded live queue", () => {
       .map((frame) => frame.journalSeq);
     expect(enduringSeqs).toStrictEqual([10, 11]);
     await generator.return();
+  });
+
+  it("repairs instead of dropping an enduring frame the buffer cannot make room for", async () => {
+    // THE INVERSION, at the level that matters. Three enduring frames into a
+    // two-frame buffer used to evict the oldest and report a drop; the durable
+    // event was gone and the reconnect cursor was free to walk past it.
+    const onQueueOverflow = vi.fn();
+    const states: string[] = [];
+    const { generator, live } = await parkedJoin({
+      maxQueuedFrames: 2,
+      onQueueOverflow,
+      onBindingState: (state: string) => states.push(state),
+    });
+    live.push(enduring(10));
+    live.push(enduring(11));
+    live.push(enduring(12));
+    await tick();
+
+    expect(states).toStrictEqual(["repair_required"]);
+    // Nothing was DROPPED: a drop report would be the store telling a consumer
+    // "this many frames are gone", which is exactly the claim U2.2 removes.
+    expect(onQueueOverflow).not.toHaveBeenCalled();
+    await generator.return();
+  });
+
+  it("does not repair while an ephemeral frame is still available to evict", async () => {
+    const onQueueOverflow = vi.fn();
+    const states: string[] = [];
+    const { generator, live } = await parkedJoin({
+      maxQueuedFrames: 2,
+      onQueueOverflow,
+      onBindingState: (state: string) => states.push(state),
+    });
+    live.push(enduring(10));
+    live.push(enduring(11));
+    live.push(textFrame("a", LOOP_A));
+    await tick();
+    expect(states).toStrictEqual([]);
+    expect(onQueueOverflow).toHaveBeenCalledWith(1);
+    await generator.return();
+  });
+
+  it("re-reads the overflowed sequences from the LAST COMMITTED cursor, never past them", async () => {
+    // Lossless-by-repair, end to end: the frames the queue refused to drop come
+    // back through the cold journal, from the cursor the join had actually
+    // committed -- not from the sequence of the frame it was holding.
+    const requested: number[] = [];
+    let call = 0;
+    const journal: JournalReader = {
+      readHistory: async (_sid, options) => {
+        requested.push(options?.fromJournalSeq ?? 0);
+        call += 1;
+        if (call === 1) return pageOf([]);
+        return pageOf([
+          envelope({ type: "TurnDone", loopId: LOOP_A }),
+          envelope({ type: "TurnDone", loopId: LOOP_A }),
+          envelope({ type: "TurnDone", loopId: LOOP_A }),
+        ]);
+      },
+    };
+    const states: string[] = [];
+    const { generator, live } = await parkedJoin(
+      {
+        maxQueuedFrames: 2,
+        autoReconnect: true,
+        reconnectDelayMs: 0,
+        onBindingState: (state: string) => states.push(state),
+      },
+      journal,
+    );
+    live.push(enduring(0));
+    live.push(enduring(1));
+    live.push(enduring(2));
+    await tick();
+    expect(states).toStrictEqual(["repair_required"]);
+
+    // Resume the consumer. The refused buffer must have CLOSED the queue: a
+    // queue that merely stopped accepting would leave the join parked at
+    // `queue.next()` forever, so this first read is raced against a real timer
+    // rather than awaited, and a stall is an assertion failure, not a hang.
+    const seen: unknown[] = [];
+    const first = await Promise.race([
+      generator.next().then((next) => {
+        if (next.done !== true) seen.push(next.value.input);
+        return next.done === true ? "ended" : "event";
+      }),
+      new Promise<string>((resolve) => setTimeout(() => resolve("stalled"), 200)),
+    ]);
+    expect(first).toBe("event");
+    for (let i = 0; i < 2; i++) {
+      const next = await generator.next();
+      if (next.done === true) break;
+      seen.push(next.value.input);
+    }
+    expect(requested).toStrictEqual([0, 0]);
+    expect(seen).toHaveLength(3);
+    expect(states).toStrictEqual(["repair_required", "live"]);
+    await generator.return();
+  });
+
+  it("announces repair_required ONCE across two overflows with no repair in between", async () => {
+    // The second overflow is a real, reachable state, not a hypothetical: the
+    // reconnect builds the replacement queue at the TOP of the connection loop,
+    // BEFORE that connection's cold read, so a binding can refuse a second
+    // backlog while it is still waiting to be repaired. `onBindingState` is a
+    // public join option, so a direct consumer — not only the store, which
+    // dedupes transitions itself — would see the repeat.
+    const controller = new AbortController();
+    let releaseSecondRead = (): void => {};
+    let hold = true;
+    let call = 0;
+    const journal: JournalReader = {
+      readHistory: async () => {
+        call += 1;
+        if (call === 1 || !hold) return emptyPage;
+        // Held open: this parks the join AFTER the reconnect has built the
+        // replacement queue and BEFORE the cold read can clear the pending
+        // repair, which is the only window in which a second refusal can
+        // happen without an intervening recovery.
+        return new Promise((resolve) => {
+          releaseSecondRead = () => resolve(emptyPage);
+        });
+      },
+    };
+    const states: string[] = [];
+    const { generator, live } = await parkedJoin(
+      {
+        maxQueuedFrames: 2,
+        autoReconnect: true,
+        reconnectDelayMs: 0,
+        signal: controller.signal,
+        onBindingState: (state: string) => states.push(state),
+      },
+      journal,
+    );
+    for (const seq of [10, 11, 12]) live.push(enduring(seq));
+    await tick();
+    expect(states).toStrictEqual(["repair_required"]);
+
+    // Let the join reconnect. It parks on the second cold read, with a fresh
+    // queue and a live connection this test can still push into.
+    void generator.next();
+    await tick();
+    expect(call).toBe(2);
+    for (const seq of [13, 14, 15]) live.push(enduring(seq));
+    await tick();
+
+    expect(states).toStrictEqual(["repair_required"]);
+
+    // Tear down through the SIGNAL, not `.return()`: a `.return()` queues
+    // behind the `.next()` still in flight above, which is parked on a cold
+    // read this test is deliberately holding open.
+    hold = false;
+    controller.abort();
+    releaseSecondRead();
+    live.close();
+    await tick();
+    void generator.return();
   });
 
   it("never drops a frame handed straight to a waiting consumer", async () => {
@@ -256,5 +441,75 @@ describe("SessionViewStore: overflow reporting", () => {
     }
     expect(onError).not.toHaveBeenCalled();
     store.stop();
+  });
+});
+
+/**
+ * Two bindings, one process, one shared scheduler and one shared journal
+ * reader.
+ *
+ * "Only that binding" is only a claim worth testing where the two bindings
+ * SHARE something: these two hold the same `FrameScheduler` instance (so a
+ * repair that cancelled frames globally would strand the peer's publication)
+ * and the same `JournalReader` (so a repair that reset a reader's state would
+ * corrupt the peer's cold walk). The peer assertion is deliberately
+ * DELIVERY, not absence of error: a binding that has stopped publishing but
+ * has not errored looks identical to a healthy one on every other channel.
+ */
+describe("SessionViewStore: two simultaneous bindings", () => {
+  function twoBindings() {
+    const scheduler = manualScheduler();
+    const journal: JournalReader = { readHistory: async () => emptyPage };
+    const flood = Array.from({ length: 400 }, (_, i) => enduring(i + 1));
+    const quiet = controllableLive();
+    const overflowing = new SessionViewStore({
+      journal,
+      sessionId: "flooded",
+      liveSource: burst(flood),
+      scheduler,
+      maxQueuedFrames: 2,
+    });
+    const peer = new SessionViewStore({
+      journal,
+      sessionId: "quiet",
+      liveSource: quiet.source,
+      scheduler,
+      maxQueuedFrames: 2,
+    });
+    return { scheduler, quiet, overflowing, peer };
+  }
+
+  it.each([
+    { name: "the flooded binding starts first", flip: false },
+    { name: "the quiet binding starts first", flip: true },
+  ])("repairs only the overflowing binding while its peer keeps delivering, when $name", async ({ flip }) => {
+    const { scheduler, quiet, overflowing, peer } = twoBindings();
+    const peerStates: string[] = [];
+    peer.subscribeBindingState((state) => peerStates.push(state));
+    const floodedStates: string[] = [];
+    overflowing.subscribeBindingState((state) => floodedStates.push(state));
+    peer.subscribeErrors(() => {});
+    overflowing.subscribeErrors(() => {});
+
+    for (const store of flip ? [peer, overflowing] : [overflowing, peer]) store.start();
+    for (let i = 0; i < 10; i++) await tick();
+
+    expect(overflowing.bindingState()).toBe("repair_required");
+    expect(floodedStates).toStrictEqual(["repair_required"]);
+
+    // The peer is not merely un-errored: it is still DELIVERING.
+    expect(peer.bindingState()).toBe("live");
+    expect(peerStates).toStrictEqual([]);
+    expect(peer.isActive()).toBe(true);
+    const before = peer.snapshot();
+    quiet.push(textFrame("after the peer repaired", LOOP_B));
+    await tick();
+    scheduler.flush();
+    const after = peer.snapshot();
+    expect(after.version).toBe(before.version + 1);
+    expect(after.view.rows.at(-1)).toMatchObject({ text: "after the peer repaired" });
+
+    overflowing.stop();
+    peer.stop();
   });
 });
