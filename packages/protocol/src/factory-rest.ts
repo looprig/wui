@@ -157,7 +157,7 @@ export class FactoryRestReads implements FactoryReads {
       throw new MalformedResponseError(path, response.status);
     }
     const contentLength = response.headers.get("Content-Length");
-    if (contentLength !== null && (!/^\d+$/.test(contentLength) || Number(contentLength) > options.maximumBytes)) {
+    if (contentLength !== null && (!/^\d+$/.test(contentLength) || Number(contentLength) !== options.maximumBytes)) {
       await response.body?.cancel().catch(() => undefined);
       throw new MalformedResponseError(path, response.status);
     }
@@ -175,8 +175,21 @@ export class FactoryRestReads implements FactoryReads {
     signal: AbortSignal | undefined,
   ): Promise<Uint8Array> {
     if (response.body === null) throw new MalformedResponseError(path, response.status);
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
+    let byobReader: ReadableStreamBYOBReader | undefined;
+    let defaultReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    // Fetch byte streams in the supported Node and Chromium targets expose a
+    // BYOB reader, so the transport requests no more than the exact remaining
+    // capacity. A custom/polyfilled default stream may deliver one chunk
+    // atomically before its size is observable; that fallback rejects before
+    // copying any oversized chunk and cancels without making another read.
+    try {
+      byobReader = response.body.getReader({ mode: "byob" });
+    } catch (cause) {
+      if (!(cause instanceof TypeError)) throw cause;
+      defaultReader = response.body.getReader();
+    }
+    const reader = byobReader ?? defaultReader!;
+    let bytes = new Uint8Array(maximumBytes);
     let total = 0;
     let cancellation: Promise<void> | undefined;
     const cancel = (): Promise<void> => {
@@ -192,7 +205,22 @@ export class FactoryRestReads implements FactoryReads {
       while (true) {
         let part: ReadableStreamReadResult<Uint8Array>;
         try {
-          part = await reader.read();
+          if (byobReader === undefined) {
+            part = await defaultReader!.read();
+          } else {
+            const byobPart = await byobReader.read(bytes.subarray(total));
+            if (byobPart.done) {
+              part = { done: true, value: undefined };
+            } else {
+              const value = new Uint8Array(
+                byobPart.value.buffer,
+                byobPart.value.byteOffset,
+                byobPart.value.byteLength,
+              );
+              bytes = new Uint8Array(byobPart.value.buffer);
+              part = { done: false, value };
+            }
+          }
         } catch (cause) {
           if (signal?.aborted || (cause instanceof DOMException && cause.name === "AbortError")) {
             throw new RequestAbortedError(path, { cause });
@@ -200,20 +228,14 @@ export class FactoryRestReads implements FactoryReads {
           throw new NetworkError(path, { cause });
         }
         if (signal?.aborted) throw new RequestAbortedError(path);
-        if (part.done) break;
+        if (part.done) throw new MalformedResponseError(path, response.status);
         if (part.value.byteLength > maximumBytes - total) {
           throw new MalformedResponseError(path, response.status);
         }
-        chunks.push(part.value.slice());
+        if (byobReader === undefined) bytes.set(part.value, total);
         total += part.value.byteLength;
+        if (total === maximumBytes) return bytes;
       }
-      const bytes = new Uint8Array(total);
-      let offset = 0;
-      for (const chunk of chunks) {
-        bytes.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
-      return bytes;
     } finally {
       signal?.removeEventListener("abort", abort);
       await cancel();

@@ -41,14 +41,16 @@ describe("FactoryRestReads bounded object ranges", () => {
     expect(new Headers(calls[0]?.init?.headers).get("Range")).toBe("bytes=2-4");
   });
 
-  it("cancels while reading as soon as a response body crosses the explicit maximum", async () => {
+  it("rejects one atomically delivered oversized default-reader chunk without another pull", async () => {
     let emittedBytes = 0;
+    let pulls = 0;
     let cancelled = false;
     const body = new ReadableStream<Uint8Array>({
       pull(controller) {
-        emittedBytes += 4;
-        controller.enqueue(new Uint8Array(4));
-        if (emittedBytes === 12) controller.close();
+        pulls += 1;
+        const chunkBytes = pulls === 1 ? 8 : 4;
+        emittedBytes += chunkBytes;
+        controller.enqueue(new Uint8Array(chunkBytes));
       },
       cancel() {
         cancelled = true;
@@ -67,6 +69,62 @@ describe("FactoryRestReads bounded object ranges", () => {
     })).rejects.toBeInstanceOf(MalformedResponseError);
     expect(cancelled).toBe(true);
     expect(emittedBytes).toBe(8);
+    expect(pulls).toBe(1);
+    expect(body.locked).toBe(false);
+  });
+
+  it("returns and cancels at exact fill without pulling one surplus byte", async () => {
+    let pulls = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(new Uint8Array([pulls]));
+      },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 });
+    const reads = new FactoryRestReads({ fetch: async () => new Response(body, {
+      status: 206,
+      headers: { "Content-Range": "bytes 0-3/4" },
+    }) });
+
+    await expect(reads.readObjectRange("session-1", "object-1", {
+      start: 0, end: 3, maximumBytes: 4,
+    })).resolves.toMatchObject({ bytes: new Uint8Array([1, 2, 3, 4]) });
+    expect(pulls).toBe(4);
+    expect(cancelled).toBe(true);
+    expect(body.locked).toBe(false);
+  });
+
+  it("caps a byte stream's BYOB delivery view to the exact remaining range", async () => {
+    let pulls = 0;
+    let cancelled = false;
+    const deliveredViewSizes: number[] = [];
+    const byteSource: UnderlyingByteSource = {
+      type: "bytes",
+      pull(controller) {
+        pulls += 1;
+        const request = controller.byobRequest;
+        if (request?.view === null || request === null) throw new Error("expected a BYOB request");
+        deliveredViewSizes.push(request.view.byteLength);
+        new Uint8Array(request.view.buffer, request.view.byteOffset, request.view.byteLength)[0] = pulls;
+        request.respond(1);
+      },
+      cancel() { cancelled = true; },
+    };
+    const body = new ReadableStream(byteSource);
+    const reads = new FactoryRestReads({ fetch: async () => new Response(body, {
+      status: 206,
+      headers: { "Content-Range": "bytes 0-3/4" },
+    }) });
+
+    await expect(reads.readObjectRange("session-1", "object-1", {
+      start: 0, end: 3, maximumBytes: 4,
+    })).resolves.toMatchObject({ bytes: new Uint8Array([1, 2, 3, 4]) });
+    expect(deliveredViewSizes).toStrictEqual([4, 3, 2, 1]);
+    expect(pulls).toBe(4);
+    expect(cancelled).toBe(true);
+    expect(body.locked).toBe(false);
   });
 
   it("rejects a legal HTTP 200 Range response before consuming its unproven body", async () => {
@@ -113,6 +171,28 @@ describe("FactoryRestReads bounded object ranges", () => {
     expect(emittedBytes).toBe(0);
   });
 
+  it("rejects a declared response length below the exact range before consuming the body", async () => {
+    let pulls = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(new Uint8Array(2));
+      },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 });
+    const reads = new FactoryRestReads({ fetch: async () => new Response(body, {
+      status: 206,
+      headers: { "Content-Range": "bytes 0-3/4", "Content-Length": "2" },
+    }) });
+
+    await expect(reads.readObjectRange("session-1", "object-1", {
+      start: 0, end: 3, maximumBytes: 4,
+    })).rejects.toBeInstanceOf(MalformedResponseError);
+    expect(pulls).toBe(0);
+    expect(cancelled).toBe(true);
+  });
+
   it("rejects Content-Range bounds that differ from the request before consuming the body", async () => {
     let emittedBytes = 0;
     let cancelled = false;
@@ -145,6 +225,24 @@ describe("FactoryRestReads bounded object ranges", () => {
     await expect(reads.readObjectRange("session-1", "object-1", {
       start: 0, end: 3, maximumBytes: 4,
     })).rejects.toBeInstanceOf(MalformedResponseError);
+  });
+
+  it("rejects a body that closes before the exact requested range is filled", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2]));
+        controller.close();
+      },
+    });
+    const reads = new FactoryRestReads({ fetch: async () => new Response(body, {
+      status: 206,
+      headers: { "Content-Range": "bytes 0-3/4" },
+    }) });
+
+    await expect(reads.readObjectRange("session-1", "object-1", {
+      start: 0, end: 3, maximumBytes: 4,
+    })).rejects.toBeInstanceOf(MalformedResponseError);
+    expect(body.locked).toBe(false);
   });
 
   it("classifies aborts before and during body reads and cancels the reader", async () => {
