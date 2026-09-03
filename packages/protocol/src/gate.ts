@@ -230,10 +230,16 @@ export function isGateAnswerability(value: unknown): value is GateAnswerability 
  * is `additionalProperties: true` at all three of those levels. A decoder that
  * filtered a denylist would forward whatever a Factory (or a compromised one)
  * chose to add; `decodeGateProjection` instead builds a fresh object from named
- * keys, and this table is pinned against the schema's own property set in both
- * directions by test/gate.test.ts. A property Core adds later is therefore
- * either classified here — projected, and then carried — or classified as
- * withheld, and then dropped on purpose. It cannot be silently neither.
+ * keys.
+ *
+ * `projected` maps each WIRE name to the name it is projected under, rather
+ * than merely listing the wire names, and that is what makes the table a guard
+ * in BOTH directions instead of documentation in one. test/gate.test.ts pins
+ * `Object.keys(projected) ∪ withheld` against the schema's own property set, so
+ * a property Core adds later is classified here or the test fails; and it pins
+ * `Object.values(projected)` against the decoder's actual output key paths, so
+ * moving a name from `projected` to `withheld` while the decoder still carries
+ * it — the table claiming a redaction that is not happening — fails too.
  *
  * `prompt.schema` is the one declared-but-withheld field, for the reason
  * `GatePrompt` already gives for the live envelope: a form gate is answered
@@ -242,19 +248,22 @@ export function isGateAnswerability(value: unknown): value is GateAnswerability 
  */
 export const GATE_PROJECTION_WIRE_FIELDS = {
   gate: {
-    projected: [
-      "gate_id",
-      "kind",
-      "prompt",
-      "opened_event_id",
-      "opened_journal_seq",
-      "deadline",
-      "answerability",
-    ],
+    projected: {
+      gate_id: "gateId",
+      kind: "kind",
+      prompt: "prompt",
+      opened_event_id: "openedEventId",
+      opened_journal_seq: "openedJournalSeq",
+      deadline: "deadline",
+      answerability: "answerability",
+    },
     withheld: [],
   },
-  prompt: { projected: ["title", "body", "origin", "controls"], withheld: ["schema"] },
-  control: { projected: ["action", "label"], withheld: [] },
+  prompt: {
+    projected: { title: "title", body: "body", origin: "origin", controls: "controls" },
+    withheld: ["schema"],
+  },
+  control: { projected: { action: "action", label: "label" }, withheld: [] },
 } as const;
 
 /**

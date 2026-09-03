@@ -33,6 +33,7 @@ import {
   type SessionView,
 } from "../src/fold.js";
 import { acceptsResidentResponse } from "../src/gate-actions.js";
+import { GATE_PROJECTION_WIRE_FIELDS } from "../src/gate.js";
 import type { EventEnvelope, PublicGatePage } from "../src/types.js";
 import { validatePublicGatePage } from "../src/validate.js";
 import {
@@ -479,6 +480,121 @@ describe("public gate board: cold projections merged with live events", () => {
     expect(publicGates(twice)).toStrictEqual(publicGates(once));
   });
 
+  it("treats a DUPLICATE cold page as a referential no-op, like the live duplicate", () => {
+    // The page path is the one a cold client POLLS, so this is the identity
+    // that actually matters: `packages/react`'s useStore derives a list as
+    // `useMemo(() => publicGates(board), [board])`, and a board rebuilt on
+    // every unchanged poll re-renders every gate card forever.
+    const records = [gateRecord(GATE_B, 7, "suspended"), gateRecord(GATE_A, 9, "resident")];
+    const once = foldPublicGatePage(emptyPublicGateBoard(), page(records), SESSION_ID);
+    expect(foldPublicGatePage(once, page(records), SESSION_ID)).toBe(once);
+    // A page whose every record is unkeyable applies nothing either.
+    expect(foldPublicGatePage(once, malformedPage([{ opened_journal_seq: 1 }]), SESSION_ID)).toBe(once);
+    // Anti-vacuity: it is not that this function always returns its argument.
+    expect(foldPublicGatePage(once, page([gateRecord(GATE_C, 8, "resident")]), SESSION_ID)).not.toBe(once);
+  });
+
+  it("changes board identity for EVERY mutable projected field, and for no immutable one", () => {
+    // `samePublicGateEntry` is a hand-written field list, so its completeness
+    // is the risk: a field it forgot would make a real update vanish. The leaf
+    // names are therefore read out of GATE_PROJECTION_WIRE_FIELDS and
+    // partitioned, and the partition is asserted to cover them exactly — a
+    // field added to the projection lands in neither list and fails here.
+    const { gate, prompt, control } = GATE_PROJECTION_WIRE_FIELDS;
+    const leaves = [
+      ...Object.keys(gate.projected).filter((n) => n !== "prompt"),
+      ...Object.keys(prompt.projected).filter((n) => n !== "controls").map((n) => `prompt.${n}`),
+      ...Object.keys(control.projected).map((n) => `prompt.controls[].${n}`),
+    ].sort();
+
+    type Edit = (record: Record<string, unknown>) => Record<string, unknown>;
+    const withPrompt = (record: Record<string, unknown>, patch: Record<string, unknown>) => ({
+      ...record,
+      prompt: { ...(record["prompt"] as Record<string, unknown>), ...patch },
+    });
+    const withControl = (record: Record<string, unknown>, patch: Record<string, unknown>) =>
+      withPrompt(record, {
+        controls: ((record["prompt"] as Record<string, unknown>)["controls"] as Array<Record<string, unknown>>).map(
+          (c) => ({ ...c, ...patch }),
+        ),
+      });
+
+    // A change a consumer can observe must produce a NEW board.
+    const mutable: Record<string, Edit> = {
+      "kind": (r) => ({ ...r, kind: "harness.form" }),
+      "deadline": (r) => ({ ...r, deadline: "2026-08-30T13:00:00Z" }),
+      "answerability": (r) => ({ ...r, answerability: "expired" }),
+      "prompt.title": (r) => withPrompt(r, { title: "Different" }),
+      "prompt.body": (r) => withPrompt(r, { body: "different" }),
+      "prompt.origin": (r) => withPrompt(r, { origin: "https://other.test" }),
+      "prompt.controls[].action": (r) => withControl(r, { action: "deny" }),
+      "prompt.controls[].label": (r) => withControl(r, { label: "Deny" }),
+    };
+    // The open position is written once, so a page disagreeing about it applies
+    // nothing — and must therefore NOT churn identity either.
+    const immutable: Record<string, Edit> = {
+      "opened_event_id": (r) => ({ ...r, opened_event_id: "event-99" }),
+      "opened_journal_seq": (r) => ({ ...r, opened_journal_seq: 42 }),
+    };
+    // A different gate id is a different key, so it adds an entry.
+    const rekeys: Record<string, Edit> = { "gate_id": (r) => ({ ...r, gate_id: GATE_C }) };
+
+    expect([...Object.keys(mutable), ...Object.keys(immutable), ...Object.keys(rekeys)].sort()).toStrictEqual(leaves);
+
+    const base = gateRecord(GATE_A, 6, "resident");
+    const board = foldPublicGatePage(emptyPublicGateBoard(), page([base]), SESSION_ID);
+    for (const [name, edit] of Object.entries(mutable)) {
+      const after = foldPublicGatePage(board, malformedPage([edit(base)]), SESSION_ID);
+      expect(after, `${name} did not change the board`).not.toBe(board);
+      expect(after.entries.size).toBe(1);
+    }
+    for (const [name, edit] of Object.entries(immutable)) {
+      expect(
+        foldPublicGatePage(board, malformedPage([edit(base)]), SESSION_ID),
+        `${name} churned board identity`,
+      ).toBe(board);
+    }
+    for (const [name, edit] of Object.entries(rekeys)) {
+      const after = foldPublicGatePage(board, malformedPage([edit(base)]), SESSION_ID);
+      expect(after, `${name} did not add an entry`).not.toBe(board);
+      expect(after.entries.size).toBe(2);
+    }
+    // Cardinality is not a leaf name and would otherwise go unchecked — in
+    // BOTH directions. `every` over the prior's controls already catches a
+    // control being removed (the new list indexes past its end), so only the
+    // ADDED direction reaches the length comparison; testing the shrink alone
+    // left dropping that comparison alive.
+    const fewer = withPrompt(base, { controls: [] });
+    expect(foldPublicGatePage(board, malformedPage([fewer]), SESSION_ID)).not.toBe(board);
+    const noControls = foldPublicGatePage(emptyPublicGateBoard(), malformedPage([fewer]), SESSION_ID);
+    expect(foldPublicGatePage(noControls, malformedPage([fewer]), SESSION_ID)).toBe(noControls);
+    expect(foldPublicGatePage(noControls, malformedPage([base]), SESSION_ID)).not.toBe(noControls);
+  });
+
+  it("RESURRECTS a resolved gate from a page that was in flight across the resolve", () => {
+    // The inverse of the never-removes limitation, and it is NOT covered by it:
+    // the page here is not stale-because-offline, it is a read that crossed a
+    // live GateResolved. The gate comes back with its attested `resident`, so
+    // `acceptsResidentResponse` reports a closed gate as answerable and nothing
+    // will ever remove it. Pinned, not fixed: this module sees no fetch time
+    // and no tip ordering, so the poll loop must choose a tombstone or a
+    // rebuild — see foldPublicGatePage's comment.
+    const inFlight = page([gateRecord(GATE_A, 6, "resident")]);
+    let board = foldPublicGatePage(emptyPublicGateBoard(), inFlight, SESSION_ID);
+    resetSeq();
+    board = foldPublicGateEvent(board, liveEnduring(gateResolved(GATE_A, LOOP_A)));
+    expect(board.entries.size).toBe(0);
+    board = foldPublicGatePage(board, inFlight, SESSION_ID);
+    expect(publicGates(board).map((g) => g.gateId)).toStrictEqual([GATE_A]);
+    expect(acceptsResidentResponse(publicGates(board)[0]!)).toBe(true);
+    // And a second copy of the same resolve does not clear it, because the
+    // board never saw the gate re-open — it is only removable by an event that
+    // will not come again.
+    resetSeq();
+    const rebuilt = foldPublicGateEvent(board, liveEnduring(gateResolved(GATE_A, LOOP_A)));
+    expect(rebuilt.entries.size).toBe(0);
+  });
+
   it("treats a DUPLICATE live GateOpened for a board gate as a referential no-op", () => {
     // Not merely equal — the identical object. A duplicate that rebuilt the map
     // would re-render every gate card in a subscriber, and (worse) is the
@@ -562,6 +678,19 @@ describe("public gate board: cold projections merged with live events", () => {
     expect(entry?.answerability).toBe("");
     expect(entry?.deadline).toBe("");
     expect(acceptsResidentResponse(entry!)).toBe(false);
+    // And the PRESENTATION half of the same rule: a live open is the only
+    // writer of `kind`/`prompt` for an entry no page has ever attested, so this
+    // is the entire content a renderer has for it. Without these four
+    // expectations a board fed only by live events renders blank cards — no
+    // title, no body, no buttons — and this case would still pass, because
+    // everything above it asserts what the entry must NOT say.
+    expect(entry?.kind).toBe("harness.permission");
+    expect(entry?.prompt).toStrictEqual({
+      title: "Allow Write?",
+      body: "write /tmp/x",
+      origin: "",
+      controls: [{ action: "Approve", label: "Approve" }],
+    });
   });
 
   it("downgrades a stale `resident` when a later page says otherwise", () => {

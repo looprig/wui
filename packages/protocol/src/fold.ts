@@ -87,8 +87,7 @@ import type { EphemeralFrame, EventEnvelope, EventHeader, PublicGatePage, Status
 import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "./sse.js";
 import { decodeEnduring, isZeroUUID, turnFailureText } from "./enduring.js";
 import { decodeGateProjection, type Gate, type PublicGateProjection } from "./gate.js";
-import { str } from "./blocks.js";
-import type { ContentBlock } from "./blocks.js";
+import { str, type ContentBlock } from "./blocks.js";
 import type { AssistantRow, LoopInfo, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft } from "./rows.js";
 import {
   narrationOf,
@@ -1645,7 +1644,29 @@ export function emptyPublicGateBoard(): PublicGateBoard {
  * (A gate EVENT, by contrast, names its own session, so `foldPublicGateEvent`
  * reads it from the envelope and never takes it from a caller.)
  *
- * Returns the same board object when the page changes nothing.
+ * RETURNS THE IDENTICAL BOARD when the page applies nothing — every record
+ * already present and equal, or every record unkeyable, or no records at all.
+ * This is not a micro-optimisation, and the sentence is here because it is
+ * asserted with `toBe`, not because it reads well. The page path is the one a
+ * cold client POLLS, and `packages/react`'s `useStore` requires a selector to
+ * return something already in the snapshot, so a consumer derives its list as
+ * `useMemo(() => publicGates(board), [board])`. A board rebuilt on every
+ * unchanged poll produces a fresh array and re-renders every gate card
+ * forever. The live duplicate has the same guarantee for the same reason.
+ *
+ * ### The in-flight page race, which is NOT handled here
+ *
+ * A page merge never removes (see `PublicGateBoard`), and the inverse race is
+ * real too: a page fetched BEFORE a `GateResolved` but merged AFTER it
+ * RESURRECTS the resolved gate, complete with whatever `answerability` the
+ * page attested — so `acceptsResidentResponse` can report a closed gate as
+ * answerable, and only another `GateResolved` (which will never arrive) or a
+ * rebuild removes it. This module cannot fix it: it sees no fetch time and no
+ * tip ordering. The poll loop above it must choose — a tombstone keyed by
+ * `(SessionID, GateID)` that suppresses a page record older than the observed
+ * resolve, or a rebuild from `emptyPublicGateBoard()` per page set. The
+ * behaviour is pinned by test so the choice is made deliberately at cutover
+ * rather than discovered as a stuck card.
  */
 export function foldPublicGatePage(
   board: PublicGateBoard,
@@ -1658,6 +1679,7 @@ export function foldPublicGatePage(
   const records: unknown = (page as unknown as Record<string, unknown>)["gates"];
   if (!Array.isArray(records) || records.length === 0) return board;
   const entries = new Map(board.entries);
+  let changed = false;
   for (const record of records) {
     const projection = decodeGateProjection(record);
     // Unkeyable. `gate_id` has minLength 1, so this is not real wire; keying it
@@ -1665,8 +1687,7 @@ export function foldPublicGatePage(
     if (projection.gateId === "") continue;
     const key = publicGateKey(sessionId, projection.gateId);
     const prior = entries.get(key);
-    entries.set(
-      key,
+    const entry: PublicGateEntry =
       prior === undefined
         ? { sessionId, ...projection }
         : {
@@ -1678,10 +1699,52 @@ export function foldPublicGatePage(
             // public order stable across a reload.
             openedEventId: prior.openedEventId,
             openedJournalSeq: prior.openedJournalSeq,
-          },
-    );
+          };
+    if (prior !== undefined && samePublicGateEntry(prior, entry)) continue;
+    changed = true;
+    entries.set(key, entry);
   }
-  return { entries };
+  return changed ? { entries } : board;
+}
+
+/**
+ * Whether a re-merged record would change anything a consumer can observe.
+ *
+ * Field-by-field rather than a structural walk, because it must be exactly the
+ * fields `PublicGateEntry` HAS: a comparator that silently ignored a field
+ * added later would make `foldPublicGatePage` swallow a real update, which is
+ * the worse direction of the identity guarantee. test/fold-gates.test.ts
+ * enumerates every projected leaf name from `GATE_PROJECTION_WIRE_FIELDS` and
+ * partitions it into the ones that must change the board and the ones that
+ * must not, so this list cannot fall behind the projection.
+ *
+ * The `sessionId`/`gateId` comparisons are UNREACHABLE at the one call site and
+ * are kept deliberately. `prior` is read from `publicGateKey(sessionId, gateId)`
+ * and `b` is built from those same two values, so the key already establishes
+ * both — no test can distinguish them from `true`, and a mutation that removes
+ * them is equivalent rather than surviving. They stay because they are the two
+ * fields whose disagreement would mean the caller compared entries from
+ * different keys, which is exactly the confusion the pair key exists to stop.
+ */
+function samePublicGateEntry(a: PublicGateEntry, b: PublicGateEntry): boolean {
+  return (
+    a.sessionId === b.sessionId &&
+    a.gateId === b.gateId &&
+    a.kind === b.kind &&
+    a.openedEventId === b.openedEventId &&
+    a.openedJournalSeq === b.openedJournalSeq &&
+    a.deadline === b.deadline &&
+    a.answerability === b.answerability &&
+    a.prompt.title === b.prompt.title &&
+    a.prompt.body === b.prompt.body &&
+    a.prompt.origin === b.prompt.origin &&
+    a.prompt.controls.length === b.prompt.controls.length &&
+    a.prompt.controls.every(
+      (control, index) =>
+        control.action === b.prompt.controls[index]?.action &&
+        control.label === b.prompt.controls[index]?.label,
+    )
+  );
 }
 
 /**
@@ -1693,6 +1756,12 @@ export function foldPublicGatePage(
  * unaddressed gate in the process into one bucket.
  */
 export function foldPublicGateEvent(board: PublicGateBoard, input: FoldInput): PublicGateBoard {
+  // This decodes the envelope a second time when a caller also runs `fold`
+  // (measured at ~3% of a 4 000-envelope replay). That is deliberate, not an
+  // oversight to collapse later: the second decode is what gives a board entry
+  // its OWN `prompt` object rather than one aliasing `SessionView.gates`. The
+  // board is copy-on-write and hands entries to a renderer; sharing the object
+  // with the live fold would make the two structures mutate together.
   const item = enduringItemOf(input);
   if (item === undefined) return board;
   const sessionId = str((item.envelope as unknown as Record<string, unknown>)["session_id"]);

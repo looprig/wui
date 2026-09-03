@@ -412,6 +412,23 @@ describe("decodeGateProjection", () => {
   }
 
   /**
+   * The key paths `GATE_PROJECTION_WIRE_FIELDS` CLAIMS the decoder emits.
+   * Everything, including the two container prefixes, is read out of the table:
+   * renaming `prompt` or `controls` there moves the derived paths with it, so
+   * the comparison against `shape()` stays honest.
+   */
+  function projectedKeyPaths(): string[] {
+    const { gate, prompt, control } = GATE_PROJECTION_WIRE_FIELDS;
+    const promptPath = gate.projected.prompt;
+    const controlsPath = `${promptPath}.${prompt.projected.controls}`;
+    return [
+      ...Object.values(gate.projected),
+      ...Object.values(prompt.projected).map((name) => `${promptPath}.${name}`),
+      ...Object.values(control.projected).map((name) => `${controlsPath}[].${name}`),
+    ];
+  }
+
+  /**
    * Every private thing the spec names (§13's "Private gate payloads, raw
    * answers, tool secrets, and signed action URLs stay in private storage",
    * §16's "raw gate answers and other private command payloads are not exposed
@@ -477,10 +494,12 @@ describe("decodeGateProjection", () => {
       const { projected, withheld } = GATE_PROJECTION_WIRE_FIELDS[level];
       const declared = SCHEMA_LEVELS[level];
       expect(declared.length, `${level}: schema declares no properties`).toBeGreaterThan(0);
-      expect([...projected, ...withheld].sort(), `${level}: allowlist/withheld does not partition the schema`)
-        .toStrictEqual([...declared].sort());
       expect(
-        projected.filter((name) => (withheld as readonly string[]).includes(name)),
+        [...Object.keys(projected), ...withheld].sort(),
+        `${level}: allowlist/withheld does not partition the schema`,
+      ).toStrictEqual([...declared].sort());
+      expect(
+        Object.keys(projected).filter((name) => (withheld as readonly string[]).includes(name)),
         `${level}: a property is both projected and withheld`,
       ).toStrictEqual([]);
     }
@@ -503,7 +522,13 @@ describe("decodeGateProjection", () => {
     // unbounded, so the assertion is on the OUTPUT: its key-path signature is a
     // constant, independent of the input. A decoder that copied unknown keys
     // through — or spread the record — cannot satisfy this.
-    const expected = [
+    //
+    // The expected set is DERIVED from the table, including the two container
+    // names used as prefixes, so this is the table's second direction: naming a
+    // field `withheld` while the decoder still carries it fails here. Pinned
+    // against the literal list below so the derivation cannot be vacuous.
+    const expected = [...projectedKeyPaths()].sort();
+    expect(expected).toStrictEqual([
       "answerability",
       "deadline",
       "gateId",
@@ -517,7 +542,7 @@ describe("decodeGateProjection", () => {
       "prompt.controls[].label",
       "prompt.origin",
       "prompt.title",
-    ];
+    ]);
     for (const record of [fixtureGateRecord(), poisonedRecord()]) {
       expect(shape(decodeGateProjection(record))).toStrictEqual(expected);
     }
