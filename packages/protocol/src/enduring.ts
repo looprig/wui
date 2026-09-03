@@ -26,6 +26,7 @@ import type { EventEnvelope } from "./types.js";
 import type { SseFrame } from "./sse.js";
 import { decodeMessage, decodeMessages, isRecord, str, type ConversationMessage } from "./blocks.js";
 import { decodeGate, type Gate } from "./gate.js";
+import { toolResultCaptures, type ToolResultCaptureSummary } from "./toolsummary.js";
 
 /** The canonical all-zeros uuid, as `uuid.UUID.String()` renders `[16]byte{}`. */
 const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
@@ -111,6 +112,8 @@ export interface TurnOpenerPayload {
 export interface StepDonePayload {
   kind: "StepDone";
   messages: ConversationMessage[];
+  /** Present only when the additive capture field was present on the wire. */
+  captures?: Map<string, ToolResultCaptureSummary>;
 }
 
 /**
@@ -473,7 +476,11 @@ function decodePayload(type: string, raw: Record<string, unknown>): EnduringPayl
         message: isRecord(raw["message"]) ? decodeMessage(raw["message"]) : undefined,
       };
     case "StepDone":
-      return { kind: "StepDone", messages: decodeMessages(raw["messages"]) };
+      return {
+        kind: "StepDone",
+        messages: decodeMessages(raw["messages"]),
+        ...(Array.isArray(raw["captures"]) ? { captures: toolResultCaptures(raw["captures"]) } : {}),
+      };
     case "TurnDone":
       return {
         kind: "TurnDone",

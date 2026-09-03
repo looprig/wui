@@ -50,6 +50,7 @@
  * never reach the browser; only the fact that something was withheld does.
  */
 import type { ContentBlock, ConversationMessage } from "./blocks.js";
+import type { ToolResultCaptureSummary } from "./toolsummary.js";
 
 export type NoticeLevel = "info" | "warn" | "error";
 export type ToolRowStatus = "running" | "ok" | "error" | "cancelled";
@@ -141,6 +142,8 @@ export interface ToolRow extends TranscriptRowCommon {
   summary: string;
   status: ToolRowStatus;
   result: string;
+  /** Safe durable locator/counts only; object bytes require an explicit Factory read. */
+  capture?: ToolResultCaptureSummary;
   /** Set when this tool call spawned a child loop; the child's rows anchor here. */
   spawnedLoopId: string;
 }

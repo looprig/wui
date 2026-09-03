@@ -80,7 +80,7 @@
     "test/rows-pending.test.ts": 22,
     "test/rows-stepdone.test.ts": 32,
     "test/rows-terminals.test.ts": 29,
-    "test/rows-tools.test.ts": 11,
+    "test/rows-tools.test.ts": 13,
     "test/rows.test.ts": 12,
     "test/serve-transport.test.ts": 6,
     "test/sse.test.ts": 23,
@@ -92,7 +92,7 @@
     "test/store-visibility.test.ts": 15,
     "test/store.test.ts": 8,
     "test/surface.test.ts": 30,
-    "test/toolsummary.test.ts": 25,
+    "test/toolsummary.test.ts": 34,
     "test/transport.test.ts": 46
   },
   "fileGranular": [

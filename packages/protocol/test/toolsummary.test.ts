@@ -36,8 +36,164 @@
  * and two UTF-8 bytes, so `.length` would disagree with tui on any non-ASCII
  * payload.
  */
-import { describe, expect, it } from "vitest";
-import { toolUseSummary } from "../src/toolsummary.js";
+import { readFileSync } from "node:fs";
+import { describe, expect, it, vi } from "vitest";
+import type { FactoryReads } from "../src/factory-rest.js";
+import { RequestAbortedError } from "../src/errors.js";
+import { readToolCapturePages, ToolCaptureIntegrityError, ToolCaptureTooLargeError } from "../src/content.js";
+import { toolResultCaptures, toolUseSummary, type ToolResultCaptureSummary } from "../src/toolsummary.js";
+import * as content from "../src/content.js";
+
+describe("retained tool-result content", () => {
+  it("exposes an explicit user-initiated pageable Factory read", () => {
+    expect(typeof (content as Record<string, unknown>)["readToolCapturePages"]).toBe("function");
+  });
+
+  const capture: ToolResultCaptureSummary = {
+    toolExecutionId: "f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1",
+    objectId: "object-1",
+    capturedBytes: 10,
+    originalBytes: 21,
+    originalBytesLowerBound: undefined,
+    declaredCeilingBytes: 10,
+    truncated: true,
+    truncationReason: "capture_ceiling",
+    encoding: "utf-8",
+  };
+  const digest = "sha256:72399361da6a7754fec986dca5b7cbaf1c810a28ded4abaf56b2106d06cb78b0";
+
+  function reads(overrides: Partial<FactoryReads> = {}): FactoryReads {
+    return {
+      listAgents: vi.fn(),
+      listRecentSessions: vi.fn(),
+      readStatus: vi.fn(),
+      readJournal: vi.fn(),
+      listGates: vi.fn(),
+      readObjectMetadata: vi.fn(async () => ({
+        reference: { object_id: "object-1" },
+        size_bytes: 10,
+        media_type: "text/plain",
+        digest,
+      })),
+      readObjectRange: vi.fn(async (_sessionId, _objectId, options) => ({
+        bytes: new TextEncoder().encode("abcdefghij").slice(options.start, options.end + 1),
+        contentRange: `bytes ${options.start}-${options.end}/10`,
+        mediaType: "text/plain",
+      })),
+      ...overrides,
+    } as FactoryReads;
+  }
+
+  it("continues exact inclusive ranges through the captured byte count after Host/workspace deletion", async () => {
+    const factory = reads();
+    const loaded = await readToolCapturePages(factory, "session-1", capture, { pageBytes: 4, ceilingBytes: 10 });
+
+    expect(factory.readObjectMetadata).toHaveBeenCalledWith("session-1", "object-1", { signal: undefined });
+    expect(vi.mocked(factory.readObjectRange).mock.calls.map(([, , options]) => [options.start, options.end])).toStrictEqual([
+      [0, 3], [4, 7], [8, 9],
+    ]);
+    expect(loaded.pages.map(({ start, end }) => [start, end])).toStrictEqual([[0, 3], [4, 7], [8, 9]]);
+    expect(new TextDecoder().decode(loaded.bytes)).toBe("abcdefghij");
+    expect(loaded.metadata.digest).toBe(digest);
+  });
+
+  it("allows a capture exactly at the caller's declared ceiling", async () => {
+    const factory = reads();
+    await expect(readToolCapturePages(factory, "session-1", capture, { pageBytes: 10, ceilingBytes: 10 })).resolves.toMatchObject({
+      pages: [{ start: 0, end: 9 }],
+    });
+  });
+
+  it("refuses an over-ceiling capture before metadata or object I/O", async () => {
+    const factory = reads();
+    await expect(readToolCapturePages(factory, "session-1", capture, { pageBytes: 4, ceilingBytes: 9 })).rejects.toBeInstanceOf(ToolCaptureTooLargeError);
+    expect(factory.readObjectMetadata).not.toHaveBeenCalled();
+    expect(factory.readObjectRange).not.toHaveBeenCalled();
+  });
+
+  it("cancels before the first object read and forwards mid-read cancellation", async () => {
+    const already = new AbortController();
+    already.abort();
+    const untouched = reads();
+    await expect(readToolCapturePages(untouched, "session-1", capture, { pageBytes: 4, ceilingBytes: 10, signal: already.signal })).rejects.toBeInstanceOf(RequestAbortedError);
+    expect(untouched.readObjectMetadata).not.toHaveBeenCalled();
+
+    const later = new AbortController();
+    const interrupted = new RequestAbortedError("range");
+    const factory = reads({ readObjectRange: vi.fn(async (_sid, _oid, options) => {
+      expect(options.signal).toBe(later.signal);
+      later.abort();
+      throw interrupted;
+    }) });
+    await expect(readToolCapturePages(factory, "session-1", capture, { pageBytes: 4, ceilingBytes: 10, signal: later.signal })).rejects.toBe(interrupted);
+
+    const completedPageAbort = new AbortController();
+    const ignoringFactory = reads({ readObjectRange: vi.fn(async (_sid, _oid, options) => {
+      completedPageAbort.abort();
+      return {
+        bytes: new TextEncoder().encode("abcdefghij").slice(options.start, options.end + 1),
+        contentRange: `bytes ${options.start}-${options.end}/10`,
+        mediaType: "text/plain",
+      };
+    }) });
+    await expect(readToolCapturePages(ignoringFactory, "session-1", capture, {
+      pageBytes: 4, ceilingBytes: 10, signal: completedPageAbort.signal,
+    })).rejects.toBeInstanceOf(RequestAbortedError);
+    expect(ignoringFactory.readObjectRange).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a digest mismatch after bounded reads", async () => {
+    const factory = reads({ readObjectMetadata: vi.fn(async () => ({
+      reference: { object_id: "object-1" }, size_bytes: 10, digest: `sha256:${"0".repeat(64)}`,
+    })) });
+    await expect(readToolCapturePages(factory, "session-1", capture, { pageBytes: 4, ceilingBytes: 10 })).rejects.toBeInstanceOf(ToolCaptureIntegrityError);
+  });
+
+  it("rejects metadata whose immutable size disagrees with the capture before range I/O", async () => {
+    const factory = reads({ readObjectMetadata: vi.fn(async () => ({
+      reference: { object_id: "object-1" }, size_bytes: 11, digest,
+    })) });
+    await expect(readToolCapturePages(factory, "session-1", capture, { pageBytes: 4, ceilingBytes: 10 })).rejects.toBeInstanceOf(ToolCaptureIntegrityError);
+    expect(factory.readObjectRange).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a missing retained object and never attempts a range", async () => {
+    const missing = new Error("object not found");
+    const factory = reads({ readObjectMetadata: vi.fn(async () => { throw missing; }) });
+    await expect(readToolCapturePages(factory, "session-1", capture, { pageBytes: 4, ceilingBytes: 10 })).rejects.toBe(missing);
+    expect(factory.readObjectRange).not.toHaveBeenCalled();
+  });
+});
+
+describe("tool-result capture projection against Core fixture authorities", () => {
+  it("uses Core's logical reference spelling and never copies private extensions", () => {
+    const reference = JSON.parse(readFileSync(new URL("../../../contract/fixtures/object_reference.json", import.meta.url), "utf8"));
+    const metadata = JSON.parse(readFileSync(new URL("../../../contract/fixtures/object_metadata.json", import.meta.url), "utf8"));
+    const captures = toolResultCaptures([{
+      tool_execution_id: "execution-1",
+      tool_use_id: "use-1",
+      reference: { ...reference, signed_url: "SECRET-url", backend_key: "SECRET-key", credential: "SECRET-credential", raw_bytes: "SECRET-bytes" },
+      captured_bytes: metadata.size_bytes,
+      original_bytes: null,
+      original_bytes_lower_bound: metadata.size_bytes + 1,
+      truncated: true,
+      truncation_reason: "source_limit",
+      encoding: "binary",
+    }]);
+    expect(captures.get("use-1")).toStrictEqual({
+      toolExecutionId: "execution-1",
+      objectId: reference.object_id,
+      capturedBytes: 42,
+      originalBytes: null,
+      originalBytesLowerBound: 43,
+      declaredCeilingBytes: undefined,
+      truncated: true,
+      truncationReason: "source_limit",
+      encoding: "binary",
+    });
+    expect(JSON.stringify(captures.get("use-1"))).not.toContain("SECRET");
+  });
+});
 
 describe("toolUseSummary: the path tools", () => {
   it("summarises Read, ReadFile and EditFile as their trimmed path", () => {

@@ -70,6 +70,73 @@ const TOOL_SKILL = "Skill";
 /** UTF-8 byte length — Go's `len(string)`, which `String.length` is not. */
 const utf8 = new TextEncoder();
 
+export type ToolResultEncoding = "utf-8" | "binary";
+export type ToolResultTruncationReason = "capture_ceiling" | "source_limit";
+
+/** Browser-safe metadata for one retained tool result. */
+export interface ToolResultCaptureSummary {
+  toolExecutionId: string;
+  objectId: string | undefined;
+  capturedBytes: number;
+  originalBytes: number | null;
+  originalBytesLowerBound: number | undefined;
+  /** Known exactly when capture stopped at Harness's declared capture ceiling. */
+  declaredCeilingBytes: number | undefined;
+  truncated: boolean;
+  truncationReason: ToolResultTruncationReason | undefined;
+  encoding: ToolResultEncoding;
+}
+
+function nonnegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * Decodes `StepDone.captures`, keyed by durable provider tool-use id. Every
+ * value is reconstructed from named safe fields; the reference is never
+ * spread, so URLs, backend keys, credentials, and bytes cannot reach a row.
+ */
+export function toolResultCaptures(raw: unknown): Map<string, ToolResultCaptureSummary> {
+  const out = new Map<string, ToolResultCaptureSummary>();
+  if (!Array.isArray(raw)) return out;
+  for (const candidate of raw) {
+    if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) continue;
+    const capture = candidate as Record<string, unknown>;
+    const toolUseId = typeof capture["tool_use_id"] === "string" ? capture["tool_use_id"] : "";
+    const toolExecutionId = typeof capture["tool_execution_id"] === "string" ? capture["tool_execution_id"] : "";
+    const capturedBytes = nonnegativeInteger(capture["captured_bytes"]);
+    const encoding = capture["encoding"];
+    if (toolUseId === "" || toolExecutionId === "" || capturedBytes === undefined || (encoding !== "utf-8" && encoding !== "binary")) continue;
+
+    const reference = capture["reference"];
+    const objectId = typeof reference === "object" && reference !== null && !Array.isArray(reference)
+      && typeof (reference as Record<string, unknown>)["object_id"] === "string"
+      && (reference as Record<string, unknown>)["object_id"] !== ""
+      ? (reference as Record<string, unknown>)["object_id"] as string
+      : undefined;
+    const originalRaw = capture["original_bytes"];
+    const originalBytes = originalRaw === null ? null : nonnegativeInteger(originalRaw);
+    if (originalBytes === undefined) continue;
+    const lowerBound = nonnegativeInteger(capture["original_bytes_lower_bound"]);
+    const truncated = capture["truncated"] === true;
+    const reasonRaw = capture["truncation_reason"];
+    const truncationReason = reasonRaw === "capture_ceiling" || reasonRaw === "source_limit" ? reasonRaw : undefined;
+
+    out.set(toolUseId, {
+      toolExecutionId,
+      objectId,
+      capturedBytes,
+      originalBytes,
+      originalBytesLowerBound: lowerBound,
+      declaredCeilingBytes: truncated && truncationReason === "capture_ceiling" ? capturedBytes : undefined,
+      truncated,
+      truncationReason,
+      encoding,
+    });
+  }
+  return out;
+}
+
 /**
  * The decoded string fields of one summariser's argument struct, or `undefined`
  * when the decode FAILED — a non-object input, or a mapped key whose value is

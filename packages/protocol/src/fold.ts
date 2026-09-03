@@ -1036,6 +1036,7 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
       // narration introduces the calls it accompanies.
       for (const use of toolUsesOf(assistant)) {
         const result = results.get(use.id);
+        const capture = decoded.payload.captures?.get(use.id);
         out = appendRow(out, {
           kind: "tool",
           loopId: decoded.loopId,
@@ -1057,6 +1058,7 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           // "ok" matches tui's storedStepToolCard rather than inventing an error.
           status: result?.isError === true ? "error" : "ok",
           result: toolResultText(result),
+          ...(capture === undefined ? {} : { capture }),
           // The child normally announced itself BEFORE this step was finalized —
           // a subagent runs to completion inside the call that spawned it — so
           // the anchor is usually known here. The reverse order (a LoopStarted
