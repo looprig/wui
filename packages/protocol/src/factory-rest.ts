@@ -40,6 +40,8 @@ export interface FactoryJournalOptions extends FactoryPageOptions {
 export interface ObjectRangeOptions extends RequestOptions {
   start: number;
   end: number;
+  /** Exact maximum response bytes this call is allowed to consume. */
+  maximumBytes: number;
 }
 
 export interface ObjectRange {
@@ -129,8 +131,12 @@ export class FactoryRestReads implements FactoryReads {
   }
 
   async readObjectRange(sessionId: string, objectId: string, options: ObjectRangeOptions): Promise<ObjectRange> {
-    if (!Number.isSafeInteger(options.start) || !Number.isSafeInteger(options.end) || options.start < 0 || options.end < options.start) {
-      throw new RangeError("object range must be non-negative safe integers with end >= start");
+    const rangeBytes = options.end - options.start + 1;
+    if (!Number.isSafeInteger(options.start) || !Number.isSafeInteger(options.end)
+      || options.start < 0 || options.end < options.start
+      || !Number.isSafeInteger(rangeBytes) || rangeBytes <= 0
+      || !Number.isSafeInteger(options.maximumBytes) || options.maximumBytes !== rangeBytes) {
+      throw new RangeError("object range and maximumBytes must describe the same positive safe-integer byte range");
     }
     const path = `/v1/sessions/${encodeURIComponent(sessionId)}/objects/${encodeURIComponent(objectId)}`;
     const response = await this.request(path, {
@@ -141,13 +147,78 @@ export class FactoryRestReads implements FactoryReads {
     if (!response.ok) await this.throwResponseError(path, response);
     const contentRange = response.headers.get("Content-Range");
     if (response.status !== 206 || contentRange === null) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new MalformedResponseError(path, response.status);
+    }
+    const expectedContentRangePrefix = `bytes ${options.start}-${options.end}/`;
+    const completeLength = contentRange.slice(expectedContentRangePrefix.length);
+    if (!contentRange.startsWith(expectedContentRangePrefix) || !/^(?:\d+|\*)$/.test(completeLength)) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new MalformedResponseError(path, response.status);
+    }
+    const contentLength = response.headers.get("Content-Length");
+    if (contentLength !== null && (!/^\d+$/.test(contentLength) || Number(contentLength) > options.maximumBytes)) {
+      await response.body?.cancel().catch(() => undefined);
       throw new MalformedResponseError(path, response.status);
     }
     return {
-      bytes: new Uint8Array(await response.arrayBuffer()),
+      bytes: await this.readBoundedBody(path, response, options.maximumBytes, options.signal),
       contentRange,
       mediaType: response.headers.get("Content-Type") ?? undefined,
     };
+  }
+
+  private async readBoundedBody(
+    path: string,
+    response: Response,
+    maximumBytes: number,
+    signal: AbortSignal | undefined,
+  ): Promise<Uint8Array> {
+    if (response.body === null) throw new MalformedResponseError(path, response.status);
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    let cancellation: Promise<void> | undefined;
+    const cancel = (): Promise<void> => {
+      cancellation ??= reader.cancel().catch(() => {
+        // Preserve the primary protocol/cancellation/read error.
+      });
+      return cancellation;
+    };
+    const abort = (): void => { void cancel(); };
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      if (signal?.aborted) throw new RequestAbortedError(path);
+      while (true) {
+        let part: ReadableStreamReadResult<Uint8Array>;
+        try {
+          part = await reader.read();
+        } catch (cause) {
+          if (signal?.aborted || (cause instanceof DOMException && cause.name === "AbortError")) {
+            throw new RequestAbortedError(path, { cause });
+          }
+          throw new NetworkError(path, { cause });
+        }
+        if (signal?.aborted) throw new RequestAbortedError(path);
+        if (part.done) break;
+        if (part.value.byteLength > maximumBytes - total) {
+          throw new MalformedResponseError(path, response.status);
+        }
+        chunks.push(part.value.slice());
+        total += part.value.byteLength;
+      }
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return bytes;
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      await cancel();
+      reader.releaseLock();
+    }
   }
 
   private async getJSON(path: string, signal?: AbortSignal): Promise<unknown> {

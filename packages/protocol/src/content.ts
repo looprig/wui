@@ -82,11 +82,17 @@ export async function readToolCapturePages(
   capture: ToolResultCaptureSummary,
   options: ReadToolCaptureOptions,
 ): Promise<ToolCaptureContent> {
-  if (!Number.isSafeInteger(options.pageBytes) || options.pageBytes <= 0) {
-    throw new RangeError("tool capture pageBytes must be a positive safe integer");
-  }
   if (!Number.isSafeInteger(options.ceilingBytes) || options.ceilingBytes < 0) {
     throw new RangeError("tool capture ceilingBytes must be a non-negative safe integer");
+  }
+  if (!Number.isSafeInteger(options.pageBytes)) {
+    throw new RangeError("tool capture pageBytes must be a positive safe integer within ceilingBytes");
+  }
+  if (options.pageBytes <= 0) {
+    throw new RangeError("tool capture pageBytes must be a positive safe integer within ceilingBytes");
+  }
+  if (options.pageBytes > options.ceilingBytes) {
+    throw new RangeError("tool capture pageBytes must be a positive safe integer within ceilingBytes");
   }
   if (capture.capturedBytes > options.ceilingBytes) throw new ToolCaptureTooLargeError();
   if (capture.objectId === undefined) throw new ToolCaptureIntegrityError("tool result has no retained object");
@@ -98,6 +104,8 @@ export async function readToolCapturePages(
   if (metadata.reference.object_id !== capture.objectId || metadata.size_bytes !== capture.capturedBytes) {
     throw new ToolCaptureIntegrityError();
   }
+  const digestMatch = /^sha256:([0-9a-f]{64})$/.exec(metadata.digest ?? "");
+  if (digestMatch === null) throw new ToolCaptureIntegrityError();
 
   const pages: ToolCapturePage[] = [];
   const bytes = new Uint8Array(capture.capturedBytes);
@@ -106,6 +114,7 @@ export async function readToolCapturePages(
     const page = await reads.readObjectRange(sessionId, capture.objectId, {
       start,
       end,
+      maximumBytes: end - start + 1,
       signal: options.signal,
     });
     throwIfCaptureReadAborted(options.signal, path);
@@ -117,14 +126,10 @@ export async function readToolCapturePages(
     pages.push({ start, end, bytes: bytes.subarray(start, end + 1) });
   }
 
-  if (metadata.digest !== undefined) {
-    const match = /^sha256:([0-9a-f]{64})$/.exec(metadata.digest);
-    if (match === null) throw new ToolCaptureIntegrityError();
-    const actual = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-    throwIfCaptureReadAborted(options.signal, path);
-    const actualHex = Array.from(actual, (byte) => byte.toString(16).padStart(2, "0")).join("");
-    if (actualHex !== match[1]) throw new ToolCaptureIntegrityError();
-  }
+  const actual = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  throwIfCaptureReadAborted(options.signal, path);
+  const actualHex = Array.from(actual, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  if (actualHex !== digestMatch[1]) throw new ToolCaptureIntegrityError();
   return { metadata, pages, bytes };
 }
 

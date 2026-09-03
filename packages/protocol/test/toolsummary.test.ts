@@ -38,8 +38,8 @@
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import type { FactoryReads } from "../src/factory-rest.js";
-import { RequestAbortedError } from "../src/errors.js";
+import { FactoryRestReads, type FactoryReads } from "../src/factory-rest.js";
+import { CoreProtocolError, RequestAbortedError } from "../src/errors.js";
 import { readToolCapturePages, ToolCaptureIntegrityError, ToolCaptureTooLargeError } from "../src/content.js";
 import { toolResultCaptures, toolUseSummary, type ToolResultCaptureSummary } from "../src/toolsummary.js";
 import * as content from "../src/content.js";
@@ -85,12 +85,36 @@ describe("retained tool-result content", () => {
   }
 
   it("continues exact inclusive ranges through the captured byte count after Host/workspace deletion", async () => {
-    const factory = reads();
+    const requests: Array<{ url: string; authorization: string | null; range: string | null }> = [];
+    const source = new TextEncoder().encode("abcdefghij");
+    const factory = new FactoryRestReads({
+      baseUrl: "https://factory.example",
+      credentials: { restHeaders: () => ({ Authorization: "Bearer retained-object-token" }) },
+      fetch: async (url, init) => {
+        const headers = new Headers(init?.headers);
+        requests.push({ url, authorization: headers.get("Authorization"), range: headers.get("Range") });
+        if (url.endsWith("/metadata")) {
+          return new Response(JSON.stringify({
+            reference: { object_id: "object-1" }, size_bytes: 10, media_type: "text/plain", digest,
+          }), { status: 200 });
+        }
+        const match = /^bytes=(\d+)-(\d+)$/.exec(headers.get("Range") ?? "");
+        if (match === null) throw new Error("missing range");
+        const start = Number(match[1]);
+        const end = Number(match[2]);
+        return new Response(source.slice(start, end + 1), {
+          status: 206,
+          headers: { "Content-Range": `bytes ${start}-${end}/10`, "Content-Type": "text/plain" },
+        });
+      },
+    });
     const loaded = await readToolCapturePages(factory, "session-1", capture, { pageBytes: 4, ceilingBytes: 10 });
 
-    expect(factory.readObjectMetadata).toHaveBeenCalledWith("session-1", "object-1", { signal: undefined });
-    expect(vi.mocked(factory.readObjectRange).mock.calls.map(([, , options]) => [options.start, options.end])).toStrictEqual([
-      [0, 3], [4, 7], [8, 9],
+    expect(requests).toStrictEqual([
+      { url: "https://factory.example/v1/sessions/session-1/objects/object-1/metadata", authorization: "Bearer retained-object-token", range: null },
+      { url: "https://factory.example/v1/sessions/session-1/objects/object-1", authorization: "Bearer retained-object-token", range: "bytes=0-3" },
+      { url: "https://factory.example/v1/sessions/session-1/objects/object-1", authorization: "Bearer retained-object-token", range: "bytes=4-7" },
+      { url: "https://factory.example/v1/sessions/session-1/objects/object-1", authorization: "Bearer retained-object-token", range: "bytes=8-9" },
     ]);
     expect(loaded.pages.map(({ start, end }) => [start, end])).toStrictEqual([[0, 3], [4, 7], [8, 9]]);
     expect(new TextDecoder().decode(loaded.bytes)).toBe("abcdefghij");
@@ -102,6 +126,19 @@ describe("retained tool-result content", () => {
     await expect(readToolCapturePages(factory, "session-1", capture, { pageBytes: 10, ceilingBytes: 10 })).resolves.toMatchObject({
       pages: [{ start: 0, end: 9 }],
     });
+  });
+
+  it.each([0, -1, 1.5, 11])("rejects invalid pageBytes %s before Factory I/O", async (pageBytes) => {
+    const emptyCapture = { ...capture, capturedBytes: 0 };
+    const factory = reads({ readObjectMetadata: vi.fn(async () => ({
+      reference: { object_id: "object-1" }, size_bytes: 0,
+      digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    })) });
+    await expect(readToolCapturePages(factory, "session-1", emptyCapture, {
+      pageBytes, ceilingBytes: 10,
+    })).rejects.toBeInstanceOf(RangeError);
+    expect(factory.readObjectMetadata).not.toHaveBeenCalled();
+    expect(factory.readObjectRange).not.toHaveBeenCalled();
   });
 
   it("refuses an over-ceiling capture before metadata or object I/O", async () => {
@@ -149,6 +186,21 @@ describe("retained tool-result content", () => {
     await expect(readToolCapturePages(factory, "session-1", capture, { pageBytes: 4, ceilingBytes: 10 })).rejects.toBeInstanceOf(ToolCaptureIntegrityError);
   });
 
+  it.each([
+    ["missing", undefined],
+    ["malformed", "sha256:not-a-digest"],
+    ["unsupported", `sha512:${"0".repeat(128)}`],
+  ])("requires a supported sha256 digest before object-range I/O when metadata is %s", async (_name, metadataDigest) => {
+    const factory = reads({ readObjectMetadata: vi.fn(async () => ({
+      reference: { object_id: "object-1" }, size_bytes: 10, digest: metadataDigest,
+    })) });
+
+    await expect(readToolCapturePages(factory, "session-1", capture, {
+      pageBytes: 4, ceilingBytes: 10,
+    })).rejects.toBeInstanceOf(ToolCaptureIntegrityError);
+    expect(factory.readObjectRange).not.toHaveBeenCalled();
+  });
+
   it("rejects metadata whose immutable size disagrees with the capture before range I/O", async () => {
     const factory = reads({ readObjectMetadata: vi.fn(async () => ({
       reference: { object_id: "object-1" }, size_bytes: 11, digest,
@@ -157,11 +209,55 @@ describe("retained tool-result content", () => {
     expect(factory.readObjectRange).not.toHaveBeenCalled();
   });
 
-  it("surfaces a missing retained object and never attempts a range", async () => {
-    const missing = new Error("object not found");
-    const factory = reads({ readObjectMetadata: vi.fn(async () => { throw missing; }) });
-    await expect(readToolCapturePages(factory, "session-1", capture, { pageBytes: 4, ceilingBytes: 10 })).rejects.toBe(missing);
+  it("rejects metadata bound to a different object before range I/O", async () => {
+    const factory = reads({ readObjectMetadata: vi.fn(async () => ({
+      reference: { object_id: "object-2" }, size_bytes: 10, digest,
+    })) });
+    await expect(readToolCapturePages(factory, "session-1", capture, {
+      pageBytes: 4, ceilingBytes: 10,
+    })).rejects.toBeInstanceOf(ToolCaptureIntegrityError);
     expect(factory.readObjectRange).not.toHaveBeenCalled();
+  });
+
+  it("rejects a Content-Range that does not exactly bind the requested page", async () => {
+    const factory = reads({ readObjectRange: vi.fn(async (_sid, _oid, options) => ({
+      bytes: new TextEncoder().encode("abcdefghij").slice(options.start, options.end + 1),
+      contentRange: `bytes ${options.start}-${options.end}/11`,
+      mediaType: "text/plain",
+    })) });
+    await expect(readToolCapturePages(factory, "session-1", capture, {
+      pageBytes: 4, ceilingBytes: 10,
+    })).rejects.toBeInstanceOf(ToolCaptureIntegrityError);
+  });
+
+  it("rejects a returned page whose byte length differs from its requested range", async () => {
+    const factory = reads({ readObjectRange: vi.fn(async (_sid, _oid, options) => ({
+      bytes: new TextEncoder().encode("abc"),
+      contentRange: `bytes ${options.start}-${options.end}/10`,
+      mediaType: "text/plain",
+    })) });
+    await expect(readToolCapturePages(factory, "session-1", capture, {
+      pageBytes: 4, ceilingBytes: 10,
+    })).rejects.toBeInstanceOf(ToolCaptureIntegrityError);
+  });
+
+  it("surfaces a missing retained object and never attempts a range", async () => {
+    const requests: string[] = [];
+    const factory = new FactoryRestReads({
+      baseUrl: "https://factory.example",
+      fetch: async (url) => {
+        requests.push(url);
+        return new Response(JSON.stringify({
+          error: { code: "not_found", message: "not found", retryable: false },
+        }), { status: 404 });
+      },
+    });
+    await expect(readToolCapturePages(factory, "session-1", capture, {
+      pageBytes: 4, ceilingBytes: 10,
+    })).rejects.toMatchObject({ constructor: CoreProtocolError, code: "not_found" });
+    expect(requests).toStrictEqual([
+      "https://factory.example/v1/sessions/session-1/objects/object-1/metadata",
+    ]);
   });
 });
 

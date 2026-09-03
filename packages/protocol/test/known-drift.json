@@ -63,6 +63,7 @@
     "test/contract.test.ts": 66,
     "test/enduring.test.ts": 62,
     "test/errors.test.ts": 10,
+    "test/factory-rest.test.ts": 15,
     "test/fold-contract-fixtures.test.ts": 1,
     "test/fold-gates.test.ts": 39,
     "test/fold-immutability.test.ts": 6,
@@ -92,7 +93,7 @@
     "test/store-visibility.test.ts": 15,
     "test/store.test.ts": 8,
     "test/surface.test.ts": 30,
-    "test/toolsummary.test.ts": 34,
+    "test/toolsummary.test.ts": 44,
     "test/transport.test.ts": 46
   },
   "fileGranular": [
