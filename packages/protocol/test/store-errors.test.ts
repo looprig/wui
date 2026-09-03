@@ -26,6 +26,7 @@ import {
   tick,
 } from "./store-fakes.js";
 import { LOOP_A, envelope } from "./helpers.js";
+import type { EventJournalPage } from "../src/types.js";
 
 function makeStore() {
   const scheduler = manualScheduler();
@@ -251,7 +252,7 @@ describe("SessionViewStore: binding state", () => {
     // channel must not turn it into a notification storm on an already
     // overloaded main thread.
     const { store } = floodedStore({
-      liveSource: () => burstOf([enduring(1), enduring(2), enduring(3), enduring(4), enduring(5)])(),
+      liveSource: floodSource(),
       join: { autoReconnect: true, reconnectDelayMs: 0, maxRepairAttempts: 64 },
     });
     const states: string[] = [];
@@ -273,9 +274,71 @@ describe("SessionViewStore: binding state", () => {
     store.stop();
   });
 
-  it("gives up instead of flapping forever when repair moves the cursor nowhere", async () => {
+  it("does not flap once per round trip while the journal is ADVANCING", async () => {
+    // B3. The first throttle keyed on journal cursor progress, and a session
+    // busy enough to overflow the live buffer is a session whose journal is
+    // advancing — so every refusal scored as progress, the streak never got
+    // past 1, the backoff stayed at its zero-th step and `reconnectDelayMs`
+    // was dead code on this path. Measured then: 783 episodes and 783 cold
+    // reads per SECOND, one full subscribe/REST cycle per round trip.
+    //
+    // Asserted on the ADVANCING journal specifically, because the stuck one
+    // passed throughout and is what made the defect invisible.
+    let coldReads = 0;
+    let journalSeq = 0;
     const { store } = floodedStore({
-      liveSource: () => burstOf([enduring(1), enduring(2), enduring(3), enduring(4), enduring(5)])(),
+      journal: {
+        readHistory: async () => {
+          coldReads += 1;
+          journalSeq += 1;
+          return { events: [], next_journal_seq: journalSeq, done: true } as unknown as EventJournalPage;
+        },
+      },
+      liveSource: floodSource(),
+      join: { autoReconnect: true, reconnectDelayMs: 250, maxRepairAttempts: 1_000 },
+    });
+    const states: string[] = [];
+    store.subscribeBindingState((state) => states.push(state));
+    store.subscribeErrors(() => {});
+    store.start();
+    const started = Date.now();
+    while (Date.now() - started < 250) await tick();
+
+    const episodes = states.filter((state) => state === "repair_required").length;
+    expect(episodes).toBeGreaterThan(0);
+    // Single digits over a quarter second. The unfixed build produced ~195
+    // here, and one cold read per episode is a REST call per round trip.
+    expect(episodes).toBeLessThan(10);
+    expect(coldReads).toBeLessThan(10);
+    store.stop();
+  });
+
+  it("spaces consecutive refusals out, instead of spending the cap in milliseconds", async () => {
+    // The backoff SCHEDULE, pinned black-box. It is not merely how far apart
+    // attempts sit: it is what buys a transient overload time to clear before
+    // `maxRepairAttempts` fires. With the schedule, a binding is still alive
+    // after 250 ms having used two attempts; with the backoff flattened to
+    // zero it burns the whole cap in tens of milliseconds and is already dead.
+    const { store } = floodedStore({
+      liveSource: floodSource(),
+      join: { autoReconnect: true, reconnectDelayMs: 250, maxRepairAttempts: 32 },
+    });
+    const states: string[] = [];
+    store.subscribeBindingState((state) => states.push(state));
+    store.subscribeErrors(() => {});
+    store.start();
+    const started = Date.now();
+    while (Date.now() - started < 250) await tick();
+
+    expect(store.isActive()).toBe(true);
+    expect(store.bindingState()).not.toBe("inactive");
+    expect(states.filter((state) => state === "repair_required").length).toBeLessThan(5);
+    store.stop();
+  });
+
+  it("gives up instead of flapping forever when the backlog never clears", async () => {
+    const { store } = floodedStore({
+      liveSource: floodSource(),
       join: { autoReconnect: true, reconnectDelayMs: 0, maxRepairAttempts: 2 },
     });
     const onError = vi.fn();
@@ -284,7 +347,7 @@ describe("SessionViewStore: binding state", () => {
     for (let i = 0; i < 40; i++) await tick();
     expect(store.isActive()).toBe(false);
     expect(onError).toHaveBeenCalledWith(
-      expect.objectContaining({ message: expect.stringContaining("without journal progress") }),
+      expect.objectContaining({ message: expect.stringContaining("without recovering") }),
     );
     expect(store.bindingState()).toBe("inactive");
   });
@@ -366,6 +429,31 @@ describe("SessionViewStore: binding state", () => {
     expect(store.bindingState()).toBe("inactive");
   });
 });
+
+/**
+ * Five undroppable frames per connection, each above the last, and then the
+ * connection STAYS OPEN.
+ *
+ * This is the shape of a producer the consumer cannot keep up with, and it is
+ * the fixture the B3 regression needs: a source that ENDS lets a later
+ * connection drain without refusing, which is a recovery and legitimately
+ * resets the refusal streak. Sequence numbers keep climbing so the tip filter
+ * never starts discarding the flood for free.
+ */
+function floodSource(): () => AsyncIterable<unknown> {
+  let seq = 1_000_000;
+  return () => ({
+    [Symbol.asyncIterator]: () => {
+      let emitted = 0;
+      return {
+        next: async () =>
+          emitted++ < 5
+            ? { value: enduringFrame(++seq, envelope({ type: "TurnDone", loopId: LOOP_A })), done: false as const }
+            : new Promise<never>(() => {}),
+      };
+    },
+  });
+}
 
 /** A source that yields an already-resolved burst, then stays closed. */
 function burstOf(frames: readonly unknown[]) {

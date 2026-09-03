@@ -364,17 +364,27 @@ export class SessionViewStore {
    * indistinguishable from a session that quietly stopped catching up.
    *
    * THIS CHANNEL FLAPS, and a consumer must expect it to. A binding whose
-   * backlog cannot be repaired away re-enters the episode once per reconnect:
-   * measured at the default 250 ms cadence against a producer keeping five
-   * undroppable frames in flight, 15 transitions in two seconds. The join
-   * announcing `repair_required` at most once per EPISODE does not bound that,
-   * because episodes recur — an earlier version of this comment said "it cannot
-   * storm" on exactly that reasoning and was wrong. What bounds it is
-   * elsewhere: `JoinOptions.maxRepairAttempts` counts consecutive refusals that
-   * move the journal cursor nowhere and gives up, and the refusal backoff
-   * doubles in between. The error ECHO is additionally damped on the same
-   * doubling schedule `onQueueOverflow` uses, so the notification cost stays
-   * logarithmic even while the state channel keeps telling the truth.
+   * backlog cannot be repaired away re-enters the episode once per reconnect,
+   * and nothing here suppresses that: the state channel's job is to be true,
+   * not quiet.
+   *
+   * What bounds the RATE is one thing, and it is worth naming precisely because
+   * two earlier versions of this paragraph named bounds that did not bind. The
+   * first said the channel "cannot storm" because the join announces at most
+   * once per episode — true, and irrelevant, since episodes recur. The second
+   * said `maxRepairAttempts` and a doubling backoff bounded it — both clauses
+   * true, neither binding, because the streak counter reset on journal cursor
+   * movement and a session busy enough to overflow is a session whose journal
+   * is advancing. Measured on that path: 783 episodes per second.
+   *
+   * The bound that binds is the floor: EVERY refusal reconnect waits at least
+   * `JoinOptions.reconnectDelayMs`, doubling while refusals repeat with no
+   * recovery in between, and `JoinOptions.maxRepairAttempts` counts those same
+   * refusals and gives up. Re-measured on the busy path: 3 episodes per second.
+   *
+   * The error ECHO is damped further, on the same doubling schedule
+   * `onQueueOverflow` uses, so notification cost stays logarithmic in the
+   * number of episodes even while this channel reports every one of them.
    */
   subscribeBindingState(listener: (state: BindingState) => void): () => void {
     this.bindingListeners.add(listener);
@@ -422,6 +432,10 @@ export class SessionViewStore {
     this.repairEpisodes = 0;
     this.nextRepairReport = 1;
     const generation = ++this.generation;
+    // Read ONCE. Both the join's option and the error-echo guard below depend
+    // on this value, and deriving it twice means a change to the default
+    // silently stops the echo instead of failing anything.
+    const autoReconnect = this.options.join?.autoReconnect ?? true;
 
     const abortController = new AbortController();
     this.abortController = abortController;
@@ -449,7 +463,7 @@ export class SessionViewStore {
       source,
       {
         ...this.options.join,
-        autoReconnect: this.options.join?.autoReconnect ?? true,
+        autoReconnect,
         signal: abortController.signal,
         ...(this.options.maxQueuedFrames === undefined
           ? {}
@@ -473,7 +487,7 @@ export class SessionViewStore {
           // `autoReconnect` off it does not: the same error object propagates
           // out of the generator and the pump's own catch surfaces it, so
           // echoing here too would deliver one failure twice.
-          if (!(this.options.join?.autoReconnect ?? true)) return;
+          if (!autoReconnect) return;
           this.repairEpisodes += 1;
           if (this.repairEpisodes < this.nextRepairReport) return;
           this.nextRepairReport = this.repairEpisodes * 2;

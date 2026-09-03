@@ -434,8 +434,14 @@ describe("joinSessionView: bounded live queue", () => {
     // starvation, because observing it is precisely a hang.
     vi.useFakeTimers();
     const live = controllableLive();
+    let coldReads = 0;
     const generator = joinSessionView(
-      { readHistory: async () => emptyPage },
+      {
+        readHistory: async () => {
+          coldReads += 1;
+          return emptyPage;
+        },
+      },
       "s1",
       live.source,
       { autoReconnect: true, reconnectDelayMs: 0, maxQueuedFrames: 2 } as never,
@@ -448,11 +454,61 @@ describe("joinSessionView: bounded live queue", () => {
     await first;
     for (const seq of [10, 11, 12]) live.push(enduring(seq));
     await microtasks();
+    expect(coldReads).toBe(1);
     // Resume: the refused queue rejects and the join reconnects.
     void generator.next();
     await microtasks();
 
-    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    // Exactly one timer, and it is THE reconnect: a bare `> 0` would be
+    // satisfied by any future fixture that happens to call `setTimeout`.
+    expect(vi.getTimerCount()).toBe(1);
+    // Dependence, not just registration. The reconnect's cold read must not
+    // have happened yet — microtasks alone cannot release it — and must happen
+    // once the timer is allowed to run.
+    expect(coldReads).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await microtasks();
+    expect(coldReads).toBe(2);
+    void generator.return();
+  });
+
+  it("waits the FULL reconnect delay before the first repair, not zero", async () => {
+    // The floor. An earlier version returned 0 for the first refusal after a
+    // recovery, reasoning that a fresh refusal deserves an immediate retry —
+    // but a refusal is a client-side backlog, so the condition that caused it
+    // is still true at the moment of the retry. Combined with a streak counter
+    // that never advanced, that made `reconnectDelayMs` dead code on this path.
+    vi.useFakeTimers();
+    const live = controllableLive();
+    let coldReads = 0;
+    const generator = joinSessionView(
+      {
+        readHistory: async () => {
+          coldReads += 1;
+          return emptyPage;
+        },
+      },
+      "s1",
+      live.source,
+      { autoReconnect: true, reconnectDelayMs: 250, maxQueuedFrames: 2 } as never,
+    );
+    const first = generator.next();
+    await microtasks();
+    live.push(textFrame("prime", LOOP_A));
+    await first;
+    for (const seq of [10, 11, 12]) live.push(enduring(seq));
+    await microtasks();
+    void generator.next();
+    await microtasks();
+
+    expect(coldReads).toBe(1);
+    await vi.advanceTimersByTimeAsync(249);
+    await microtasks();
+    // One millisecond short of the delay: the reconnect must not have happened.
+    expect(coldReads).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await microtasks();
+    expect(coldReads).toBe(2);
     void generator.return();
   });
 
@@ -618,6 +674,14 @@ describe("SessionViewStore: two simultaneous bindings", () => {
     for (const store of flip ? [peer, overflowing] : [overflowing, peer]) store.start();
     for (let i = 0; i < 10; i++) await tick();
 
+    // Weakened from `toStrictEqual(["repair_required"])` because the binding
+    // now FLAPS — it repairs, recovers, and refuses again at the reconnect
+    // cadence — not because the outcome changed. The first transition is still
+    // exactly the refusal. `.not.toBe("live")` is deliberately loose about
+    // WHICH non-live state, since a long enough window also admits `inactive`
+    // once `maxRepairAttempts` fires; that is a materially different outcome
+    // and is asserted on its own in test/store-errors.test.ts's "gives up
+    // instead of flapping forever when the backlog never clears".
     expect(floodedStates[0]).toBe("repair_required");
     expect(overflowing.bindingState()).not.toBe("live");
 

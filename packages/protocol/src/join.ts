@@ -768,11 +768,12 @@ export interface JoinOptions {
    */
   onBindingState?: (state: BindingState, cause?: LiveQueueOverflowError) => void;
   /**
-   * Consecutive refused backlogs that move `cursor` nowhere before the join
-   * gives up and throws. Default `DEFAULT_MAX_REFUSAL_REPAIRS`. A refusal after
-   * the cursor advanced resets the count, so a slow-but-progressing recovery is
-   * never cut off. Only consulted when `autoReconnect` is on — without it the
-   * first refusal already ends the join.
+   * Consecutive refused backlogs, with no recovery in between, before the join
+   * gives up and throws. Default `DEFAULT_MAX_REFUSAL_REPAIRS`. A connection
+   * that completes its cold walk and then ends WITHOUT refusing resets the
+   * count, so a binding that rides out a transient overload is never cut off.
+   * Only consulted when `autoReconnect` is on — without it the first refusal
+   * already ends the join.
    */
   maxRepairAttempts?: number;
   /** Aborts the join. Checked between steps; does not preempt an in-flight `readHistory`/live `next()` call already awaited (those should honor their own cancellation, e.g. via `RequestOptions.signal` on the transport call a caller wires up). Also cuts short an in-progress error-triggered reconnect delay. */
@@ -832,13 +833,33 @@ export async function* joinSessionView(
    */
   let connectionEpoch = 0;
   let repairEpoch = -1;
-  /** Consecutive refusals that did not move `cursor`, and the cursor at the last one. */
-  let refusalsWithoutProgress = 0;
-  let cursorAtLastRefusal = -1;
+  /**
+   * Consecutive refusals with no RECOVERY in between, where a recovery is a
+   * connection that completed its cold walk and then ended without refusing.
+   *
+   * This deliberately does NOT key on journal progress. The first version did —
+   * `cursor > cursorAtLastRefusal` — and it was wrong in the one case that
+   * matters: a session busy enough to overflow the live buffer is a session
+   * whose journal is advancing, so every refusal scored as progress, the
+   * counter stayed pinned at 1, the backoff stayed at its zero-th step and
+   * `maxRepairAttempts` never counted past 1. Measured against a journal
+   * advancing one sequence per read: 783 refusal episodes and 783 cold reads
+   * per second, one full subscribe/REST cycle per round trip — 190x the rate
+   * of the fixed-delay reconnect this was supposed to improve on, and against
+   * a real Factory a client-caused outage amplifier.
+   *
+   * Cursor movement is evidence the PRODUCER is busy. It is not evidence the
+   * backlog cleared, and only the latter is a reason to forget a refusal.
+   */
+  let refusalsWithoutRecovery = 0;
 
   for (;;) {
     if (signal?.aborted) return;
     const epoch = ++connectionEpoch;
+    /** Set by this connection's own refusal, and by nothing else. */
+    let refusedThisConnection = false;
+    /** True once this connection's cold walk reached a `done` page. */
+    let coldWalkCompleted = false;
 
     // --- Step 1: subscribe live FIRST. Buffering starts the instant liveSource() returns. ---
     const queue = new AsyncQueue<SseFrame, DroppableFrame>({
@@ -854,11 +875,8 @@ export async function* joinSessionView(
         if (repairPending) return;
         repairPending = true;
         repairEpoch = epoch;
-        // A refusal that did not move the cursor since the last one is no
-        // progress. `cursor` advancing means the repair really did re-read
-        // something, so a slow-but-recovering binding is never cut off.
-        refusalsWithoutProgress = cursor > cursorAtLastRefusal ? 1 : refusalsWithoutProgress + 1;
-        cursorAtLastRefusal = cursor;
+        refusedThisConnection = true;
+        refusalsWithoutRecovery += 1;
         options.onBindingState?.("repair_required", error);
       },
     });
@@ -900,7 +918,10 @@ export async function* joinSessionView(
         }
         cursor = page.next_journal_seq;
         tip = page.next_journal_seq;
-        if (page.done) break;
+        if (page.done) {
+          coldWalkCompleted = true;
+          break;
+        }
       }
 
       // --- Step 3: drain the live buffer; drop enduring frames the cold read already covered. ---
@@ -974,7 +995,12 @@ export async function* joinSessionView(
 
     if (!autoReconnect) return;
 
-    if (repairPending && refusalsWithoutProgress > maxRepairAttempts) {
+    // A connection that got through its cold walk and then ended for any
+    // reason OTHER than refusing its own backlog is a recovery: the buffer it
+    // was holding drained. That, and only that, forgets the streak.
+    if (coldWalkCompleted && !refusedThisConnection) refusalsWithoutRecovery = 0;
+
+    if (repairPending && refusalsWithoutRecovery > maxRepairAttempts) {
       // A binding that keeps refusing without the cursor ever moving is not
       // recovering, and repair cannot make it recover: the clearest case is a
       // source emitting nothing but unparseable frames, where every `error`
@@ -983,7 +1009,7 @@ export async function* joinSessionView(
       // `joinFactorySessionView` does, so the failure is reported once instead
       // of flapping forever.
       throw new Error(
-        `live frame queue refused ${refusalsWithoutProgress} backlogs without journal progress`,
+        `live frame queue refused ${refusalsWithoutRecovery} consecutive backlogs without recovering`,
       );
     }
 
@@ -1006,7 +1032,7 @@ export async function* joinSessionView(
       // test's own timeout never firing. `joinFactorySessionView` documents the
       // same hazard; this path used to reintroduce it.
       if (repairPending) {
-        await macrotaskDelay(refusalBackoffMs(refusalsWithoutProgress, reconnectDelayMs), signal);
+        await macrotaskDelay(refusalBackoffMs(refusalsWithoutRecovery, reconnectDelayMs), signal);
       } else {
         // Minimal hot-loop guard for a persistently-failing server — see
         // `reconnectDelayMs`'s doc comment for why this is a fixed delay, not
@@ -1034,11 +1060,15 @@ export async function* joinSessionView(
 export const DEFAULT_MAX_QUEUED_FRAMES = 512;
 
 /**
- * Consecutive refusals that move the journal cursor nowhere before the join
- * gives up and throws. Mirrors `joinFactorySessionView`'s
- * `maxRepairAttempts` default, and exists for the same reason: repair is a
- * loop with no natural fixed point, and a binding whose backlog cannot be
- * repaired away flaps at the reconnect cadence forever.
+ * Consecutive refusals with no recovery in between before the join gives up
+ * and throws. Mirrors `joinFactorySessionView`'s `maxRepairAttempts` default,
+ * and exists for the same reason: repair is a loop with no natural fixed
+ * point, and a binding whose backlog cannot be repaired away flaps at the
+ * reconnect cadence forever.
+ *
+ * With the backoff below, 32 consecutive refusals at the default 250 ms span
+ * roughly a minute of real time, so this gives a genuine overload time to
+ * clear before it fires.
  */
 export const DEFAULT_MAX_REFUSAL_REPAIRS = 32;
 
@@ -1075,6 +1105,26 @@ const MAX_REFUSAL_BACKOFF_FACTOR = 8;
  * content. When such a caller passes a MIXED array, the index returned is into
  * the array as given — the droppable entries are selected with their original
  * positions, never renumbered.
+ */
+/**
+ * DEFERRED, with a trigger rather than a date: this rebuilds the candidate list
+ * and every declared key on EVERY push, so eviction costs ~96 us against a full
+ * 512-frame buffer versus ~1.5 us for the flat scan it replaced — and it costs
+ * that on the main thread precisely when the consumer is already too slow,
+ * which is a positive feedback loop.
+ *
+ * It is not fixed here because the cost only bites while the buffer sits near
+ * its bound. Revisit at the first profile of a real fast-token session at
+ * `DEFAULT_MAX_QUEUED_FRAMES`, and only if eviction actually shows in that
+ * trace.
+ *
+ * If it is taken, the safe shape is NOT a bucket index cached across pushes: a
+ * stale index selects a victim that is no longer the item at that position,
+ * which is this task's own defect class made reachable where it currently is
+ * not, and the invalidation surface is three paths wide (`push`, `drain`,
+ * `next` all mutate `items`). The shape with no index to go stale is an
+ * incremental per-key COUNT owned by the queue, updated at the single point
+ * each of those three mutates the buffer.
  */
 export function selectFrameToDrop(frames: readonly DroppableFrame[]): number {
   const candidates: Array<{ frame: DroppableFrame; index: number }> = [];
@@ -1165,15 +1215,21 @@ function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
 }
 
 /**
- * Zero for the first refusal after progress; from the second consecutive
- * non-progressing refusal onward, `base` doubling per attempt and capped at
- * eight times base. The same shape as `joinFactorySessionView`'s
- * `repairBackoffMs`, for the same reason.
+ * `base` for the first refusal, doubling per consecutive refusal, capped at
+ * eight times base.
+ *
+ * The FLOOR is the point, and it was missing: the first version returned 0 for
+ * the first refusal, on the theory that a refusal following a recovery should
+ * retry at once. Combined with a streak counter that never got past 1 (see
+ * `refusalsWithoutRecovery`), that made `reconnectDelayMs` dead code on this
+ * path and turned every refusal into an immediate reconnect. A refusal is a
+ * client-side backlog, so unlike a clean end of connection there is never a
+ * reason to retry it instantly — the condition that caused it is still true.
  */
 function refusalBackoffMs(consecutiveRefusals: number, base: number): number {
-  if (consecutiveRefusals <= 1) return 0;
   const bounded = base > 0 ? base : 0;
-  return bounded * Math.min(2 ** (consecutiveRefusals - 2), MAX_REFUSAL_BACKOFF_FACTOR);
+  const step = Math.max(consecutiveRefusals, 1) - 1;
+  return bounded * Math.min(2 ** step, MAX_REFUSAL_BACKOFF_FACTOR);
 }
 
 /**
