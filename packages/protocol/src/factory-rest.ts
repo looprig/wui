@@ -40,8 +40,6 @@ export interface FactoryJournalOptions extends FactoryPageOptions {
 export interface ObjectRangeOptions extends RequestOptions {
   start: number;
   end: number;
-  /** Exact maximum response bytes this call is allowed to consume. */
-  maximumBytes: number;
 }
 
 export interface ObjectRange {
@@ -77,6 +75,17 @@ function query(options: FactoryPageOptions & { tail?: number }): string {
 
 function normalizedBase(baseUrl: string | undefined): string {
   return baseUrl === undefined ? "" : baseUrl.replace(/\/+$/, "");
+}
+
+/**
+ * The route for one retained session object's bytes; `/metadata` is appended
+ * for its descriptor. This module owns the spelling, and exports it because
+ * `tool-capture.ts` names the same route in the `RequestAbortedError` it raises
+ * around these calls — a second literal there would keep naming the old path
+ * for as long as nobody noticed the route had moved.
+ */
+export function sessionObjectPath(sessionId: string, objectId: string): string {
+  return `/v1/sessions/${encodeURIComponent(sessionId)}/objects/${encodeURIComponent(objectId)}`;
 }
 
 export class FactoryRestReads implements FactoryReads {
@@ -126,19 +135,21 @@ export class FactoryRestReads implements FactoryReads {
     objectId: string,
     options: RequestOptions = {},
   ): Promise<ObjectMetadata> {
-    const path = `/v1/sessions/${encodeURIComponent(sessionId)}/objects/${encodeURIComponent(objectId)}/metadata`;
+    const path = `${sessionObjectPath(sessionId, objectId)}/metadata`;
     return validateObjectMetadata(await this.getJSON(path, options.signal));
   }
 
   async readObjectRange(sessionId: string, objectId: string, options: ObjectRangeOptions): Promise<ObjectRange> {
-    const rangeBytes = options.end - options.start + 1;
+    // The inclusive range IS the response bound: there is exactly one legal
+    // byte count for a `start`/`end` pair, so it is derived here rather than
+    // accepted from the caller, who could only restate what it just passed.
+    const maximumBytes = options.end - options.start + 1;
     if (!Number.isSafeInteger(options.start) || !Number.isSafeInteger(options.end)
       || options.start < 0 || options.end < options.start
-      || !Number.isSafeInteger(rangeBytes) || rangeBytes <= 0
-      || !Number.isSafeInteger(options.maximumBytes) || options.maximumBytes !== rangeBytes) {
-      throw new RangeError("object range and maximumBytes must describe the same positive safe-integer byte range");
+      || !Number.isSafeInteger(maximumBytes)) {
+      throw new RangeError("object range must be an inclusive positive safe-integer byte range");
     }
-    const path = `/v1/sessions/${encodeURIComponent(sessionId)}/objects/${encodeURIComponent(objectId)}`;
+    const path = sessionObjectPath(sessionId, objectId);
     const response = await this.request(path, {
       method: "GET",
       signal: options.signal,
@@ -157,12 +168,12 @@ export class FactoryRestReads implements FactoryReads {
       throw new MalformedResponseError(path, response.status);
     }
     const contentLength = response.headers.get("Content-Length");
-    if (contentLength !== null && (!/^\d+$/.test(contentLength) || Number(contentLength) !== options.maximumBytes)) {
+    if (contentLength !== null && (!/^\d+$/.test(contentLength) || Number(contentLength) !== maximumBytes)) {
       await response.body?.cancel().catch(() => undefined);
       throw new MalformedResponseError(path, response.status);
     }
     return {
-      bytes: await this.readBoundedBody(path, response, options.maximumBytes, options.signal),
+      bytes: await this.readBoundedBody(path, response, maximumBytes, options.signal),
       contentRange,
       mediaType: response.headers.get("Content-Type") ?? undefined,
     };

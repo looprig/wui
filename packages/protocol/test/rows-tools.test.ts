@@ -305,7 +305,7 @@ describe("rows: durable tool-result captures", () => {
         capturedBytes: 10,
         originalBytes: 21,
         originalBytesLowerBound: undefined,
-        declaredCeilingBytes: 10,
+        capturedBytesAtCeiling: 10,
         truncated: true,
         truncationReason: "capture_ceiling",
         encoding: "utf-8",

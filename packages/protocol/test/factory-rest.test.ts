@@ -28,7 +28,7 @@ describe("FactoryRestReads bounded object ranges", () => {
     });
 
     await expect(reads.readObjectRange("session /1", "object/a", {
-      start: 2, end: 4, maximumBytes: 3,
+      start: 2, end: 4,
     })).resolves.toEqual({
       bytes: new Uint8Array([2, 3, 4]),
       contentRange: "bytes 2-4/9",
@@ -65,7 +65,6 @@ describe("FactoryRestReads bounded object ranges", () => {
     await expect(reads.readObjectRange("session-1", "object-1", {
       start: 0,
       end: 3,
-      maximumBytes: 4,
     })).rejects.toBeInstanceOf(MalformedResponseError);
     expect(cancelled).toBe(true);
     expect(emittedBytes).toBe(8);
@@ -89,7 +88,7 @@ describe("FactoryRestReads bounded object ranges", () => {
     }) });
 
     await expect(reads.readObjectRange("session-1", "object-1", {
-      start: 0, end: 3, maximumBytes: 4,
+      start: 0, end: 3,
     })).resolves.toMatchObject({ bytes: new Uint8Array([1, 2, 3, 4]) });
     expect(pulls).toBe(4);
     expect(cancelled).toBe(true);
@@ -119,7 +118,7 @@ describe("FactoryRestReads bounded object ranges", () => {
     }) });
 
     await expect(reads.readObjectRange("session-1", "object-1", {
-      start: 0, end: 3, maximumBytes: 4,
+      start: 0, end: 3,
     })).resolves.toMatchObject({ bytes: new Uint8Array([1, 2, 3, 4]) });
     expect(deliveredViewSizes).toStrictEqual([4, 3, 2, 1]);
     expect(pulls).toBe(4);
@@ -143,7 +142,7 @@ describe("FactoryRestReads bounded object ranges", () => {
     }) });
 
     await expect(reads.readObjectRange("session-1", "object-1", {
-      start: 0, end: 3, maximumBytes: 4,
+      start: 0, end: 3,
     })).rejects.toBeInstanceOf(MalformedResponseError);
     expect(cancelled).toBe(true);
     expect(emittedBytes).toBe(0);
@@ -165,7 +164,7 @@ describe("FactoryRestReads bounded object ranges", () => {
     }) });
 
     await expect(reads.readObjectRange("session-1", "object-1", {
-      start: 0, end: 3, maximumBytes: 4,
+      start: 0, end: 3,
     })).rejects.toBeInstanceOf(MalformedResponseError);
     expect(cancelled).toBe(true);
     expect(emittedBytes).toBe(0);
@@ -187,7 +186,7 @@ describe("FactoryRestReads bounded object ranges", () => {
     }) });
 
     await expect(reads.readObjectRange("session-1", "object-1", {
-      start: 0, end: 3, maximumBytes: 4,
+      start: 0, end: 3,
     })).rejects.toBeInstanceOf(MalformedResponseError);
     expect(pulls).toBe(0);
     expect(cancelled).toBe(true);
@@ -210,7 +209,7 @@ describe("FactoryRestReads bounded object ranges", () => {
     }) });
 
     await expect(reads.readObjectRange("session-1", "object-1", {
-      start: 0, end: 3, maximumBytes: 4,
+      start: 0, end: 3,
     })).rejects.toBeInstanceOf(MalformedResponseError);
     expect(cancelled).toBe(true);
     expect(emittedBytes).toBe(0);
@@ -223,7 +222,7 @@ describe("FactoryRestReads bounded object ranges", () => {
     }) });
 
     await expect(reads.readObjectRange("session-1", "object-1", {
-      start: 0, end: 3, maximumBytes: 4,
+      start: 0, end: 3,
     })).rejects.toBeInstanceOf(MalformedResponseError);
   });
 
@@ -240,7 +239,7 @@ describe("FactoryRestReads bounded object ranges", () => {
     }) });
 
     await expect(reads.readObjectRange("session-1", "object-1", {
-      start: 0, end: 3, maximumBytes: 4,
+      start: 0, end: 3,
     })).rejects.toBeInstanceOf(MalformedResponseError);
     expect(body.locked).toBe(false);
   });
@@ -263,7 +262,7 @@ describe("FactoryRestReads bounded object ranges", () => {
       if (timing === "before") abort.abort();
 
       await expect(reads.readObjectRange("session-1", "object-1", {
-        start: 0, end: 3, maximumBytes: 4, signal: abort.signal,
+        start: 0, end: 3, signal: abort.signal,
       })).rejects.toBeInstanceOf(RequestAbortedError);
       expect(cancelled, timing).toBe(true);
     }
@@ -287,7 +286,7 @@ describe("FactoryRestReads bounded object ranges", () => {
     }) });
 
     const result = reads.readObjectRange("session-1", "object-1", {
-      start: 0, end: 3, maximumBytes: 4, signal: abort.signal,
+      start: 0, end: 3, signal: abort.signal,
     });
     let settled = false;
     void result.finally(() => { settled = true; }).catch(() => undefined);
@@ -313,19 +312,25 @@ describe("FactoryRestReads bounded object ranges", () => {
     }) });
 
     await expect(reads.readObjectRange("session-1", "object-1", {
-      start: 0, end: 3, maximumBytes: 4,
+      start: 0, end: 3,
     })).rejects.toMatchObject({ constructor: NetworkError, cause });
     expect(cancelled).toBe(false); // errored streams are already terminal; cancel remains harmless.
     expect(body.locked).toBe(false);
   });
 
+  // The response bound is DERIVED from the inclusive range, so the only way to
+  // ask for an illegal number of bytes is to describe an illegal range. Each
+  // row breaks exactly one of the retained conditions: a non-integer or
+  // negative start, an end below the start, a non-safe-integer end, and a range
+  // whose LENGTH leaves the safe-integer domain even though both endpoints are
+  // inside it (0..MAX_SAFE_INTEGER is MAX_SAFE_INTEGER + 1 bytes).
   it.each([
-    { start: 0, end: 3, maximumBytes: 0 },
-    { start: 0, end: 3, maximumBytes: -1 },
-    { start: 0, end: 3, maximumBytes: 1.5 },
-    { start: 0, end: 3, maximumBytes: 5 },
-    { start: Number.MAX_SAFE_INTEGER, end: Number.MAX_SAFE_INTEGER + 1, maximumBytes: 1 },
-  ])("rejects an invalid or mismatched maximum before fetch: %o", async (options) => {
+    { start: 1.5, end: 3 },
+    { start: -1, end: 3 },
+    { start: 3, end: 2 },
+    { start: Number.MAX_SAFE_INTEGER, end: Number.MAX_SAFE_INTEGER + 1 },
+    { start: 0, end: Number.MAX_SAFE_INTEGER },
+  ])("rejects an invalid byte range before fetch: %o", async (options) => {
     const fetch = vi.fn();
     const reads = new FactoryRestReads({ fetch });
     await expect(reads.readObjectRange("session-1", "object-1", options)).rejects.toBeInstanceOf(RangeError);

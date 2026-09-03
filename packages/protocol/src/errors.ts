@@ -299,3 +299,48 @@ export class LiveConnectionError extends Error {
     this.status = options?.status;
   }
 }
+
+/**
+ * Thrown when a retained tool result is LARGER than the ceiling the caller
+ * declared for this read. An explicit refusal before any object I/O, not a
+ * failure of the object.
+ */
+export class ToolCaptureTooLargeError extends Error {
+  constructor() {
+    super("retained tool result exceeds the requested read ceiling");
+    this.name = "ToolCaptureTooLargeError";
+  }
+}
+
+/**
+ * Thrown when a retained tool result's metadata or bytes do not verify: a
+ * descriptor bound to a different object, a size disagreeing with the capture,
+ * an unusable digest, a `Content-Range` that does not bind the requested page,
+ * a short page, or a whole-object digest mismatch.
+ *
+ * It means the bytes could not be TRUSTED, which is distinct from there being
+ * no object to read — see `ToolCaptureUnavailableError`, which was split out
+ * of this class precisely because one shared class made a missing-object guard
+ * indistinguishable from the check that would have caught its absence one
+ * request later.
+ */
+export class ToolCaptureIntegrityError extends Error {
+  constructor(detail = "retained tool result failed integrity verification") {
+    super(detail);
+    this.name = "ToolCaptureIntegrityError";
+  }
+}
+
+/**
+ * Thrown when a tool-result capture retained no object at all, so there is
+ * nothing to read. The fold genuinely produces such captures (a `StepDone`
+ * capture entry carrying no `reference`). This is an ABSENCE precondition,
+ * checked before any request is issued, and deliberately not an integrity
+ * failure.
+ */
+export class ToolCaptureUnavailableError extends Error {
+  constructor() {
+    super("tool result has no retained object");
+    this.name = "ToolCaptureUnavailableError";
+  }
+}

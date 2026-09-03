@@ -278,7 +278,7 @@ describe("Factory durable reads", () => {
     });
 
     await expect(client.reads.readObjectMetadata("session-1", "object/a")).resolves.toEqual(metadata);
-    await expect(client.reads.readObjectRange("session-1", "object/a", { start: 2, end: 4, maximumBytes: 3 })).resolves.toEqual({
+    await expect(client.reads.readObjectRange("session-1", "object/a", { start: 2, end: 4 })).resolves.toEqual({
       bytes: new Uint8Array([2, 3, 4]),
       contentRange: "bytes 2-4/9",
       mediaType: "application/octet-stream",

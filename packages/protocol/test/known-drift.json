@@ -93,7 +93,7 @@
     "test/store-visibility.test.ts": 15,
     "test/store.test.ts": 8,
     "test/surface.test.ts": 30,
-    "test/toolsummary.test.ts": 60,
+    "test/toolsummary.test.ts": 59,
     "test/transport.test.ts": 46
   },
   "fileGranular": [

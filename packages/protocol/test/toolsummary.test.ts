@@ -37,78 +37,138 @@
  * payload.
  */
 import { readFileSync } from "node:fs";
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { FactoryRestReads, type FactoryReads } from "../src/factory-rest.js";
-import { CoreProtocolError, RequestAbortedError } from "../src/errors.js";
-import { readToolCapturePages, ToolCaptureIntegrityError, ToolCaptureTooLargeError } from "../src/content.js";
+import {
+  CoreProtocolError,
+  RequestAbortedError,
+  ToolCaptureIntegrityError,
+  ToolCaptureTooLargeError,
+  ToolCaptureUnavailableError,
+} from "../src/errors.js";
+import { readToolCapturePages } from "../src/tool-capture.js";
 import { toolResultCaptures, toolUseSummary, type ToolResultCaptureSummary } from "../src/toolsummary.js";
-import * as content from "../src/content.js";
 
-describe("retained tool-result content", () => {
-  it("exposes an explicit user-initiated pageable Factory read", () => {
-    expect(typeof (content as Record<string, unknown>)["readToolCapturePages"]).toBe("function");
+interface RecordedRequest {
+  url: string;
+  authorization: string | null;
+  range: string | null;
+}
+
+const encoder = new TextEncoder();
+
+async function sha256Hex(text: string): Promise<string> {
+  const digested = new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(text)));
+  return Array.from(digested, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+interface CaptureFixture {
+  readonly capture: ToolResultCaptureSummary;
+  /** The object's real digest — "" until `computeDigest` has run. */
+  readonly digest: string;
+  computeDigest(): Promise<void>;
+  reads(overrides?: Partial<FactoryReads>): FactoryReads;
+  factory(requests: RecordedRequest[]): FactoryRestReads;
+}
+
+/**
+ * One retained-object fixture over `text`: the capture summary a fold would
+ * produce for it, a `FactoryReads` double, and a real `FactoryRestReads` over a
+ * `fetch` double that records what it was asked for.
+ *
+ * The digest is COMPUTED from the same bytes the doubles serve, in `beforeAll`,
+ * rather than pasted in as a constant. Two hand-computed SHA-256 literals used
+ * to sit here; both were correct, which is exactly the problem — a reader
+ * cannot check them, and the first payload someone adds with a wrong one fails
+ * as a confusing `ToolCaptureIntegrityError` about the code under test. The
+ * NEGATIVE cases deliberately do not derive anything (see the all-zeros digest
+ * below): an expected value a failing test computes for itself is no longer an
+ * expectation.
+ */
+function captureFixture(text: string): CaptureFixture {
+  const source = encoder.encode(text);
+  let digest = "";
+  const metadataBody = (): Record<string, unknown> => ({
+    reference: { object_id: "object-1" },
+    size_bytes: source.length,
+    media_type: "text/plain",
+    digest,
   });
-
-  const capture: ToolResultCaptureSummary = {
-    toolExecutionId: "f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1",
-    objectId: "object-1",
-    capturedBytes: 10,
-    originalBytes: 21,
-    originalBytesLowerBound: undefined,
-    declaredCeilingBytes: 10,
-    truncated: true,
-    truncationReason: "capture_ceiling",
-    encoding: "utf-8",
-  };
-  const digest = "sha256:72399361da6a7754fec986dca5b7cbaf1c810a28ded4abaf56b2106d06cb78b0";
-
-  function reads(overrides: Partial<FactoryReads> = {}): FactoryReads {
-    return {
+  return {
+    capture: {
+      toolExecutionId: "f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1",
+      objectId: "object-1",
+      capturedBytes: source.length,
+      originalBytes: 21,
+      originalBytesLowerBound: undefined,
+      // Derived, and equal to `capturedBytes` by construction — the decoder
+      // reads no ceiling field. See toolsummary.ts.
+      capturedBytesAtCeiling: source.length,
+      truncated: true,
+      truncationReason: "capture_ceiling",
+      encoding: "utf-8",
+    },
+    get digest(): string {
+      return digest;
+    },
+    async computeDigest(): Promise<void> {
+      digest = `sha256:${await sha256Hex(text)}`;
+    },
+    reads: (overrides: Partial<FactoryReads> = {}): FactoryReads => ({
       listAgents: vi.fn(),
       listRecentSessions: vi.fn(),
       readStatus: vi.fn(),
       readJournal: vi.fn(),
       listGates: vi.fn(),
-      readObjectMetadata: vi.fn(async () => ({
-        reference: { object_id: "object-1" },
-        size_bytes: 10,
-        media_type: "text/plain",
-        digest,
-      })),
+      readObjectMetadata: vi.fn(async () => metadataBody()),
       readObjectRange: vi.fn(async (_sessionId, _objectId, options) => ({
-        bytes: new TextEncoder().encode("abcdefghij").slice(options.start, options.end + 1),
-        contentRange: `bytes ${options.start}-${options.end}/10`,
+        bytes: source.slice(options.start, options.end + 1),
+        contentRange: `bytes ${options.start}-${options.end}/${source.length}`,
         mediaType: "text/plain",
       })),
       ...overrides,
-    } as FactoryReads;
-  }
-
-  it("continues exact inclusive ranges through the captured byte count, naming Factory and only Factory", async () => {
-    const requests: Array<{ url: string; authorization: string | null; range: string | null }> = [];
-    const source = new TextEncoder().encode("abcdefghij");
-    const factory = new FactoryRestReads({
+    } as FactoryReads),
+    factory: (requests: RecordedRequest[]): FactoryRestReads => new FactoryRestReads({
       baseUrl: "https://factory.example",
       credentials: { restHeaders: () => ({ Authorization: "Bearer retained-object-token" }) },
       fetch: async (url, init) => {
         const headers = new Headers(init?.headers);
         requests.push({ url, authorization: headers.get("Authorization"), range: headers.get("Range") });
-        if (url.endsWith("/metadata")) {
-          return new Response(JSON.stringify({
-            reference: { object_id: "object-1" }, size_bytes: 10, media_type: "text/plain", digest,
-          }), { status: 200 });
-        }
+        if (url.endsWith("/metadata")) return new Response(JSON.stringify(metadataBody()), { status: 200 });
         const match = /^bytes=(\d+)-(\d+)$/.exec(headers.get("Range") ?? "");
         if (match === null) throw new Error("missing range");
         const start = Number(match[1]);
         const end = Number(match[2]);
         return new Response(source.slice(start, end + 1), {
           status: 206,
-          headers: { "Content-Range": `bytes ${start}-${end}/10`, "Content-Type": "text/plain" },
+          headers: { "Content-Range": `bytes ${start}-${end}/${source.length}`, "Content-Type": "text/plain" },
         });
       },
+    }),
+  };
+}
+
+describe("retained tool-result content", () => {
+  const main = captureFixture("abcdefghij");
+  /**
+   * Deliberately SMALLER than the ceiling every test declares. Every other
+   * fixture would have `capturedBytes` and `ceilingBytes` equal, which makes
+   * the two bounds indistinguishable: replacing `options.ceilingBytes` with
+   * `capture.capturedBytes` in the `pageBytes` guard survives all of them.
+   */
+  const small = captureFixture("abcde");
+  beforeAll(async () => {
+    await main.computeDigest();
+    await small.computeDigest();
+  });
+
+  const { capture, reads } = main;
+
+  it("continues exact inclusive ranges through the captured byte count, naming Factory and only Factory", async () => {
+    const requests: RecordedRequest[] = [];
+    const loaded = await readToolCapturePages(main.factory(requests), "session-1", capture, {
+      pageBytes: 4, ceilingBytes: 10,
     });
-    const loaded = await readToolCapturePages(factory, "session-1", capture, { pageBytes: 4, ceilingBytes: 10 });
 
     expect(requests).toStrictEqual([
       { url: "https://factory.example/v1/sessions/session-1/objects/object-1/metadata", authorization: "Bearer retained-object-token", range: null },
@@ -118,51 +178,40 @@ describe("retained tool-result content", () => {
     ]);
     expect(loaded.pages.map(({ start, end }) => [start, end])).toStrictEqual([[0, 3], [4, 7], [8, 9]]);
     expect(new TextDecoder().decode(loaded.bytes)).toBe("abcdefghij");
-    expect(loaded.metadata.digest).toBe(digest);
+    expect(loaded.metadata.digest).toBe(main.digest);
   });
 
   /**
    * `pageBytes` is bounded by the caller's DECLARED CEILING, never by the size
-   * this particular capture happens to have. Every other read fixture in this
-   * file sets `capturedBytes` and `ceilingBytes` to the same number, so the two
-   * bounds are indistinguishable there: replacing `options.ceilingBytes` with
-   * `capture.capturedBytes` in that guard survives all of them. Here the
-   * capture is deliberately SMALLER than the ceiling, and the whole small space
-   * of page sizes either side of both numbers is enumerated rather than one
-   * more fixed triple — a page size between 5 and 10 is legal and must read.
+   * this particular capture happens to have — a page size between 5 and 10 is
+   * legal here and must read. The whole small space of page sizes either side
+   * of both numbers is enumerated rather than one more fixed triple, and it is
+   * driven through a real `FactoryRestReads` so the property under test is the
+   * `Range` header sequence that actually goes on the wire at EVERY page size,
+   * not a page list at the single size some other test happens to pin.
    */
-  const smallCapture: ToolResultCaptureSummary = { ...capture, capturedBytes: 5, declaredCeilingBytes: 10 };
-  const smallDigest = "sha256:36bbe50ed96841d10443bcb670d6554f0a34b761be67ec9c4a8ad2c0c44ca42c";
-
-  function smallReads(): FactoryReads {
-    return reads({
-      readObjectMetadata: vi.fn(async () => ({
-        reference: { object_id: "object-1" }, size_bytes: 5, media_type: "text/plain", digest: smallDigest,
-      })),
-      readObjectRange: vi.fn(async (_sessionId, _objectId, options) => ({
-        bytes: new TextEncoder().encode("abcde").slice(options.start, options.end + 1),
-        contentRange: `bytes ${options.start}-${options.end}/5`,
-        mediaType: "text/plain",
-      })),
-    });
-  }
-
   it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])(
     "bounds pageBytes %i by the declared ceiling of 10 rather than the captured 5 bytes",
     async (pageBytes) => {
-      const factory = smallReads();
-      const attempt = readToolCapturePages(factory, "session-1", smallCapture, { pageBytes, ceilingBytes: 10 });
+      const requests: RecordedRequest[] = [];
+      const attempt = readToolCapturePages(small.factory(requests), "session-1", small.capture, {
+        pageBytes, ceilingBytes: 10,
+      });
       if (pageBytes > 10) {
         await expect(attempt).rejects.toBeInstanceOf(RangeError);
-        expect(factory.readObjectMetadata).not.toHaveBeenCalled();
-        expect(factory.readObjectRange).not.toHaveBeenCalled();
+        expect(requests).toStrictEqual([]);
         return;
       }
-      await expect(attempt).resolves.toBeTruthy();
+      await expect(attempt, `pageBytes ${pageBytes} is within the declared ceiling and must read`)
+        .resolves.toBeDefined();
       const loaded = await attempt;
-      const expected: Array<[number, number]> = [];
-      for (let start = 0; start < 5; start += pageBytes) expected.push([start, Math.min(4, start + pageBytes - 1)]);
-      expect(loaded.pages.map(({ start, end }) => [start, end])).toStrictEqual(expected);
+      const expectedPages: Array<[number, number]> = [];
+      for (let start = 0; start < 5; start += pageBytes) expectedPages.push([start, Math.min(4, start + pageBytes - 1)]);
+      expect(loaded.pages.map(({ start, end }) => [start, end])).toStrictEqual(expectedPages);
+      expect(requests.map(({ range }) => range)).toStrictEqual([
+        null,
+        ...expectedPages.map(([start, end]) => `bytes=${start}-${end}`),
+      ]);
       expect(new TextDecoder().decode(loaded.bytes)).toBe("abcde");
     },
   );
@@ -175,12 +224,8 @@ describe("retained tool-result content", () => {
   });
 
   it.each([0, -1, 1.5, 11])("rejects invalid pageBytes %s before Factory I/O", async (pageBytes) => {
-    const emptyCapture = { ...capture, capturedBytes: 0 };
-    const factory = reads({ readObjectMetadata: vi.fn(async () => ({
-      reference: { object_id: "object-1" }, size_bytes: 0,
-      digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    })) });
-    await expect(readToolCapturePages(factory, "session-1", emptyCapture, {
+    const factory = reads();
+    await expect(readToolCapturePages(factory, "session-1", capture, {
       pageBytes, ceilingBytes: 10,
     })).rejects.toBeInstanceOf(RangeError);
     expect(factory.readObjectMetadata).not.toHaveBeenCalled();
@@ -214,7 +259,7 @@ describe("retained tool-result content", () => {
     const ignoringFactory = reads({ readObjectRange: vi.fn(async (_sid, _oid, options) => {
       completedPageAbort.abort();
       return {
-        bytes: new TextEncoder().encode("abcdefghij").slice(options.start, options.end + 1),
+        bytes: encoder.encode("abcdefghij").slice(options.start, options.end + 1),
         contentRange: `bytes ${options.start}-${options.end}/10`,
         mediaType: "text/plain",
       };
@@ -257,7 +302,7 @@ describe("retained tool-result content", () => {
 
   it("rejects metadata whose immutable size disagrees with the capture before range I/O", async () => {
     const factory = reads({ readObjectMetadata: vi.fn(async () => ({
-      reference: { object_id: "object-1" }, size_bytes: 11, digest,
+      reference: { object_id: "object-1" }, size_bytes: 11, digest: main.digest,
     })) });
     await expect(readToolCapturePages(factory, "session-1", capture, { pageBytes: 4, ceilingBytes: 10 })).rejects.toBeInstanceOf(ToolCaptureIntegrityError);
     expect(factory.readObjectRange).not.toHaveBeenCalled();
@@ -265,7 +310,7 @@ describe("retained tool-result content", () => {
 
   it("rejects metadata bound to a different object before range I/O", async () => {
     const factory = reads({ readObjectMetadata: vi.fn(async () => ({
-      reference: { object_id: "object-2" }, size_bytes: 10, digest,
+      reference: { object_id: "object-2" }, size_bytes: 10, digest: main.digest,
     })) });
     await expect(readToolCapturePages(factory, "session-1", capture, {
       pageBytes: 4, ceilingBytes: 10,
@@ -275,7 +320,7 @@ describe("retained tool-result content", () => {
 
   it("rejects a Content-Range that does not exactly bind the requested page", async () => {
     const factory = reads({ readObjectRange: vi.fn(async (_sid, _oid, options) => ({
-      bytes: new TextEncoder().encode("abcdefghij").slice(options.start, options.end + 1),
+      bytes: encoder.encode("abcdefghij").slice(options.start, options.end + 1),
       contentRange: `bytes ${options.start}-${options.end}/11`,
       mediaType: "text/plain",
     })) });
@@ -286,7 +331,7 @@ describe("retained tool-result content", () => {
 
   it("rejects a returned page whose byte length differs from its requested range", async () => {
     const factory = reads({ readObjectRange: vi.fn(async (_sid, _oid, options) => ({
-      bytes: new TextEncoder().encode("abc"),
+      bytes: encoder.encode("abc"),
       contentRange: `bytes ${options.start}-${options.end}/10`,
       mediaType: "text/plain",
     })) });
@@ -298,31 +343,20 @@ describe("retained tool-result content", () => {
   /**
    * A capture with no retained object at all — the fold genuinely produces this
    * (see rows-tools.test.ts's `use-b`, whose capture carries no `reference`).
-   * Deleting the guard is masked by an identical error CLASS raised later: with
-   * `objectId` undefined, `encodeURIComponent` yields the literal "undefined"
-   * and a Factory metadata request goes out for a bogus object id before the
-   * `reference.object_id` comparison rejects with the same
-   * `ToolCaptureIntegrityError`. So a bare `rejects.toThrow` proves nothing
-   * here. The two things that distinguish the guard from its mask are the
-   * specific message and the fact that NO request was issued.
+   * Deleting the guard does not stop the read: with `objectId` undefined,
+   * `encodeURIComponent` yields the literal "undefined" and a Factory metadata
+   * request goes out for a bogus object id before the `reference.object_id`
+   * comparison rejects. That later check used to raise the SAME class, which
+   * masked the guard's deletion entirely; `ToolCaptureUnavailableError` exists
+   * so the absence and the integrity failure are distinguishable by TYPE.
+   * The request list is asserted independently: the guard's other job is that
+   * no request is issued at all.
    */
   it("refuses a capture with no retained object before any Factory request", async () => {
-    const requests: string[] = [];
-    const factory = new FactoryRestReads({
-      baseUrl: "https://factory.example",
-      fetch: async (url) => {
-        requests.push(url);
-        return new Response(JSON.stringify({
-          reference: { object_id: "undefined" }, size_bytes: 10, media_type: "text/plain", digest,
-        }), { status: 200 });
-      },
-    });
-    await expect(readToolCapturePages(factory, "session-1", { ...capture, objectId: undefined }, {
+    const requests: RecordedRequest[] = [];
+    await expect(readToolCapturePages(main.factory(requests), "session-1", { ...capture, objectId: undefined }, {
       pageBytes: 4, ceilingBytes: 10,
-    })).rejects.toMatchObject({
-      constructor: ToolCaptureIntegrityError,
-      message: "tool result has no retained object",
-    });
+    })).rejects.toBeInstanceOf(ToolCaptureUnavailableError);
     expect(requests).toStrictEqual([]);
   });
 
@@ -367,7 +401,7 @@ describe("tool-result capture projection against Core fixture authorities", () =
       capturedBytes: 42,
       originalBytes: null,
       originalBytesLowerBound: 43,
-      declaredCeilingBytes: undefined,
+      capturedBytesAtCeiling: undefined,
       truncated: true,
       truncationReason: "source_limit",
       encoding: "binary",

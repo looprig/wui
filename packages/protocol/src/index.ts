@@ -29,6 +29,8 @@
  *    and the exact history-to-live join that drives it.
  *  - `store` — the framework-neutral subscribe/notify store over that join.
  *  - `content` / `gate-actions` — small composition helpers for the UI layer.
+ *  - `tool-capture` — the explicit, user-initiated, bounded and
+ *    digest-verified read of a retained tool-result object from Factory.
  *
  * `blocks.ts`'s `isRecord` and `str` are deliberately NOT re-exported: they are
  * cross-module decode helpers for `enduring.ts`, `gate.ts` and `fold.ts`, not
@@ -76,6 +78,7 @@ export * from "./join.js";
 export * from "./live.js";
 export * from "./store.js";
 export * from "./content.js";
+export * from "./tool-capture.js";
 export * from "./gate-actions.js";
 export {
   allSchemas,

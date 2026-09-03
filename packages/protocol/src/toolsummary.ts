@@ -80,8 +80,19 @@ export interface ToolResultCaptureSummary {
   capturedBytes: number;
   originalBytes: number | null;
   originalBytesLowerBound: number | undefined;
-  /** Known exactly when capture stopped at Harness's declared capture ceiling. */
-  declaredCeilingBytes: number | undefined;
+  /**
+   * `capturedBytes`, surfaced under a second name when — and only when — the
+   * wire said `truncated` with `truncation_reason === "capture_ceiling"`. It
+   * is DERIVED, not declared: no field on the wire carries a ceiling and this
+   * decoder reads none, so it is equal to `capturedBytes` by construction and
+   * is a LOWER BOUND on whatever ceiling a producer actually applied, never
+   * the ceiling itself. A producer that stops at its ceiling and then trims
+   * back to a whole UTF-8 rune (`encoding` is `"utf-8"` as often as
+   * `"binary"`) emits strictly fewer bytes than its ceiling. No harness
+   * producer emits `truncation_reason: "capture_ceiling"` today, so against
+   * every current producer this is `undefined`.
+   */
+  capturedBytesAtCeiling: number | undefined;
   truncated: boolean;
   truncationReason: ToolResultTruncationReason | undefined;
   encoding: ToolResultEncoding;
@@ -128,7 +139,7 @@ export function toolResultCaptures(raw: unknown): Map<string, ToolResultCaptureS
       capturedBytes,
       originalBytes,
       originalBytesLowerBound: lowerBound,
-      declaredCeilingBytes: truncated && truncationReason === "capture_ceiling" ? capturedBytes : undefined,
+      capturedBytesAtCeiling: truncated && truncationReason === "capture_ceiling" ? capturedBytes : undefined,
       truncated,
       truncationReason,
       encoding,
