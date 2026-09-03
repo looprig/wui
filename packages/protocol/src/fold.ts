@@ -1718,13 +1718,27 @@ export function foldPublicGatePage(
  * partitions it into the ones that must change the board and the ones that
  * must not, so this list cannot fall behind the projection.
  *
- * The `sessionId`/`gateId` comparisons are UNREACHABLE at the one call site and
- * are kept deliberately. `prior` is read from `publicGateKey(sessionId, gateId)`
- * and `b` is built from those same two values, so the key already establishes
- * both — no test can distinguish them from `true`, and a mutation that removes
- * them is equivalent rather than surviving. They stay because they are the two
- * fields whose disagreement would mean the caller compared entries from
- * different keys, which is exactly the confusion the pair key exists to stop.
+ * FOUR of the twelve comparisons are UNREACHABLE at the one call site, for two
+ * different reasons, and all four are named because declaring SOME dead
+ * comparisons implies the rest are live — a partial list is a claim, not a
+ * courtesy. Each is an equivalent mutant: removing it survives the suite, and
+ * that is the expected result rather than a gap. The other eight are live and
+ * each dies on the leaf-partition case.
+ *
+ *  - `sessionId` and `gateId` are established by the KEY. `prior` is read from
+ *    `publicGateKey(sessionId, gateId)`, which is injective, and `b` is built
+ *    from those same two values, so two entries under one key agree on both.
+ *    They stay because their disagreement is exactly the "entries from
+ *    different keys were compared" confusion the pair key exists to stop.
+ *  - `openedEventId` and `openedJournalSeq` are established by ASSIGNMENT, more
+ *    directly still: in the `prior !== undefined` branch the candidate is
+ *    literally built with `openedEventId: prior.openedEventId` and
+ *    `openedJournalSeq: prior.openedJournalSeq`, so it cannot differ. They
+ *    become LIVE the moment the write-once rule above is dropped, which is
+ *    precisely why they should stay — they are the comparator's half of that
+ *    rule. test/fold-gates.test.ts's `immutable` partition asserts the FOLD
+ *    behaves this way; it cannot reach the comparator, and nothing here
+ *    pretends otherwise.
  */
 function samePublicGateEntry(a: PublicGateEntry, b: PublicGateEntry): boolean {
   return (
