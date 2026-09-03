@@ -84,7 +84,7 @@
     "test/rows.test.ts": 12,
     "test/serve-transport.test.ts": 6,
     "test/sse.test.ts": 23,
-    "test/store-backpressure.test.ts": 25,
+    "test/store-backpressure.test.ts": 26,
     "test/store-coalescing.test.ts": 12,
     "test/store-errors.test.ts": 20,
     "test/store-flush.test.ts": 11,

@@ -512,6 +512,105 @@ describe("joinSessionView: bounded live queue", () => {
     void generator.return();
   });
 
+  it("ignores a refusal from a SUPERSEDED connection whose stream kept flowing", async () => {
+    // The mirror of the epoch gate. That one stops a stale cold READ clearing a
+    // current refusal; this stops a stale REFUSAL moving current state.
+    //
+    // `onIrreducible` closes over shared join state — `repairPending`,
+    // `repairEpoch`, `refusalsWithoutRecovery` — while the flags the recovery
+    // reset consults are per-connection, so an increment from an abandoned
+    // connection is never forgiven by the connection that caused it. The
+    // abandoned stream is not hypothetical: this module's own teardown is
+    // best-effort by design (see the `finally` block), a `.return()` queues
+    // behind an in-flight read, and a source that does not wire its own
+    // cancellation is a stream nobody has closed — modelled here by omitting
+    // `return()` entirely.
+    //
+    // Without the guard the binding is STRANDED: a healthy live connection
+    // never re-reads the journal, so nothing ever announces `live` again and
+    // the consumer is told a repair is under way that nobody is attempting.
+    const connections: Array<{ push: (frame: SseFrame) => void }> = [];
+    const source: LiveFrameSource = () => {
+      const buffered: SseFrame[] = [];
+      let waiter: ((result: IteratorResult<SseFrame>) => void) | undefined;
+      connections.push({
+        push: (frame) => {
+          if (waiter !== undefined) {
+            waiter({ value: frame, done: false });
+            waiter = undefined;
+          } else buffered.push(frame);
+        },
+      });
+      return {
+        [Symbol.asyncIterator]: () => ({
+          next: () =>
+            new Promise<IteratorResult<SseFrame>>((resolve) => {
+              const item = buffered.shift();
+              if (item !== undefined) resolve({ value: item, done: false });
+              else waiter = resolve;
+            }),
+          // No `return()`: a source that does not honour cancellation.
+        }),
+      };
+    };
+
+    let coldReads = 0;
+    const journal: JournalReader = {
+      readHistory: async () => {
+        coldReads += 1;
+        if (coldReads === 1) throw new Error("journal blipped");
+        return emptyPage;
+      },
+    };
+    const states: string[] = [];
+    const onQueueOverflow = vi.fn();
+    const controller = new AbortController();
+    const generator = joinSessionView(journal, "s1", source, {
+      autoReconnect: true,
+      reconnectDelayMs: 0,
+      maxQueuedFrames: 2,
+      signal: controller.signal,
+      onQueueOverflow,
+      onBindingState: (state: string) => states.push(state),
+    } as never);
+    const pending = generator.next();
+    for (let i = 0; i < 6; i++) await tick();
+
+    // Connection 1 died on its cold read; connection 2 is healthy and following.
+    expect(connections.length).toBe(2);
+    expect(coldReads).toBe(2);
+    expect(states).toStrictEqual([]);
+
+    // The sibling callback in that closure first, because it needs the
+    // abandoned queue still OPEN: an abandoned queue is discarded wholesale, so
+    // an eviction from it is not a live frame this binding lost. (Ordering
+    // matters — the enduring flood below CLOSES that queue, after which pushes
+    // are ignored and this assertion would pass vacuously.)
+    for (let i = 0; i < 8; i++) connections[0]?.push(textFrame(String(i), LOOP_A));
+    for (let i = 0; i < 2; i++) await tick();
+    expect(onQueueOverflow).not.toHaveBeenCalled();
+
+    // Now flood the ABANDONED connection with undroppable frames, repeatedly,
+    // with nobody draining it.
+    for (let round = 0; round < 3; round++) {
+      for (const seq of [10, 11, 12]) connections[0]?.push(enduring(seq));
+      for (let i = 0; i < 2; i++) await tick();
+    }
+
+    // The current connection is healthy, so its binding state must not move...
+    expect(states).toStrictEqual([]);
+    // ...and the binding must still be DELIVERING through it, not merely
+    // un-announced: repeated stale refusals must not walk a healthy binding
+    // toward `maxRepairAttempts` and a throw either.
+    connections[1]?.push(textFrame("still delivering", LOOP_A));
+    const next = await pending;
+    expect(next.done).toBe(false);
+    expect(next.done === true ? undefined : next.value.input).toMatchObject({ segment: "live" });
+    expect(states).toStrictEqual([]);
+    controller.abort();
+    void generator.return();
+  });
+
   it("never drops a frame handed straight to a waiting consumer", async () => {
     const onQueueOverflow = vi.fn();
     const live = controllableLive();

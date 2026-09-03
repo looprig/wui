@@ -866,8 +866,37 @@ export async function* joinSessionView(
       max: maxQueuedFrames,
       isDroppable: isDroppableFrame,
       selectVictim: selectFrameToDrop,
-      onDrop: (droppedTotal) => options.onQueueOverflow?.(droppedTotal),
+      // Same guard, same reason, one line up: an abandoned connection's queue
+      // is discarded wholesale, so every frame in it is going away whether it
+      // was evicted or not. Reporting those evictions as drops tells a HEALTHY
+      // binding it lost live content it was never going to receive.
+      onDrop: (droppedTotal) => {
+        if (epoch !== connectionEpoch) return;
+        options.onQueueOverflow?.(droppedTotal);
+      },
       onIrreducible: (error) => {
+        // A SUPERSEDED connection has no say in this binding's state. Teardown
+        // here is best-effort by design (see the `finally` block below), and a
+        // `.return()` queues behind an in-flight read, so an abandoned
+        // connection's pump can still be relaying into this queue long after
+        // the join moved on. Every write below is join-wide — `repairPending`,
+        // `repairEpoch`, `refusalsWithoutRecovery` — while the flags the
+        // recovery reset consults are per-connection, so without this guard a
+        // stale refusal is never forgiven by the connection that caused it.
+        //
+        // Two consequences, both measured. A flood on an abandoned connection
+        // announced `repair_required` while the CURRENT connection was healthy
+        // and following live — and a healthy live connection never re-reads the
+        // journal, so nothing would ever announce `live` again and the binding
+        // stayed stranded reporting a repair nobody was attempting. And each
+        // abandoned connection could inflate `refusalsWithoutRecovery` once
+        // before its queue closed, walking a healthy binding toward
+        // `maxRepairAttempts` and a throw.
+        //
+        // This is the epoch gate on the cold read (see `connectionEpoch`)
+        // pointing the other way: that one stops a stale READ clearing a
+        // current refusal, this stops a stale REFUSAL moving current state.
+        if (epoch !== connectionEpoch) return;
         // Only the FIRST transition is announced: `repairPending` is cleared by
         // a LATER connection's cold read, not by this callback, so a binding
         // that overflows again before it has recovered does not re-announce a
