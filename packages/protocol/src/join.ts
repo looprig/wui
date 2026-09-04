@@ -275,10 +275,21 @@ type FactorySignal =
   | { kind: "publication"; publication: FactoryPublication }
   | { kind: "repair"; error?: Error };
 
-const DEFAULT_FACTORY_TAIL_LIMIT = 256;
-const DEFAULT_MAX_REPAIR_ATTEMPTS = 32;
-const DEFAULT_REPAIR_DELAY_MS = 250;
-const MAX_REPAIR_BACKOFF_FACTOR = 8;
+/**
+ * The Factory join's bounds, exported because a framework adapter that drives
+ * the same algorithm over its own transport seam must use the same numbers.
+ *
+ * `packages/react`'s `useFactorySessionView` does exactly that: it cannot use
+ * `joinFactorySessionView` itself yet — the join owns its subscription while
+ * `FactoryLinkStore` owns the socket — so it re-derives the loop, and until
+ * that seam is resolved these are the one place the constants live. Retyping
+ * them there let the two drift silently in either direction with nothing
+ * failing.
+ */
+export const DEFAULT_FACTORY_TAIL_LIMIT = 256;
+export const DEFAULT_MAX_REPAIR_ATTEMPTS = 32;
+export const DEFAULT_REPAIR_DELAY_MS = 250;
+export const MAX_REPAIR_BACKOFF_FACTOR = 8;
 
 /**
  * Subscribe-first Factory join. Each repair replaces the complete generation;
@@ -575,7 +586,13 @@ export async function* joinFactorySessionView(
  * join does on a clean end); from the second consecutive non-progressing
  * repair onward, `base` doubling per attempt and capped at eight times base.
  */
-function repairBackoffMs(consecutiveRepairs: number, base: number): number {
+/**
+ * The delay before the `consecutiveRepairs`-th consecutive non-progressing
+ * repair: zero for the first, then `base` doubling per attempt and capped at
+ * `MAX_REPAIR_BACKOFF_FACTOR` times it. Exported for the same reason the
+ * constants above are.
+ */
+export function repairBackoffMs(consecutiveRepairs: number, base: number): number {
   if (consecutiveRepairs <= 1) return 0;
   return base * Math.min(2 ** (consecutiveRepairs - 2), MAX_REPAIR_BACKOFF_FACTOR);
 }

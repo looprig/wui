@@ -359,16 +359,30 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
    * The callers, for the record, are a cancellation, a subscription error that
    * triggers a rejoin, and that rejoin itself.
    *
-   * Returns whether this call is the one that freed the channel. Both release
-   * paths that END a binding's hold — a cancellation and a subscription error —
+   * Returns whether this call is the one that freed the channel — which it does
+   * even if the underlying `unsubscribe` throws, because the slot is emptied
+   * before the call and no second caller can reach that subscription again.
+   * Both release paths that END a binding's hold — a cancellation and a subscription error —
    * use it to decide whether a peer may now be driven at that channel; a caller
    * that released nothing has made nothing available.
    */
   #release(record: BindingRecord): boolean {
     const release = record.release;
     record.release = undefined;
-    release?.();
-    return release !== undefined;
+    if (release === undefined) return false;
+    try {
+      release();
+    } catch {
+      // A throwing `unsubscribe` used to escape `record.cancel`, and from there
+      // the cancel loop in `close()`: `#link.disconnect()` never ran, the
+      // remaining bindings were never cancelled, and the `"idle"` publish never
+      // happened — leaving the store reporting a connection over a link nobody
+      // would ever close. The slot is already emptied above, so the channel is
+      // released as far as this store is concerned either way; what a failed
+      // `unsubscribe` costs is the link's own registry entry, which is the
+      // link's to report, not this store's to abort a teardown over.
+    }
+    return true;
   }
 
   /**

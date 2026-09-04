@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import {
+  DEFAULT_FACTORY_TAIL_LIMIT,
+  DEFAULT_MAX_REPAIR_ATTEMPTS,
+  DEFAULT_REPAIR_DELAY_MS,
+  repairBackoffMs,
   SessionViewStore,
   type FactoryJournalOptions,
   type FactoryPageOptions,
@@ -144,11 +148,13 @@ export interface FactorySessionViewOptions {
    * stricter: see the memo in `useFactorySessionView`.
    */
   coveredThrough?: number;
-  /** Bound on the one tail read per join. Default 256, matching protocol's join. */
+  /** Bound on the one tail read per join. Defaults to protocol's `DEFAULT_FACTORY_TAIL_LIMIT`. */
   tailLimit?: number;
   /**
    * Consecutive repairs that make NO coverage progress before the view gives
-   * up and reports a failure. Default 32, matching protocol's join. A repair
+   * up and reports a failure. Defaults to protocol's
+   * `DEFAULT_MAX_REPAIR_ATTEMPTS`. A construction input, like `coveredThrough`
+   * and for the same reason: see the memo in `useFactorySessionView`. A repair
    * cycle that advances `coveredThrough` past the sequence its cycle started
    * from resets the counter, so a slow but progressing recovery is never cut
    * off; only a genuinely stuck condition terminates.
@@ -156,8 +162,10 @@ export interface FactorySessionViewOptions {
   maxRepairAttempts?: number;
   /**
    * Base delay before the SECOND and later consecutive non-progressing repairs,
-   * doubling per attempt and capped at eight times this value. Default 250
-   * (milliseconds), matching protocol's join. The first repair after progress
+   * doubling per attempt and capped at `MAX_REPAIR_BACKOFF_FACTOR` times this
+   * value; the curve is protocol's `repairBackoffMs`, not a second copy of it.
+   * Defaults to protocol's `DEFAULT_REPAIR_DELAY_MS`. A construction input,
+   * like `coveredThrough` and for the same reason. The first repair after progress
    * uses a zero delay — but still a real timer, because the macrotask is the
    * point: it is what turns a burst of frames arriving in one turn into one
    * read rather than one read each.
@@ -179,10 +187,13 @@ export interface UseFactorySessionViewResult {
   readonly error: Error | null;
 }
 
-const DEFAULT_TAIL_LIMIT = 256;
-const DEFAULT_MAX_REPAIR_ATTEMPTS = 32;
-const DEFAULT_REPAIR_DELAY_MS = 250;
-const MAX_REPAIR_BACKOFF_FACTOR = 8;
+/**
+ * The bounds and the backoff schedule come from `@looprig/protocol`, which is a
+ * workspace package here rather than a pinned dependency. Retyping the four
+ * numbers and the curve let this file and `joinFactorySessionView` drift in
+ * either direction with nothing failing; importing them makes the drift
+ * impossible instead of merely tested for.
+ */
 
 const COLD: Omit<UseFactorySessionViewResult, "coveredThrough"> = {
   state: "joining",
@@ -282,6 +293,15 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
   #consecutiveRepairs = 0;
   /** `#coveredThrough` when the last repair cycle was scheduled. */
   #repairBase = 0;
+  /**
+   * True once the counter has passed the cap. Without it `#repair` returns
+   * having scheduled NOTHING, so every subsequent trigger re-entered, counted
+   * again, allocated a fresh `Error` with a stack and published — and
+   * `Publisher.publish` compares nothing, so each publish is a React commit.
+   * Bounded in requests, unbounded in renders, which is the same amplifier one
+   * order of magnitude cheaper.
+   */
+  #gaveUp = false;
   #coveredThrough: number;
   #running = false;
   /**
@@ -343,9 +363,24 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
     this.#controller = undefined;
   }
 
-  /** The binding's subscription is authorized: read the durable plane. */
+  /**
+   * The binding's subscription is authorized: read the durable plane.
+   *
+   * A repair scheduled but not yet fired is DROPPED here, because this read
+   * does its work. Left in place, a foreign frame followed by a reconnect cost
+   * two full three-request cold reads: the rejoin's, and then the stale timer's
+   * a moment later, which also bumped the generation and aborted the fresh read
+   * it had just superseded.
+   *
+   * A fresh authorization also clears `#gaveUp`. Giving up is a statement about
+   * one subscription's stream of triggers, not about the session; the next
+   * connection gets its chance, exactly as a binding does.
+   */
   join(): void {
     if (!this.#running) return;
+    if (this.#repairTimer !== undefined) clearTimeout(this.#repairTimer);
+    this.#repairTimer = undefined;
+    this.#gaveUp = false;
     // The previous read is abandoned rather than awaited: it was taken against
     // a subscription that is no longer the one delivering.
     this.#controller?.abort();
@@ -365,10 +400,12 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
    */
   #repair(): void {
     if (!this.#running) return;
+    if (this.#gaveUp) return;
     if (this.#repairTimer !== undefined) return;
     this.#consecutiveRepairs = this.#coveredThrough > this.#repairBase ? 0 : this.#consecutiveRepairs + 1;
     this.#repairBase = this.#coveredThrough;
     if (this.#consecutiveRepairs > this.#maxRepairAttempts) {
+      this.#gaveUp = true;
       this.publish({
         state: "failed",
         error: new Error(
@@ -377,9 +414,7 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
       });
       return;
     }
-    const delay = this.#consecutiveRepairs <= 1
-      ? 0
-      : this.#repairDelayMs * Math.min(2 ** (this.#consecutiveRepairs - 2), MAX_REPAIR_BACKOFF_FACTOR);
+    const delay = repairBackoffMs(this.#consecutiveRepairs, this.#repairDelayMs);
     this.#repairTimer = setTimeout(() => {
       this.#repairTimer = undefined;
       this.join();
@@ -478,6 +513,18 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
   }
 }
 
+function positiveBound(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) throw new RangeError(`${name} must be a positive safe integer`);
+  return value;
+}
+
+function safeSequence(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${name} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
 /**
  * Opens one session's durable view over the application's Factory link.
  *
@@ -502,10 +549,18 @@ export function useFactorySessionView(
   options: FactorySessionViewOptions,
 ): UseFactorySessionViewResult {
   const { tenantId, sessionId } = options;
-  const tailLimit = options.tailLimit ?? DEFAULT_TAIL_LIMIT;
-  const maxRepairAttempts = options.maxRepairAttempts ?? DEFAULT_MAX_REPAIR_ATTEMPTS;
-  const repairDelayMs = options.repairDelayMs ?? DEFAULT_REPAIR_DELAY_MS;
-  const coveredThrough = options.coveredThrough ?? 0;
+  // Validated exactly where `joinFactorySessionView` validates its own, and
+  // with its messages: a `maxRepairAttempts` of 0 silently means "give up on
+  // the first repair and never read again", a `NaN` delay becomes a zero one,
+  // and a `tailLimit` of 0 issues `limit=0` reads. A bound that is not a bound
+  // is a programming error, and it is cheaper to fail on it than to serve it.
+  const tailLimit = positiveBound(options.tailLimit ?? DEFAULT_FACTORY_TAIL_LIMIT, "tailLimit");
+  const maxRepairAttempts = positiveBound(
+    options.maxRepairAttempts ?? DEFAULT_MAX_REPAIR_ATTEMPTS,
+    "maxRepairAttempts",
+  );
+  const repairDelayMs = safeSequence(options.repairDelayMs ?? DEFAULT_REPAIR_DELAY_MS, "repairDelayMs");
+  const coveredThrough = safeSequence(options.coveredThrough ?? 0, "coveredThrough");
 
   const readsRef = useRef(reads);
   const tailLimitRef = useRef(tailLimit);
@@ -529,10 +584,18 @@ export function useFactorySessionView(
   //
   // And not dependencies, because the binding below is keyed on the session
   // alone. A machine rebuilt without a rebind is never authorized, so `onJoin`
-  // never fires and it never reads: changing `coveredThrough` alone would
-  // replace a working view with a permanently "joining" one. Measured. These
-  // therefore take effect at the next session change, which is the only moment
-  // a fresh cursor means anything anyway.
+  // never fires and it never reads: adding any of these would replace a working
+  // view with a permanently "joining" one. Measured, and pinned by a test,
+  // because this repository has no lint surface at all — there is no eslint
+  // config and no eslint dependency, so the disable comment below documents the
+  // omission and enforces nothing.
+  //
+  // The three option lifetimes are therefore: `tailLimit` LIVE, through a ref,
+  // read afresh by every cold read; `coveredThrough`, `maxRepairAttempts` and
+  // `repairDelayMs` CONSTRUCTION-ONLY, taking effect at the next session
+  // change. That asymmetry is not elegant, and it is the honest one: only
+  // `tailLimit` can change meaning mid-session without invalidating what the
+  // view has already accumulated.
   const machine = useMemo(
     () =>
       new FactoryColdJoin(

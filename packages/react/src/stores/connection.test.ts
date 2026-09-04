@@ -886,3 +886,31 @@ test("a loser's own cancellation does not re-drive its fellow loser", async () =
   expect(link.forSession("session-a")).toHaveLength(1);
   store.close();
 });
+
+// A throwing `unsubscribe` used to escape `record.cancel` and, from there, the
+// cancel loop inside `close()`: `#link.disconnect()` never ran, the remaining
+// bindings were never cancelled, and the `"idle"` publish never happened — the
+// store left reporting a connection over a link nobody would close.
+test("a subscription that throws on unsubscribe does not strand close()", async () => {
+  const link = new FakeClientLink();
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const first = recorder("session-a");
+  const second = recorder("session-b");
+  store.bind(first.options);
+  store.bind(second.options);
+  await expect.poll(() => link.open.length).toBe(2);
+  const hostile = link.forSession("session-a")[0]!;
+  hostile.unsubscribe = (): never => {
+    throw new Error("the socket is already gone");
+  };
+
+  store.close();
+
+  expect(store.snapshot().state).toBe("idle");
+  expect(store.snapshot().bindingCount).toBe(0);
+  // The teardown completed past the throw: the peer was cancelled and the link
+  // was actually disconnected.
+  expect(link.disconnectCalls).toBe(1);
+  expect(link.forSession("session-b")[0]?.unsubscribeCount).toBe(1);
+});

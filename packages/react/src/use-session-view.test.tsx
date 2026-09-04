@@ -1,5 +1,10 @@
 import { useEffect } from "react";
-import { createFactoryClient } from "@looprig/protocol";
+import {
+  createFactoryClient,
+  DEFAULT_MAX_REPAIR_ATTEMPTS,
+  DEFAULT_REPAIR_DELAY_MS,
+  MAX_REPAIR_BACKOFF_FACTOR,
+} from "@looprig/protocol";
 import type { EnduringPublication, FactoryClient, FactoryClientOptions } from "@looprig/protocol";
 import { expect, test } from "vitest";
 import { render, renderHook } from "vitest-browser-react";
@@ -620,11 +625,18 @@ test("a repair that recovers coverage clears the give-up counter", async () => {
   expect(h.view.current?.error).toBeNull();
 });
 
-test("the caller's coveredThrough is where both the machine and the binding start", async () => {
-  // M3. The option was documented, exported and plumbed through, and no test
-  // passed it: replacing it with a literal 0 left the whole suite green. It has
-  // two readers, and they are different mechanisms — the accumulation's
-  // starting coverage, and the cursor the binding reports at every rejoin.
+test("the caller's coveredThrough is the accumulation's starting coverage", async () => {
+  // The option was documented, exported and plumbed through, and no test passed
+  // it: replacing it with a literal 0 left the whole suite green.
+  //
+  // ONE reader, stated as one. The value is also handed to the binding as its
+  // `cursor`, and that is NOT a second reader through this hook: the machine
+  // starts at the same number and the `advance` effect writes it to the binding
+  // in the same commit, and `advance` only raises — so `cursor: 0` and
+  // `cursor: coveredThrough` reach the same cursor by either route, and no
+  // authorization can fire in between because `#join` opens with an `await`.
+  // The earlier version of this comment claimed the second reader and asserted
+  // a reconnect instead, which is why that mutant survived.
   const h = await mountFactoryView({
     props: { coveredThrough: 40 },
     setup: (_link, reads) => {
@@ -633,17 +645,16 @@ test("the caller's coveredThrough is where both the machine and the binding star
   });
 
   await expect.poll(() => h.reads.of("readJournal").length).toBe(1);
-  // Reader one: before any page has landed, the view already claims the
-  // caller's coverage rather than zero.
+  // Before any page has landed, the view already claims the caller's coverage
+  // rather than zero.
   expect(h.view.current?.coveredThrough).toBe(40);
 
-  // Reader two: the binding subscribed at that cursor, which is the value a
-  // rejoin reports back as the span to repair.
+  // And a page that covers LESS than the caller already had does not lower it.
+  h.reads.page = { journal_tip: 3, covered_through: 3, events: [publicEvent(3)] };
   h.reads.settle("readJournal");
   await expect.poll(() => h.view.current?.state).toBe("ready");
-  h.link.drop();
-  await expect.poll(() => h.reads.of("readStatus").length).toBe(2);
-  expect(h.link.forSession(FSID)).toHaveLength(2);
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  expect(h.view.current?.coveredThrough).toBe(40);
 });
 
 test("changing the session in place starts the new one on its own cursor", async () => {
@@ -717,4 +728,232 @@ test("changing coveredThrough alone leaves the working view alone", async () => 
   expect(h.view.current?.coveredThrough).toBe(40);
   expect(h.reads.of("readStatus")).toHaveLength(1);
   expect(h.link.open).toHaveLength(1);
+});
+
+/** Drives repair triggers at `everyMs` until `stop()`, so the backoff alone paces the reads. */
+function driveForeignFrames(h: FactoryHarness, everyMs = 1): () => void {
+  let sequence = 0;
+  const handle = setInterval(() => {
+    sequence += 1;
+    h.link.open[0]?.deliver({ ...enduringFor(sequence), session_id: "some-other-session" });
+  }, everyMs);
+  return () => clearInterval(handle);
+}
+
+test("a repair loop that once made progress still gives up", async () => {
+  // M1. `#repairBase` is re-based on every cycle. Frozen at the constructor's
+  // cursor instead, `#coveredThrough > #repairBase` is true forever after the
+  // first byte of progress, the counter resets every cycle, and the give-up
+  // bound never fires again — the unbounded loop this class exists to close,
+  // re-opened by any session that ever advanced. Both other bound tests miss
+  // it: one never progresses, so `0 > 0` is false either way, and the other
+  // only asks for the reset.
+  const h = await mountFactoryView({ props: { repairDelayMs: 0, maxRepairAttempts: 3 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+
+  // Progress, once.
+  h.reads.page = { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] };
+  h.link.open[0]?.deliver(enduringFor(5));
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(5);
+
+  // Then stuck: nothing that follows advances coverage.
+  const stop = driveForeignFrames(h);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  stop();
+
+  // Asserted at a fixed time, not polled: without the re-base this is "ready"
+  // forever and a poll would report a timeout rather than a failed assertion.
+  expect(h.view.current?.state).toBe("failed");
+  expect(h.view.current?.error?.message).toMatch(/consecutive repairs without coverage progress/);
+});
+
+test("the give-up boundary is the caller's number exactly, from both sides", async () => {
+  // M3. `>` was pinned only in the loosening direction: any TIGHTENING was
+  // invisible, including `>= 1`, which gives up on the first repair and ignores
+  // `maxRepairAttempts` entirely. The read count at the boundary is an equality.
+  const h = await mountFactoryView({ props: { repairDelayMs: 0, maxRepairAttempts: 4 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+
+  const stop = driveForeignFrames(h);
+  await expect.poll(() => h.view.current?.state).toBe("failed");
+  stop();
+
+  // One cold read for the join, then exactly `maxRepairAttempts` repairs, then
+  // the give-up — which reads nothing.
+  expect(h.reads.of("readStatus")).toHaveLength(5);
+  expect(h.view.current?.error?.message).toContain("5 consecutive repairs");
+});
+
+test("the default give-up bound is protocol's, not one and not unbounded", async () => {
+  const h = await mountFactoryView({ props: { repairDelayMs: 0 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+
+  const stop = driveForeignFrames(h);
+  await expect.poll(() => h.view.current?.state, { timeout: 4000 }).toBe("failed");
+  stop();
+
+  expect(h.reads.of("readStatus")).toHaveLength(1 + DEFAULT_MAX_REPAIR_ATTEMPTS);
+});
+
+test("consecutive repairs back off, doubling, and stop doubling at the cap", async () => {
+  // M2. The whole schedule had no reader: replacing it with `const delay = 0`
+  // left the suite green, and so did 8 -> 1, 8 -> 1000, 250 -> 0 and
+  // 250 -> 999999. A count of reads cannot see a schedule; the times can.
+  const base = 20;
+  const h = await mountFactoryView({ props: { repairDelayMs: base, maxRepairAttempts: 8 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  const firstRepairIndex = h.reads.of("readStatus").length;
+
+  const stop = driveForeignFrames(h);
+  await expect.poll(() => h.view.current?.state, { timeout: 4000 }).toBe("failed");
+  stop();
+
+  const times = h.reads.of("readStatus").slice(firstRepairIndex - 1).map((call) => call.at);
+  const gaps: number[] = [];
+  for (let index = 1; index < times.length; index += 1) gaps.push(times[index]! - times[index - 1]!);
+
+  // The first repair after a join is immediate; the second is one base delay.
+  expect(gaps[0]).toBeLessThan(base / 2);
+  expect(gaps[1]).toBeGreaterThanOrEqual(base / 2);
+  expect(gaps[1]).toBeLessThan(base * 1.6);
+  // It doubles, and it stops: the largest wait is the capped one, not the last
+  // term of an unbounded series.
+  const longest = Math.max(...gaps);
+  expect(longest).toBeGreaterThanOrEqual(base * MAX_REPAIR_BACKOFF_FACTOR * 0.6);
+  expect(longest).toBeLessThan(base * MAX_REPAIR_BACKOFF_FACTOR * 2);
+  // And the whole run is paced by the curve rather than by the macrotask queue.
+  expect(times[times.length - 1]! - times[0]!).toBeGreaterThan(base * 12);
+});
+
+test("the default repair delay is protocol's quarter second, not zero and not unbounded", async () => {
+  // The DEFAULT is a separate reader from the curve: a test that always passes
+  // `repairDelayMs` cannot see `DEFAULT_REPAIR_DELAY_MS` at all. Both bounds
+  // are asserted at FIXED times, so neither direction reports a poll timeout.
+  const h = await mountFactoryView({ props: { maxRepairAttempts: 2 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  const before = h.reads.of("readStatus").length;
+
+  const stop = driveForeignFrames(h);
+  await new Promise((resolve) => setTimeout(resolve, DEFAULT_REPAIR_DELAY_MS / 4));
+  // The first repair is immediate; the second waits a base delay that has not
+  // elapsed. A zero default would already have spent the whole budget.
+  expect(h.reads.of("readStatus")).toHaveLength(before + 1);
+
+  await new Promise((resolve) => setTimeout(resolve, DEFAULT_REPAIR_DELAY_MS * 2));
+  stop();
+  // And it is a quarter second, not a forever: the second repair has landed and
+  // the run has given up.
+  expect(h.reads.of("readStatus")).toHaveLength(before + 2);
+  expect(h.view.current?.state).toBe("failed");
+});
+
+test("a view that has given up stops paying for further triggers", async () => {
+  // M4. `#repair` returned after publishing WITHOUT scheduling anything, so
+  // every later trigger re-entered, counted again, allocated an `Error` with a
+  // stack and published — and `Publisher.publish` compares nothing, so each was
+  // a React commit. Bounded in requests, unbounded in renders.
+  const h = await mountFactoryView({ props: { repairDelayMs: 0, maxRepairAttempts: 2 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  const stop = driveForeignFrames(h);
+  await expect.poll(() => h.view.current?.state).toBe("failed");
+  stop();
+
+  const settled = h.view.current;
+  const reads = h.reads.calls.length;
+  for (let index = 0; index < 20; index += 1) {
+    h.link.open[0]?.deliver({ ...enduringFor(index + 1), session_id: "some-other-session" });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  // The identical snapshot reference: not one further publish, so not one
+  // further render and not one further Error allocated.
+  expect(h.view.current).toBe(settled);
+  expect(h.reads.calls).toHaveLength(reads);
+});
+
+test("a rejoin drops a repair that was still pending, and re-arms the view", async () => {
+  // A foreign frame schedules a repair; the link reconnects first and the
+  // rejoin's read does that work. Left armed, the stale timer fired a second
+  // full three-request cold read a moment later, bumping the generation and
+  // aborting the fresh read it had just superseded.
+  const h = await mountFactoryView({ props: { repairDelayMs: 60 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  // Two frames: the first repair is immediate, the second is the one that waits.
+  h.link.open[0]?.deliver({ ...enduringFor(1), session_id: "some-other-session" });
+  await expect.poll(() => h.reads.of("readStatus").length).toBe(2);
+  h.link.open[0]?.deliver({ ...enduringFor(2), session_id: "some-other-session" });
+
+  h.link.drop();
+  await expect.poll(() => h.reads.of("readStatus").length).toBe(3);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  expect(h.reads.of("readStatus")).toHaveLength(3);
+  expect(h.view.current?.state).toBe("ready");
+});
+
+test("a rejoin after a give-up reads again", async () => {
+  // Giving up is a statement about one subscription's stream of triggers, not
+  // about the session: the next connection gets its chance, exactly as a
+  // binding does.
+  const h = await mountFactoryView({ props: { repairDelayMs: 0, maxRepairAttempts: 1 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  const stop = driveForeignFrames(h);
+  await expect.poll(() => h.view.current?.state).toBe("failed");
+  stop();
+  const reads = h.reads.of("readStatus").length;
+
+  h.link.drop();
+
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  expect(h.reads.of("readStatus").length).toBe(reads + 1);
+});
+
+test("only tailLimit is live; the other three take effect at the next session", async () => {
+  // Three option lifetimes, and this is the only thing in the repository that
+  // would catch someone widening the memo's dependencies: there is no eslint
+  // config and no eslint dependency here, so the disable comment beside those
+  // dependencies enforces nothing at all.
+  const h = await mountFactoryView({
+    props: { tailLimit: 8, repairDelayMs: 0, maxRepairAttempts: 4, coveredThrough: 2 },
+  });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  expect(h.reads.of("readJournal")[0]?.options).toMatchObject({ tail: 8, limit: 8 });
+
+  await h.rerender({ tailLimit: 32, repairDelayMs: 999, maxRepairAttempts: 1, coveredThrough: 90 });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  // The view is still the same working one: no rebuild, so no rebind, so no
+  // permanently "joining" view.
+  expect(h.view.current?.state).toBe("ready");
+  expect(h.view.current?.coveredThrough).toBe(2);
+  expect(h.reads.of("readStatus")).toHaveLength(1);
+
+  // But `tailLimit` is read afresh by the next cold read, and the bounds the
+  // rerender passed are ignored — the repair still runs on the delay and the
+  // attempt count this view was built with.
+  h.link.drop();
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
+  expect(h.reads.of("readJournal")[1]?.options).toMatchObject({ tail: 32, limit: 32 });
+  const stop = driveForeignFrames(h);
+  await expect.poll(() => h.view.current?.state).toBe("failed");
+  stop();
+  expect(h.view.current?.error?.message).toContain("5 consecutive repairs");
+});
+
+test("a bound that is not a bound is rejected, with protocol's own messages", async () => {
+  // `joinFactorySessionView` validates all four and throws `RangeError`; this
+  // ran none, so `maxRepairAttempts: 0` silently meant "give up on the first
+  // repair and never read again", `repairDelayMs: NaN` became a zero delay, and
+  // `tailLimit: 0` issued `limit=0` reads.
+  const cases: [ViewProps, string][] = [
+    [{ tailLimit: 0 }, "tailLimit must be a positive safe integer"],
+    [{ tailLimit: 1.5 }, "tailLimit must be a positive safe integer"],
+    [{ maxRepairAttempts: 0 }, "maxRepairAttempts must be a positive safe integer"],
+    [{ repairDelayMs: -1 }, "repairDelayMs must be a non-negative safe integer"],
+    [{ repairDelayMs: Number.NaN }, "repairDelayMs must be a non-negative safe integer"],
+    [{ coveredThrough: -1 }, "coveredThrough must be a non-negative safe integer"],
+  ];
+  for (const [props, message] of cases) {
+    await expect(mountFactoryView({ props })).rejects.toThrow(message);
+  }
 });

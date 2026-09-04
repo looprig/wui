@@ -38,6 +38,13 @@ export interface ColdReadCall {
   readonly method: ColdReadMethod;
   readonly sessionId: string;
   readonly options: RequestOptions & FactoryJournalOptions;
+  /**
+   * `performance.now()` when the call was made. The repair backoff is a
+   * SCHEDULE, and a schedule is only observable in time: a count of reads is
+   * identical whether the delay curve is honoured, flattened to zero or
+   * uncapped, which is how the whole curve came to have no reader.
+   */
+  readonly at: number;
 }
 
 /** A `journal_seq`-keyed public event, in the shape a tail page carries. */
@@ -126,7 +133,7 @@ export class FakeFactoryReads {
     options: RequestOptions & FactoryJournalOptions,
     produce: () => T,
   ): Promise<T> {
-    this.calls.push({ method, sessionId, options });
+    this.calls.push({ method, sessionId, options, at: performance.now() });
     // Taken at CALL time, so a queued body belongs to the call that was made
     // while it was queued rather than to whichever call happens to be released
     // first.
