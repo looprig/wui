@@ -235,6 +235,12 @@ test("opening a cold session reads status, gates and a bounded tail, subscribes,
   // bounds the page the same read returns.
   expect(h.reads.of("readJournal")[0]?.options).toMatchObject({ tail: 256, limit: 256 });
 
+  // The projections the three reads returned are what the view carries. Calling
+  // `listGates` and dropping the answer would leave the gate projection a
+  // declared field nothing fills.
+  expect(h.view.current?.status).toStrictEqual(h.reads.status);
+  expect(h.view.current?.gates).toStrictEqual(h.reads.gates);
+
   // And it subscribed, once, to this session's channel.
   expect(h.link.subscriptions.map((subscription) => subscription.sessionId)).toStrictEqual([FSID]);
 

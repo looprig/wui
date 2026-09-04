@@ -131,13 +131,25 @@ export class FakeFactoryReads {
     // while it was queued rather than to whichever call happens to be released
     // first.
     const queued = (this.#queued.get(method) ?? []).shift() as T | undefined;
+    // `FactoryRestReads` hands the signal to `fetch` and turns an abort into a
+    // rejected `RequestAbortedError`; a double that RESOLVED an aborted read
+    // would be looser than the module it stands in for, and would leave a
+    // caller's cancellation looking like it had no effect at all.
+    const aborted = (): boolean => options.signal?.aborted === true;
+    if (aborted()) throw new Error("read aborted");
     if (this.#holding.has(method)) {
-      await new Promise<void>((resolve) => {
+      await new Promise<void>((resolve, reject) => {
+        const abort = (): void => reject(new Error("read aborted"));
+        options.signal?.addEventListener("abort", abort, { once: true });
         const waiting = this.#held.get(method) ?? [];
-        waiting.push(resolve);
+        waiting.push(() => {
+          options.signal?.removeEventListener("abort", abort);
+          resolve();
+        });
         this.#held.set(method, waiting);
       });
     }
+    if (aborted()) throw new Error("read aborted");
     const failure = this.#failures.get(method);
     if (failure !== undefined) {
       this.#failures.delete(method);

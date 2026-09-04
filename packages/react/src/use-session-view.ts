@@ -241,11 +241,14 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
    */
   start(): void {
     this.#running = true;
-    this.#generation += 1;
   }
 
   stop(): void {
     this.#running = false;
+    // Invalidates any read still in flight for good, which is what makes a
+    // restart safe without `start()` having to bump as well: a read taken
+    // before this line can never match the generation again, whether it lands
+    // while the machine is stopped or after it has been started again.
     this.#generation += 1;
     this.#controller?.abort();
     this.#controller = undefined;
