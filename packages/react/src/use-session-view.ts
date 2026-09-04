@@ -136,13 +136,31 @@ export interface FactorySessionViewOptions {
   tenantId: string;
   sessionId: string;
   /**
-   * Greatest sequence the application has already durably applied. Read ONCE,
-   * at construction, like `FactoryLinkProvider`'s `options`: a value that moved
-   * later would have to rebuild the accumulated view to mean anything.
+   * Greatest sequence the application has already durably applied. It is a
+   * construction input, so CHANGING it rebuilds the machine and starts the
+   * session over from that cursor — a value that moved without rebuilding
+   * would describe an accumulation that never happened.
    */
   coveredThrough?: number;
   /** Bound on the one tail read per join. Default 256, matching protocol's join. */
   tailLimit?: number;
+  /**
+   * Consecutive repairs that make NO coverage progress before the view gives
+   * up and reports a failure. Default 32, matching protocol's join. A repair
+   * cycle that advances `coveredThrough` past the sequence its cycle started
+   * from resets the counter, so a slow but progressing recovery is never cut
+   * off; only a genuinely stuck condition terminates.
+   */
+  maxRepairAttempts?: number;
+  /**
+   * Base delay before the SECOND and later consecutive non-progressing repairs,
+   * doubling per attempt and capped at eight times this value. Default 250
+   * (milliseconds), matching protocol's join. The first repair after progress
+   * uses a zero delay — but still a real timer, because the macrotask is the
+   * point: it is what turns a burst of frames arriving in one turn into one
+   * read rather than one read each.
+   */
+  repairDelayMs?: number;
 }
 
 export interface UseFactorySessionViewResult {
@@ -160,6 +178,9 @@ export interface UseFactorySessionViewResult {
 }
 
 const DEFAULT_TAIL_LIMIT = 256;
+const DEFAULT_MAX_REPAIR_ATTEMPTS = 32;
+const DEFAULT_REPAIR_DELAY_MS = 250;
+const MAX_REPAIR_BACKOFF_FACTOR = 8;
 
 const COLD: Omit<UseFactorySessionViewResult, "coveredThrough"> = {
   state: "joining",
@@ -196,9 +217,53 @@ const COLD: Omit<UseFactorySessionViewResult, "coveredThrough"> = {
  *    `journal_tip`, or a live sequence beyond what the tail reached, leaves a
  *    hole this class neither sees nor repairs; `joinFactorySessionView` in
  *    `@looprig/protocol` is where that bound lives.
+ *
+ * ## Repair is coalesced and bounded, and both halves are needed
+ *
+ * A frame naming another channel and a `session.reset` both force a re-read.
+ * Neither is a one-shot: a subscription that is not what it claims to be keeps
+ * producing frames, and a Factory that resets keeps resetting. Re-reading per
+ * frame is a client-caused outage amplifier — one three-request cycle per
+ * round trip — so `#repair` COALESCES: a repair already scheduled absorbs every
+ * further trigger, and twenty frames in one turn cost one read.
+ *
+ * Coalescing alone does not bound a condition that re-arms after every read, so
+ * consecutive repairs that make no coverage progress are COUNTED and capped
+ * (`maxRepairAttempts`), with the delay doubling in between (`repairDelayMs`).
+ * A cycle whose coverage passes the sequence it started from clears the
+ * counter, so a slow recovery is never cut off; a stuck one ends by reporting a
+ * failure rather than retrying forever. Both bounds are `joinFactorySessionView`\'s,
+ * with its defaults, for the reasons its own doc gives.
  *  - It does not fold. `events` are wire events, not transcript rows.
  *  - It drops ephemeral publications, which carry no sequence and so have no
  *    place in a `journal_seq`-keyed accumulation.
+ *
+ * ## Why this is not `@looprig/protocol`'s `FactorySessionViewStore`
+ *
+ * It should be, and this class is a smaller re-derivation of it: the same
+ * AbortController-plus-generation lifecycle, the same 256 tail default, the
+ * same repair bounds — and protocol's has, in addition, gap detection,
+ * pre-join publication buffering and a `persistCoveredThrough` seam that this
+ * one does not.
+ *
+ * The obstacle is a real seam conflict, not a preference. `FactoryJoinLink`
+ * requires `subscribe(options): ClientSubscription`, because
+ * `joinFactorySessionView` OWNS its subscription: it opens one per repair
+ * generation, reads `subscription.version` to check the negotiated protocol,
+ * and awaits `subscription.ready`. `FactoryLinkStore` owns the socket and the
+ * one-subscription-per-channel registry above it, and hands a view a
+ * `SessionBinding` instead — no `ready`, no `version`, and a rejoin cadence the
+ * store, not the view, decides. Adapting a binding into a `ClientSubscription`
+ * today would mean fabricating a `version` the binding never saw, which is a
+ * double looser than the thing it stands in for and would defeat a real guard.
+ *
+ * The fix is on the store's side, and it is small: a `bind()` that can return
+ * the `ClientSubscription` shape — `ready` resolved by the authorization
+ * `onJoin` already reports, and the negotiated `version` carried through from
+ * the subscription the store holds. That would delete most of this class and
+ * bring protocol's gap detection and buffering with it. U5.1/U5.2 own the
+ * cut-over; this was left alone in U4.2 because changing the transport seam is
+ * not a thing to do inside the task that removes view-triggered restore.
  *
  * Nothing here imports React.
  */
@@ -207,7 +272,14 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
   readonly #sessionId: string;
   readonly #reads: () => FactoryColdReads;
   readonly #tailLimit: () => number;
+  readonly #maxRepairAttempts: number;
+  readonly #repairDelayMs: number;
   readonly #events = new Map<number, PublicJournalEvent>();
+  /** The pending coalesced repair, if one is already scheduled. */
+  #repairTimer: ReturnType<typeof setTimeout> | undefined;
+  #consecutiveRepairs = 0;
+  /** `#coveredThrough` when the last repair cycle was scheduled. */
+  #repairBase = 0;
   #coveredThrough: number;
   #running = false;
   /**
@@ -225,13 +297,18 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
     coveredThrough: number,
     reads: () => FactoryColdReads,
     tailLimit: () => number,
+    maxRepairAttempts: number,
+    repairDelayMs: number,
   ) {
     super({ ...COLD, coveredThrough });
     this.#tenantId = tenantId;
     this.#sessionId = sessionId;
     this.#coveredThrough = coveredThrough;
+    this.#repairBase = coveredThrough;
     this.#reads = reads;
     this.#tailLimit = tailLimit;
+    this.#maxRepairAttempts = maxRepairAttempts;
+    this.#repairDelayMs = repairDelayMs;
   }
 
   /**
@@ -243,13 +320,23 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
     this.#running = true;
   }
 
+  /**
+   * Ends the in-flight read rather than merely ignoring it: the signal reaches
+   * a real `FactoryRestReads`'s `fetch`, so an abandoned view stops costing a
+   * request, and the rejection that follows is what the read's own generation
+   * guard discards.
+   *
+   * There is deliberately no generation bump here. It was measured to change
+   * nothing any reader can see — `join()` bumps on every read, so a superseded
+   * read is already guarded, and after this line the machine has no
+   * subscribers by construction: `useStore`'s subscription is torn down by the
+   * same unmount that runs this cleanup, and on a dependency change the memo
+   * has already rebuilt and `useStore` resubscribed to the replacement.
+   */
   stop(): void {
     this.#running = false;
-    // Invalidates any read still in flight for good, which is what makes a
-    // restart safe without `start()` having to bump as well: a read taken
-    // before this line can never match the generation again, whether it lands
-    // while the machine is stopped or after it has been started again.
-    this.#generation += 1;
+    if (this.#repairTimer !== undefined) clearTimeout(this.#repairTimer);
+    this.#repairTimer = undefined;
     this.#controller?.abort();
     this.#controller = undefined;
   }
@@ -267,13 +354,45 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
     void this.#read(generation, controller);
   }
 
+  /**
+   * Schedules ONE re-read for however many triggers arrive before it runs.
+   *
+   * The timer is always real, even at a zero delay, because reaching the
+   * macrotask queue is what makes the coalescing work at all: every trigger in
+   * the current turn finds `#repairTimer` set and is absorbed.
+   */
+  #repair(): void {
+    if (!this.#running) return;
+    if (this.#repairTimer !== undefined) return;
+    this.#consecutiveRepairs = this.#coveredThrough > this.#repairBase ? 0 : this.#consecutiveRepairs + 1;
+    this.#repairBase = this.#coveredThrough;
+    if (this.#consecutiveRepairs > this.#maxRepairAttempts) {
+      this.publish({
+        state: "failed",
+        error: new Error(
+          `factory session view gave up after ${this.#consecutiveRepairs} consecutive repairs without coverage progress`,
+        ),
+      });
+      return;
+    }
+    const delay = this.#consecutiveRepairs <= 1
+      ? 0
+      : this.#repairDelayMs * Math.min(2 ** (this.#consecutiveRepairs - 2), MAX_REPAIR_BACKOFF_FACTOR);
+    this.#repairTimer = setTimeout(() => {
+      this.#repairTimer = undefined;
+      this.join();
+    }, delay);
+  }
+
   publication(value: FactoryPublication): void {
     if (!this.#running) return;
     if (value.tenant_id !== this.#tenantId || value.session_id !== this.#sessionId) {
       // Never applied, and never trusted to move the cursor. A frame for
       // another channel means this subscription is not what it claims to be, so
-      // the durable plane is re-read rather than believed.
-      this.join();
+      // the durable plane is re-read rather than believed — through the bounded,
+      // coalesced path, because a channel that produced one such frame will
+      // produce the next one too.
+      this.#repair();
       return;
     }
     if (value.type !== "enduring_publication") return;
@@ -302,7 +421,7 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
       if (this.#coveredThrough > value.last_contiguous) this.#coveredThrough = value.last_contiguous;
       this.publish({ events: this.#ordered(), coveredThrough: this.#coveredThrough });
     }
-    this.join();
+    this.#repair();
   }
 
   /**
@@ -382,6 +501,9 @@ export function useFactorySessionView(
 ): UseFactorySessionViewResult {
   const { tenantId, sessionId } = options;
   const tailLimit = options.tailLimit ?? DEFAULT_TAIL_LIMIT;
+  const maxRepairAttempts = options.maxRepairAttempts ?? DEFAULT_MAX_REPAIR_ATTEMPTS;
+  const repairDelayMs = options.repairDelayMs ?? DEFAULT_REPAIR_DELAY_MS;
+  const coveredThrough = options.coveredThrough ?? 0;
 
   const readsRef = useRef(reads);
   const tailLimitRef = useRef(tailLimit);
@@ -393,19 +515,26 @@ export function useFactorySessionView(
     tailLimitRef.current = tailLimit;
   });
 
-  const initialCoveredThrough = useRef(options.coveredThrough ?? 0);
+  // Every construction input is a memo DEPENDENCY, not a ref read from inside
+  // the factory. A ref would hold whatever the FIRST render passed for as long
+  // as the component lives, so an in-place session change — supported, since
+  // `sessionId` is a dependency here — would build cold session B's machine and
+  // binding on session A's cursor and subscribe B at a sequence measured on
+  // another journal.
   const machine = useMemo(
     () =>
       new FactoryColdJoin(
         tenantId,
         sessionId,
-        initialCoveredThrough.current,
+        coveredThrough,
         () => readsRef.current,
         () => tailLimitRef.current,
+        maxRepairAttempts,
+        repairDelayMs,
       ),
     // Safe to double-invoke and discard in StrictMode: the constructor opens
     // nothing and issues no read. Everything starts from an effect below.
-    [tenantId, sessionId],
+    [tenantId, sessionId, coveredThrough, maxRepairAttempts, repairDelayMs],
   );
 
   useEffect(() => {
@@ -418,7 +547,7 @@ export function useFactorySessionView(
   const binding = useSessionBinding({
     tenantId,
     sessionId,
-    cursor: initialCoveredThrough.current,
+    cursor: coveredThrough,
     onJoin: () => machine.join(),
     onRejoin: () => machine.join(),
     onPublication: (publication) => machine.publication(publication),

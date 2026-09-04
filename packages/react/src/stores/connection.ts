@@ -281,12 +281,26 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     void this.#ensureConnected();
   }
 
-  /** Cancels every binding exactly once, then drops the connection. */
+  /**
+   * Cancels every binding exactly once, then drops the connection.
+   *
+   * The set is emptied BEFORE the cancels rather than after, and the order is
+   * load-bearing: `record.cancel` re-enters this store through
+   * `#redriveChannelPeers`, so with the set still populated the first cancel
+   * sent a surviving peer at `#join` -> `#ensureConnected`, which found
+   * `#connecting` already cleared and the link not yet disconnected and started
+   * a SECOND `link.connect()` on a fresh epoch. The `disconnect()` below then
+   * rejected it, and because that epoch was current the store published
+   * `"failed"` after publishing `"idle"` — the exact outcome `#epoch` exists to
+   * prevent, reached from inside rather than from a stale caller. Emptying
+   * first leaves the re-drive scan nothing to find.
+   */
   close(): void {
     this.#epoch.start();
     this.#connecting = undefined;
-    for (const record of [...this.#bindings]) record.cancel();
+    const bindings = [...this.#bindings];
     this.#bindings.clear();
+    for (const record of bindings) record.cancel();
     this.#link.disconnect();
     this.publish({ state: "idle", connected: false, failure: null, bindingCount: 0 });
   }
@@ -304,8 +318,11 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     record.cancel = cancelOnce(() => {
       record.cancelled = true;
       this.#bindings.delete(record);
-      this.#release(record);
-      this.#redriveChannelPeers(record);
+      // Only a record that actually HELD the channel frees one, so only that
+      // record may drive a peer at it. A cancelling loser frees nothing, and
+      // sending its fellow loser at a channel the winner still holds throws and
+      // reports a second error for a subscription that never changed hands.
+      if (this.#release(record)) this.#redriveChannelPeers(record);
       this.publish({ bindingCount: this.#bindings.size });
     });
     this.#bindings.add(record);
@@ -341,11 +358,17 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
    *
    * The callers, for the record, are a cancellation, a subscription error that
    * triggers a rejoin, and that rejoin itself.
+   *
+   * Returns whether this call is the one that freed the channel. Both release
+   * paths that END a binding's hold — a cancellation and a subscription error —
+   * use it to decide whether a peer may now be driven at that channel; a caller
+   * that released nothing has made nothing available.
    */
-  #release(record: BindingRecord): void {
+  #release(record: BindingRecord): boolean {
     const release = record.release;
     record.release = undefined;
     release?.();
+    return release !== undefined;
   }
 
   /**
@@ -361,8 +384,12 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
    * and nothing re-drives the loser: it stays silent, uncancelled, and counted
    * in `bindingCount`, for as long as the link stays up.
    *
-   * The release is what makes the channel available, so the release is where
-   * the retry belongs. `attemptedGeneration` is reset to 0 rather than
+   * The release is what makes the channel available, so every path that ends a
+   * binding's hold calls this: a cancellation and `#onBindingError`. Both, not
+   * one — a winner whose subscription merely FAILS hands the channel back
+   * without anybody unmounting, and for as long as only the cancel path
+   * re-drove, that case left the loser silent exactly as before.
+   * `attemptedGeneration` is reset to 0 rather than
    * decremented: 0 is the value no live generation ever takes (see
    * `#generation`), so `#join` cannot mistake it for an attempt already made.
    *
@@ -524,7 +551,7 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     // A superseded subscription's late error is not this binding's state.
     if (record.attemptedGeneration !== generation) return;
     record.options.onError?.(error);
-    this.#release(record);
+    if (this.#release(record)) this.#redriveChannelPeers(record);
     // Recovers only across a NEW connection: `#join` finds the same generation
     // and stops if the link is still up. A subscription this Factory has stopped
     // authorizing must not be reopened in a loop against the same socket.

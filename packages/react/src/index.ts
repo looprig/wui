@@ -16,22 +16,20 @@ export {
   type SessionListQuery,
   type UseSessionListResult,
 } from "./use-session-list.js";
-export {
-  useSessionView,
-  type SessionViewOptions,
-  type UseSessionViewResult,
-} from "./use-session-view.js";
 // Opening a session view is a READ. `useAttachOrRestore` was deleted rather
 // than deprecated in U4.2: `@looprig/react` is `private: true`, has never been
 // published, and the only consumer in or out of this repository is `app/` —
 // there was no external caller a compatibility shim could have been for.
 export {
   useFactorySessionView,
+  useSessionView,
   type FactoryColdReads,
   type FactorySessionViewOptions,
   type FactorySessionViewState,
   type PublicJournalEvent,
+  type SessionViewOptions,
   type UseFactorySessionViewResult,
+  type UseSessionViewResult,
 } from "./use-session-view.js";
 export { useRowCount, useTranscriptRow } from "./use-transcript-row.js";
 export { useComposer, type UseComposerResult } from "./use-composer.js";

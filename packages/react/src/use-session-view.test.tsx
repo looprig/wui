@@ -150,8 +150,11 @@ interface FactoryHarness {
 }
 
 interface ViewProps {
+  sessionId?: string;
   tailLimit?: number;
   coveredThrough?: number;
+  repairDelayMs?: number;
+  maxRepairAttempts?: number;
 }
 
 interface MountOptions {
@@ -179,9 +182,11 @@ async function mountFactoryView(options: MountOptions = {}): Promise<FactoryHarn
     client.current = useFactoryClient();
     const value = useFactorySessionView(reads, {
       tenantId: TENANT,
-      sessionId: FSID,
+      sessionId: inner.sessionId ?? FSID,
       ...(inner.tailLimit === undefined ? {} : { tailLimit: inner.tailLimit }),
       ...(inner.coveredThrough === undefined ? {} : { coveredThrough: inner.coveredThrough }),
+      ...(inner.repairDelayMs === undefined ? {} : { repairDelayMs: inner.repairDelayMs }),
+      ...(inner.maxRepairAttempts === undefined ? {} : { maxRepairAttempts: inner.maxRepairAttempts }),
     });
     useEffect(() => {
       view.current = value;
@@ -442,15 +447,18 @@ test("a reset discards what the Factory no longer holds and re-reads", async () 
   // gone from the Factory, so they go from the view too.
   await expect.poll(() => h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([1]);
   expect(h.view.current?.coveredThrough).toBe(1);
-  expect(h.reads.of("readJournal").length).toBe(2);
+  // The truncation is applied at once; the re-read it forces goes through the
+  // coalesced repair path, so it lands a macrotask later.
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
   expect(h.link.rpcCalls).toStrictEqual([]);
 });
 
-test("a superseded read commits nothing, even when it lands last", async () => {
-  // The repair case, in the order that makes it a statement about the machine
-  // rather than about arrival timing: the stale read is released AFTER the
-  // current one (see `FakeFactoryReads.settle`), so a machine that committed
-  // whatever came back would end holding the stale page and the stale status.
+test("a superseded read is cancelled, and only the current one commits", async () => {
+  // The repair case. What this measures is the ABORT: `join()` cancels the read
+  // it supersedes, this double rejects an aborted read exactly as
+  // `FactoryRestReads` does, and so the stale page and stale status never land
+  // at all. An earlier version of this test claimed the release ORDER was what
+  // made a superseded commit observable; it is not, and the ordering is inert.
   const h = await mountFactoryView({
     setup: (_link, reads) => {
       reads.hold("readJournal");
@@ -535,4 +543,159 @@ test("a publication carrying no sequence changes nothing", async () => {
   expect(h.view.current?.coveredThrough).toBe(1);
   // And neither is a repair: they are for this channel, so nothing is re-read.
   expect(h.reads.of("readStatus")).toHaveLength(1);
+});
+
+test("a burst of foreign frames causes one re-read, not one per frame", async () => {
+  // M2. Both repair triggers are PERSISTENT states, not one-shots: a
+  // subscription that is not what it claims to be keeps producing frames, and a
+  // Factory that keeps resetting keeps resetting. Re-reading per frame is the
+  // unthrottled subscribe/REST storm `joinFactorySessionView` names — one full
+  // three-request cycle per round trip, from the client, at the server.
+  const h = await mountFactoryView({ props: { repairDelayMs: 5 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  expect(h.reads.calls).toHaveLength(3);
+
+  for (let index = 0; index < 20; index += 1) {
+    h.link.open[0]?.deliver({ ...enduringFor(index + 1), session_id: "some-other-session" });
+  }
+  await expect.poll(() => h.reads.of("readStatus").length).toBe(2);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  // Twenty frames, one repair: six requests in total, not sixty.
+  expect(h.reads.of("readStatus")).toHaveLength(2);
+  expect(h.reads.calls).toHaveLength(6);
+});
+
+test("a burst of foreign resets causes one re-read, not one per reset", async () => {
+  const h = await mountFactoryView({ props: { repairDelayMs: 5 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+
+  for (let index = 0; index < 20; index += 1) {
+    h.link.open[0]?.reset({
+      type: "session.reset",
+      tenant_id: TENANT,
+      session_id: "some-other-session",
+      journal_tip: 3,
+      last_contiguous: 1,
+    });
+  }
+  await expect.poll(() => h.reads.of("readStatus").length).toBe(2);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  expect(h.reads.calls).toHaveLength(6);
+});
+
+test("repairs that never make progress give up instead of retrying forever", async () => {
+  // The second bound. Coalescing collapses a burst; it does not bound a
+  // condition that keeps re-arming after every read, which is what a Factory
+  // stuck on the wrong channel is. Without a counter the loop is infinite.
+  const h = await mountFactoryView({ props: { repairDelayMs: 1, maxRepairAttempts: 3 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+
+  for (let index = 0; index < 12; index += 1) {
+    h.link.open[0]?.deliver({ ...enduringFor(index + 1), session_id: "some-other-session" });
+    await new Promise((resolve) => setTimeout(resolve, 12));
+  }
+
+  await expect.poll(() => h.view.current?.state).toBe("failed");
+  expect(h.view.current?.error?.message).toMatch(/consecutive repairs without coverage progress/);
+  // Bounded by the counter, not by the burst: four cold reads at most (the
+  // first join plus three repairs), so twelve requests.
+  expect(h.reads.of("readStatus").length).toBeLessThanOrEqual(4);
+});
+
+test("a repair that recovers coverage clears the give-up counter", async () => {
+  // A slow-but-progressing recovery must never be cut off; only a stuck loop
+  // terminates. Coverage moving past the cycle's base is the progress test.
+  const h = await mountFactoryView({ props: { repairDelayMs: 1, maxRepairAttempts: 2 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+
+  for (let index = 1; index <= 8; index += 1) {
+    h.reads.page = { journal_tip: index, covered_through: index, events: [publicEvent(index)] };
+    h.link.open[0]?.deliver({ ...enduringFor(index), session_id: "some-other-session" });
+    await expect.poll(() => h.view.current?.coveredThrough).toBe(index);
+  }
+
+  expect(h.view.current?.state).toBe("ready");
+  expect(h.view.current?.error).toBeNull();
+});
+
+test("the caller's coveredThrough is where both the machine and the binding start", async () => {
+  // M3. The option was documented, exported and plumbed through, and no test
+  // passed it: replacing it with a literal 0 left the whole suite green. It has
+  // two readers, and they are different mechanisms — the accumulation's
+  // starting coverage, and the cursor the binding reports at every rejoin.
+  const h = await mountFactoryView({
+    props: { coveredThrough: 40 },
+    setup: (_link, reads) => {
+      reads.hold("readJournal");
+    },
+  });
+
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(1);
+  // Reader one: before any page has landed, the view already claims the
+  // caller's coverage rather than zero.
+  expect(h.view.current?.coveredThrough).toBe(40);
+
+  // Reader two: the binding subscribed at that cursor, which is the value a
+  // rejoin reports back as the span to repair.
+  h.reads.settle("readJournal");
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  h.link.drop();
+  await expect.poll(() => h.reads.of("readStatus").length).toBe(2);
+  expect(h.link.forSession(FSID)).toHaveLength(2);
+});
+
+test("changing the session in place starts the new one on its own cursor", async () => {
+  // The bug the missing test hid: reading `coveredThrough` from a ref taken on
+  // the FIRST render, while the machine's memo is keyed on `sessionId`, builds
+  // cold session B's machine and binding on session A's cursor — and subscribes
+  // B at a sequence measured on another journal. `sessionId` is a memo
+  // dependency, so an in-place change is supported and this is reachable.
+  const OTHER = "session-2";
+  const h = await mountFactoryView({ props: { coveredThrough: 40 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  expect(h.view.current?.coveredThrough).toBe(40);
+
+  await h.rerender({ sessionId: OTHER, coveredThrough: 0 });
+
+  await expect.poll(() => h.link.forSession(OTHER).length).toBe(1);
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(0);
+  // The old session's binding is gone, and the new one is a JOIN, not a repair
+  // of a span it never covered.
+  expect(h.link.open.map((subscription) => subscription.sessionId)).toStrictEqual([OTHER]);
+  expect(h.reads.of("readStatus").map((call) => call.sessionId)).toStrictEqual([FSID, OTHER]);
+});
+
+test("the gate projection page is bounded by the same limit as the tail", async () => {
+  // M5(a). The bound the Factory reads to size its gate page. Losing it turned
+  // a bounded projection into an unbounded one with nothing failing.
+  const h = await mountFactoryView({ props: { tailLimit: 8 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  expect(h.reads.of("listGates")[0]?.options).toMatchObject({ limit: 8 });
+});
+
+test("a repair never flashes failed between the abort and the replacement read", async () => {
+  // M5(b). The catch path's generation guard has a live reader: `join()` aborts
+  // the read it supersedes, and the fake and the real client both REJECT an
+  // aborted read. Without the guard that rejection publishes
+  // `{state:"failed"}` — a "The live connection failed" banner on every single
+  // reconnect, cleared a moment later by the replacement read.
+  const h = await mountFactoryView({
+    setup: (_link, reads) => {
+      reads.hold("readJournal");
+    },
+  });
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(1);
+  const states: (string | undefined)[] = [];
+  const watch = setInterval(() => states.push(h.view.current?.state), 1);
+
+  h.link.drop();
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
+  h.reads.settle("readJournal");
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  clearInterval(watch);
+
+  expect(states).not.toContain("failed");
+  expect(h.view.current?.error).toBeNull();
 });

@@ -75,21 +75,21 @@ export class FakeFactoryReads {
   }
 
   /**
-   * Releases every read of `method` held so far, NEWEST FIRST, and stops
+   * Releases every read of `method` held so far, in call order, and stops
    * holding new ones.
    *
-   * The order is chosen, not incidental. Releasing oldest-first would let a
-   * superseded read commit before the current one and be overwritten by it, so
-   * a store with no generation guard would end in the right state anyway and
-   * the guard would be unkillable. Newest-first puts the stale commit LAST,
-   * which is the only order in which "a superseded read commits nothing" is a
-   * statement about the store.
+   * The order is NOT load-bearing, and an earlier version of this file claimed
+   * it was — that releasing newest-first was what made a superseded commit
+   * observable. It is not: every generation change in `FactoryColdJoin` also
+   * aborts the read it supersedes, and this double rejects an aborted read, so
+   * a stale read never lands in any order. What the ordering-sensitive test
+   * actually measures is the abort.
    */
   settle(method: ColdReadMethod): void {
     this.#holding.delete(method);
     const waiting = this.#held.get(method) ?? [];
     this.#held.set(method, []);
-    for (const release of [...waiting].reverse()) release();
+    for (const release of waiting) release();
   }
 
   /**

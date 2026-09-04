@@ -715,10 +715,10 @@ test("a loser is re-driven by the winner's unmount alone, with no reconnect", as
 
 // The bound the re-drive must not widen, isolated so that `joined` is the ONLY
 // reason the scan skips this record: it shares the released record's channel,
-// and that channel is free. A binding whose subscription was AUTHORIZED and
-// then failed has joined, and re-driving it here would reopen a subscription
-// this Factory has stopped authorizing, on the same socket — the loop
-// `#onBindingError` refuses. It waits for a new connection instead.
+// and that channel really is free. A binding whose subscription was AUTHORIZED
+// and then failed has joined, and re-driving it here would reopen a
+// subscription this Factory has stopped authorizing, on the same socket — the
+// loop `#onBindingError` refuses. It waits for a new connection instead.
 test("a peer's release does not re-drive a binding that has already subscribed", async () => {
   const link = new FakeClientLink();
   const store = new FactoryLinkStore(link);
@@ -731,14 +731,18 @@ test("a peer's release does not re-drive a binding that has already subscribed",
   expect(winner.joins).toEqual([0]);
   expect(loser.errors).toHaveLength(1);
 
-  // The winner's subscription dies and hands its channel back, so the channel
-  // is free when the loser's record is released below.
+  // The winner's subscription dies and hands the channel back, which re-drives
+  // the loser. Both records have now subscribed at least once.
   link.forSession("session-a")[0]!.fail(new Error("no longer authorized"));
-  await expect.poll(() => winner.errors).toHaveLength(1);
+  await expect.poll(() => loser.joins).toEqual([0]);
+  expect(link.forSession("session-a")).toHaveLength(2);
+
+  // The loser now frees the channel itself. Nothing may take it on this
+  // connection: the only peer is one that has already subscribed.
   second.cancel();
   await new Promise((resolve) => setTimeout(resolve, 20));
 
-  expect(link.forSession("session-a")).toHaveLength(1);
+  expect(link.forSession("session-a")).toHaveLength(2);
   expect(link.connectCalls).toBe(1);
   expect(winner.rejoins).toEqual([]);
   store.close();
@@ -767,5 +771,107 @@ test("onJoin reports the first authorization and onRejoin every later one", asyn
   await expect.poll(() => view.rejoins).toEqual([4, 4]);
   // Still exactly one join, however many times the connection came back.
   expect(view.joins).toEqual([4]);
+  store.close();
+});
+
+// M1. `close()` cancels every binding, and the cancel path re-drives a channel
+// peer. With `#bindings` still populated at that moment, the first cancel
+// re-enters `#join` -> `#ensureConnected`, which finds `#connecting` already
+// cleared and the link not yet disconnected, and starts a SECOND connect on a
+// fresh epoch. `close()` then disconnects, that connect rejects, and the
+// rejection is current — so the store publishes "failed" after it published
+// "idle". `#epoch`'s own doc says it exists to stop exactly this.
+test("closing with two bindings on one session leaves the store idle, not failed", async () => {
+  const link = new FakeClientLink();
+  link.holdConnect = true;
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const winner = recorder("session-a");
+  const loser = recorder("session-a");
+  store.bind(winner.options);
+  store.bind(loser.options);
+
+  store.close();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  expect(store.snapshot().state).toBe("idle");
+  expect(store.snapshot().failure).toBeNull();
+  expect(store.snapshot().bindingCount).toBe(0);
+  // One connect, because the close never started a second one.
+  expect(link.connectCalls).toBe(1);
+});
+
+test("closing after a failed connect leaves the store idle, not failed again", async () => {
+  const link = new FakeClientLink();
+  link.holdConnect = true;
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const winner = recorder("session-a");
+  const loser = recorder("session-a");
+  store.bind(winner.options);
+  store.bind(loser.options);
+  link.settleConnect(new Error("refused"));
+  await expect.poll(() => store.snapshot().state).toBe("failed");
+
+  store.close();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  expect(store.snapshot().state).toBe("idle");
+  expect(store.snapshot().failure).toBeNull();
+  expect(link.connectCalls).toBe(1);
+});
+
+// M4(a). `#onBindingError` is the OTHER path that hands a channel back, and it
+// did not re-drive: when the winner's subscription failed, the loser was left
+// silent, uncancelled and still counted in `bindingCount` — the same shape the
+// cancel path was fixed for, reached through a different release.
+test("a subscription failure re-drives the peer that lost that channel", async () => {
+  const link = new FakeClientLink();
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const winner = recorder("session-a");
+  const loser = recorder("session-a");
+  store.bind(winner.options);
+  store.bind(loser.options);
+  await expect.poll(() => link.open.length).toBe(1);
+  expect(loser.errors).toHaveLength(1);
+
+  link.forSession("session-a")[0]!.fail(new Error("no longer authorized"));
+
+  await expect.poll(() => loser.joins).toEqual([0]);
+  expect(link.open).toHaveLength(1);
+  expect(link.forSession("session-a")).toHaveLength(2);
+  // On the SAME connection: the release is what made the channel reachable.
+  expect(link.connectCalls).toBe(1);
+  expect(store.snapshot().bindingCount).toBe(2);
+  for (const subscription of link.open) subscription.deliver(enduring("session-a", 4));
+  expect(loser.publications.map((p) => p.journal_seq)).toEqual([4]);
+  store.close();
+});
+
+// A record that never held the channel has nothing to hand back, so its
+// cancellation frees nothing and must drive nobody. Without that bound a
+// cancelling loser sends its fellow loser at a channel the winner still holds,
+// which throws and reports a SECOND error for one subscription that never
+// changed hands.
+test("a loser's own cancellation does not re-drive its fellow loser", async () => {
+  const link = new FakeClientLink();
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const winner = recorder("session-a");
+  const first = recorder("session-a");
+  const second = recorder("session-a");
+  store.bind(winner.options);
+  const firstBinding = store.bind(first.options);
+  store.bind(second.options);
+  await expect.poll(() => link.open.length).toBe(1);
+  expect(second.errors).toHaveLength(1);
+
+  firstBinding.cancel();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  expect(second.errors).toHaveLength(1);
+  expect(second.joins).toEqual([]);
+  expect(link.forSession("session-a")).toHaveLength(1);
   store.close();
 });
