@@ -372,15 +372,28 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
    * a moment later, which also bumped the generation and aborted the fresh read
    * it had just superseded.
    *
-   * A fresh authorization also clears `#gaveUp`. Giving up is a statement about
-   * one subscription's stream of triggers, not about the session; the next
-   * connection gets its chance, exactly as a binding does.
+   * A fresh authorization also resets the whole repair budget — the counter and
+   * `#gaveUp` together. Giving up is a statement about ONE subscription's stream
+   * of triggers, not about the session; the next connection gets its chance,
+   * exactly as a binding does, and gets it with its own budget rather than one
+   * already spent. Clearing only the flag left a view that read once on
+   * reconnect and then refused every later signal that it was out of date.
+   *
+   * This is why the repair timer calls `#beginRead` and not this: `join()` is
+   * the AUTHORIZATION path. A timer that came through here would reset the
+   * counter on every cycle, and the give-up bound would never fire — the
+   * unbounded loop, reintroduced by the recovery that is supposed to be safe.
    */
   join(): void {
     if (!this.#running) return;
     if (this.#repairTimer !== undefined) clearTimeout(this.#repairTimer);
     this.#repairTimer = undefined;
     this.#gaveUp = false;
+    this.#consecutiveRepairs = 0;
+    this.#beginRead();
+  }
+
+  #beginRead(): void {
     // The previous read is abandoned rather than awaited: it was taken against
     // a subscription that is no longer the one delivering.
     this.#controller?.abort();
@@ -417,7 +430,9 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
     const delay = repairBackoffMs(this.#consecutiveRepairs, this.#repairDelayMs);
     this.#repairTimer = setTimeout(() => {
       this.#repairTimer = undefined;
-      this.join();
+      // Not `join()`: see there. A repair spends the budget, it does not
+      // replenish it.
+      this.#beginRead();
     }, delay);
   }
 
