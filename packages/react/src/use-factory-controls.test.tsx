@@ -506,3 +506,77 @@ test("a reply to a cancelled action never lands on the action that replaced it",
   await expect(replacement).resolves.toMatchObject({ outcome: "accepted", commandId: "cmd-2" });
   h.unmount();
 });
+
+test("a gate awaiting a retry is retained but NOT responding", async () => {
+  const h = await mount();
+  h.link.holdRpc = true;
+  const answering = controls(h.sink).gate.respond(
+    controls(h.sink).gate.gates[0]!,
+    GATE_APPROVAL_ACTIONS.approve,
+  );
+  await expect.poll(() => controls(h.sink).gate.gates[0]!.responding).toBe(true);
+
+  h.link.drop();
+  await expect(answering).resolves.toMatchObject({ outcome: "unknown", commandId: "cmd-1" });
+
+  // The one state in which `responding` and `pending !== null` disagree, and
+  // the state this whole feature exists to render: the answer is still the
+  // user's, and the card must show a Retry button rather than a spinner.
+  await expect.poll(() => controls(h.sink).gate.gates[0]!.pending).toMatchObject({
+    commandId: "cmd-1",
+    sending: false,
+  });
+  expect(controls(h.sink).gate.gates[0]!.responding).toBe(false);
+  expect(controls(h.sink).gate.gates[0]!.error).toBeInstanceOf(Error);
+
+  h.link.holdRpc = false;
+  await expect(controls(h.sink).gate.retry(GATE)).resolves.toMatchObject({
+    outcome: "accepted",
+    commandId: "cmd-1",
+  });
+  await expect.poll(() => controls(h.sink).gate.gates[0]!.pending).toBeNull();
+  expect(controls(h.sink).gate.gates[0]!.responding).toBe(false);
+  h.unmount();
+});
+
+test("a control whose envelope cannot be built reports it instead of rejecting", async () => {
+  const h = await mount();
+  const unhandled: unknown[] = [];
+  const capture = (event: PromiseRejectionEvent): void => {
+    unhandled.push(event.reason);
+  };
+  window.addEventListener("unhandledrejection", capture);
+  try {
+    // A gate whose id the board served empty. `respondResidentGate` validates
+    // it while BUILDING the envelope, so the throw happens on the caller's
+    // stack inside an `onClick`.
+    const malformed = { ...controls(h.sink).gate.gates[0]!, gateId: "" };
+
+    await expect(controls(h.sink).gate.respond(malformed, GATE_APPROVAL_ACTIONS.deny)).resolves
+      .toStrictEqual({ outcome: "none" });
+
+    expect(h.link.rpcCalls).toStrictEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(unhandled).toStrictEqual([]);
+  } finally {
+    window.removeEventListener("unhandledrejection", capture);
+    h.unmount();
+  }
+});
+
+test.each(CONTROLS)("$name: a retry is refused while its own attempt is in flight", async (control) => {
+  const h = await mount();
+  h.link.holdRpc = true;
+  const lost = control.fire(controls(h.sink));
+  h.link.drop();
+  await expect(lost).resolves.toMatchObject({ outcome: "unknown", commandId: "cmd-1" });
+
+  const retrying = control.retry(controls(h.sink));
+  const repeat = control.retry(controls(h.sink));
+  expect(h.link.rpcCalls).toHaveLength(2);
+  await expect(repeat).resolves.toStrictEqual({ outcome: "refused", commandId: "cmd-1" });
+
+  h.link.rpcCalls[1]!.settle();
+  await expect(retrying).resolves.toMatchObject({ outcome: "accepted", commandId: "cmd-1" });
+  h.unmount();
+});

@@ -1,4 +1,5 @@
 import {
+  CommandIdentityError,
   CoreCommandRejectedError,
   CoreInvalidRequestError,
   CoreSessionNotFoundError,
@@ -421,4 +422,113 @@ test("one transition publishes once, attached or not", async () => {
   // transition and notify every subscriber twice.
   expect(notifies).toBe(2);
   detach();
+});
+
+test("an envelope Core's identity rules refuse is reported, never thrown", async () => {
+  const { link, commands } = plane();
+  // The session id is a caller-supplied prop, and `createFactoryCommands`
+  // validates it while BUILDING the envelope — before any transport is touched.
+  const store = new FactoryComposerStore(commands, "");
+
+  // `submit` promises it never rejects. From an `onClick` a rejected promise is
+  // an unhandled rejection, not an error state a card can render.
+  await expect(store.submit("hi")).resolves.toStrictEqual({ outcome: "none" });
+
+  expect(store.snapshot().errors.get(COMPOSER_COMMAND_KEY)).toBeInstanceOf(CommandIdentityError);
+  expect(link.rpcCalls).toStrictEqual([]);
+  // Nothing was retained, so the control is not wedged: a later action on a
+  // usable session mints normally.
+  expect(store.snapshot().pending.size).toBe(0);
+});
+
+test("a retry is refused while its own attempt is still in flight", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const lost = store.submit("one");
+  link.drop();
+  await expect(lost).resolves.toMatchObject({ outcome: "unknown", commandId: "cmd-1" });
+
+  // Retry is a BUTTON. The rapid-double-click class this task closes applies to
+  // it exactly as it applies to send, and it is the more dangerous of the two:
+  // two attempts on one slot mean the first to land releases it and the second
+  // resolves the user's own retry as "cancelled".
+  const first = store.retry();
+  const second = store.retry();
+  expect(link.rpcCalls).toHaveLength(2);
+  await expect(second).resolves.toStrictEqual({ outcome: "refused", commandId: "cmd-1" });
+
+  link.rpcCalls[1]!.settle();
+  await expect(first).resolves.toMatchObject({ outcome: "accepted", commandId: "cmd-1" });
+});
+
+test("a retry clears the stale failure it is retrying, and success leaves none", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const lost = store.submit("one");
+  link.drop();
+  await lost;
+  expect(store.snapshot().errors.get(COMPOSER_COMMAND_KEY)).toBeInstanceOf(Error);
+
+  const retrying = store.retry();
+
+  // Cleared as the attempt STARTS, not when it ends: nothing clears an error on
+  // a success path, so a stale one left here would survive an accepted retry
+  // forever, beside a control with nothing pending.
+  expect(store.snapshot().errors.get(COMPOSER_COMMAND_KEY)).toBeUndefined();
+  link.rpcCalls[1]!.settle();
+  await expect(retrying).resolves.toMatchObject({ outcome: "accepted" });
+  expect(store.snapshot().errors.size).toBe(0);
+});
+
+test("a new submit clears the previous submit's rejection", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const rejected = store.submit("one");
+  await expect.poll(() => link.outstanding).toHaveLength(1);
+  link.rpcCalls[0]!.settle({ status: "rejected" });
+  await rejected;
+  expect(store.snapshot().errors.get(COMPOSER_COMMAND_KEY)).toBeInstanceOf(CoreCommandRejectedError);
+
+  const next = store.submit("two");
+
+  // Otherwise the failed command's notice renders beside the one now in flight.
+  expect(store.snapshot().errors.get(COMPOSER_COMMAND_KEY)).toBeUndefined();
+  link.rpcCalls[1]!.settle();
+  await expect(next).resolves.toMatchObject({ outcome: "accepted", commandId: "cmd-2" });
+});
+
+test("a published snapshot never changes underneath the caller holding it", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const lost = store.submit("one");
+  link.drop();
+  await lost;
+  const held = store.snapshot();
+  expect(held.errors.size).toBe(1);
+
+  store.clearError();
+
+  // `Publisher`'s contract is that a snapshot is stable between publishes. The
+  // scope's own error map is mutated in place by every later transition, so the
+  // snapshot must hold a copy of it and not an alias.
+  expect(held.errors.size).toBe(1);
+  expect(store.snapshot().errors.size).toBe(0);
+});
+
+test("each view of a retained envelope gets its own request, not a shared one", async () => {
+  const { link, commands } = plane();
+  link.holdRpc = true;
+  const one = new FactoryComposerStore(commands, SID);
+  const sending = one.submit("one");
+  const two = new FactoryComposerStore(commands, SID);
+
+  const view = retained(one)!;
+  (view.request as unknown as { blocks: Record<string, unknown>[] }).blocks[0]!["Text"] = "tampered";
+
+  // Nothing freezes the parsed request, so a shared parse would let one card's
+  // careless write reach every other view of the same slot — and the retained
+  // draft is exactly what a Retry button renders.
+  expect(retainedComposerText(retained(two)!.request)).toBe("one");
+  link.rpcCalls[0]!.settle();
+  await sending;
 });

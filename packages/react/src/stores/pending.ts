@@ -58,9 +58,14 @@ import { Publisher, asError } from "./publisher.js";
  * What a renderer needs about one retained envelope: which command it is,
  * whether an attempt is in flight, and the request it will replay.
  *
- * `request` is the parsed snapshot `PendingCommand.request` produced once, not
- * a live reference into the store — the envelope is immutable, so a consumer
- * reading it can neither disturb the retry nor observe a torn value.
+ * `request` is a FRESH parse per view, which is `PendingCommand.request`'s own
+ * contract and is kept rather than cached deliberately. Caching one parse and
+ * handing it to every view would be cheaper and would quietly remove the
+ * property that makes it safe: the object is not frozen, so one consumer
+ * writing to `request.blocks[0]` would be seen by every other view of the same
+ * slot. The retry itself is unaffected either way — `PendingCommand.submit`
+ * re-reads its own snapshot — so this is about what a renderer may believe
+ * about the value it was handed.
  */
 export interface PendingCommandView {
   readonly commandId: string;
@@ -102,8 +107,6 @@ const EMPTY: SessionCommandSnapshot = { pending: new Map(), errors: new Map() };
 
 interface Slot {
   readonly command: PendingCommand;
-  /** Parsed once. `PendingCommand.request` re-parses on every read; a view is rebuilt on every notify. */
-  readonly request: FactoryCommandRequest;
   sending: boolean;
 }
 
@@ -154,6 +157,11 @@ function scopeOf(commands: FactoryCommands, sessionId: string): CommandScope {
  * resolves its scope on every operation rather than holding one: a discarded
  * empty scope and a freshly created one are indistinguishable.
  */
+/** Reads a scope without creating one. See `SessionCommandStore`'s constructor. */
+function peekScope(commands: FactoryCommands, sessionId: string): CommandScope | undefined {
+  return SCOPES.get(commands)?.get(sessionId);
+}
+
 function disposeScope(commands: FactoryCommands, sessionId: string): void {
   const bySession = SCOPES.get(commands);
   const scope = bySession?.get(sessionId);
@@ -247,8 +255,24 @@ export abstract class SessionCommandStore extends Publisher<SessionCommandSnapsh
     const retained = scope.slots.get(key);
     if (retained !== undefined) return { outcome: "refused", commandId: retained.command.commandId };
 
-    const command = mint();
-    const slot: Slot = { command, request: command.request, sending: true };
+    let command: PendingCommand;
+    try {
+      command = mint();
+    } catch (cause) {
+      // Envelope construction enforces Core's identity rules, and every input it
+      // reads comes from outside this module: a session id passed as a prop, a
+      // gate id and an opened event id read off a board page Factory served.
+      // A throw here must not escape as a rejected promise — these are `onClick`
+      // handlers, so what the user would get is an unhandled rejection rather
+      // than an error state, and the three hooks all promise "never rejects".
+      // Nothing was sent and nothing is retained, so the outcome is `"none"`;
+      // the reason is in `errors`, which is what tells it apart from an empty
+      // draft.
+      scope.errors.set(key, asError(cause));
+      this.#emit(scope);
+      return { outcome: "none" };
+    }
+    const slot: Slot = { command, sending: true };
     scope.slots.set(key, slot);
     scope.errors.delete(key);
     this.#emit(scope);
@@ -345,12 +369,35 @@ export abstract class SessionCommandStore extends Publisher<SessionCommandSnapsh
     if (changed) this.#emit(scope);
   }
 
+  /**
+   * Rebuilds this store's snapshot from the shared scope.
+   *
+   * Reads the scope WITHOUT creating one, because the constructor calls this:
+   * a store built during a render that is then abandoned — a suspended or
+   * aborted concurrent render, a sibling that threw — never attaches and never
+   * runs the cleanup that disposes a scope, so creating one here would leak an
+   * empty entry per abandoned render for the life of the client. That is the
+   * exact growth `disposeScope` exists to prevent.
+   *
+   * `errors` is COPIED rather than aliased. `Publisher`'s snapshot must not
+   * change between publishes, and the scope's map is mutated in place by every
+   * later transition, so a consumer holding a snapshot would watch its own
+   * `errors` change underneath it.
+   */
   #sync(): void {
-    const scope = scopeOf(this.#commands, this.#sessionId);
+    const scope = peekScope(this.#commands, this.#sessionId);
     const pending = new Map<string, PendingCommandView>();
-    for (const [key, slot] of scope.slots) {
-      pending.set(key, { commandId: slot.command.commandId, sending: slot.sending, request: slot.request });
+    const errors = new Map<string, Error>();
+    if (scope !== undefined) {
+      for (const [key, slot] of scope.slots) {
+        pending.set(key, {
+          commandId: slot.command.commandId,
+          sending: slot.sending,
+          request: slot.command.request,
+        });
+      }
+      for (const [key, error] of scope.errors) errors.set(key, error);
     }
-    this.publish({ pending, errors: new Map(scope.errors) });
+    this.publish({ pending, errors });
   }
 }

@@ -208,15 +208,20 @@ export class FactoryGateStore extends SessionCommandStore {
    * Answers one gate. `action` is submitted VERBATIM — harness's
    * `gate.ParseApprovalAction` matches the three `GATE_APPROVAL_ACTIONS`
    * strings exactly and rejects anything else.
+   *
+   * `values` is always the empty object, and is deliberately not a parameter.
+   * Core requires the field; wui implements permission gates only (see
+   * `isAnswerableGate`), and for those the whole answer IS the action. A
+   * parameter no caller can reach — `UseFactoryGateResult.respond` has none —
+   * would be untested by construction, and the task that renders
+   * `prompt.controls` for a form gate is the one that should add it, together
+   * with the reader for it.
    */
-  respond(
-    gate: PublicGateEntry,
-    action: GateApprovalAction,
-    values: Readonly<Record<string, unknown>> = {},
-  ): Promise<CommandResult> {
+  respond(gate: PublicGateEntry, action: GateApprovalAction): Promise<CommandResult> {
     if (!acceptsResidentResponse(gate)) return Promise.resolve({ outcome: "none" });
     const expected = openIdentity(gate);
     if (expected === null) return Promise.resolve({ outcome: "none" });
+    const values: Readonly<Record<string, unknown>> = {};
     const input: ResidentGateResponseInput =
       "expectedOpenEventId" in expected
         ? { gateId: gate.gateId, action, values, expectedOpenEventId: expected.expectedOpenEventId }

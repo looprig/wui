@@ -1,4 +1,5 @@
 import {
+  CommandIdentityError,
   CoreGateResolvedError,
   createFactoryCommands,
   decodeGate,
@@ -287,4 +288,36 @@ test("prune never forgets another control's failure in the same session", async 
 
   expect(composer.snapshot().errors.get(COMPOSER_COMMAND_KEY)).toBeInstanceOf(Error);
   detach();
+});
+
+test("prune keeps the failure of a gate that is still listed", async () => {
+  const { link, store } = gatePlane();
+  link.holdRpc = true;
+  const first = store.respond(entry(GATE_A), "Approve");
+  const second = store.respond(entry(GATE_B), "Deny");
+  link.drop();
+  await first;
+  await second;
+  expect([...store.snapshot().errors.keys()].sort()).toStrictEqual(
+    [gateCommandKey(GATE_A), gateCommandKey(GATE_B)].sort(),
+  );
+
+  // The other half of the guard. A board that still lists GATE_A must not lose
+  // its "another client answered" notice just because a later gate event
+  // rebuilt the board — the card is still on screen and still open.
+  store.prune([GATE_A]);
+
+  expect([...store.snapshot().errors.keys()]).toStrictEqual([gateCommandKey(GATE_A)]);
+});
+
+test("an envelope Core's identity rules refuse is reported, never thrown", async () => {
+  const { link, store } = gatePlane();
+  // The gate id and the opened event id come off a board page Factory served,
+  // and `respondResidentGate` validates both while building the envelope.
+  const malformed = entry(GATE_A, { gateId: "" });
+
+  await expect(store.respond(malformed, "Approve")).resolves.toStrictEqual({ outcome: "none" });
+
+  expect(store.snapshot().errors.get(gateCommandKey(""))).toBeInstanceOf(CommandIdentityError);
+  expect(link.rpcCalls).toStrictEqual([]);
 });
