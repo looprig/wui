@@ -713,28 +713,34 @@ test("a loser is re-driven by the winner's unmount alone, with no reconnect", as
   store.close();
 });
 
-// The bound the re-drive must not widen. A binding whose subscription was
-// AUTHORIZED and then failed has joined; re-driving it on a peer's release
-// would reopen a subscription this Factory has stopped authorizing, on the same
-// socket, which is the loop `#onBindingError` refuses.
+// The bound the re-drive must not widen, isolated so that `joined` is the ONLY
+// reason the scan skips this record: it shares the released record's channel,
+// and that channel is free. A binding whose subscription was AUTHORIZED and
+// then failed has joined, and re-driving it here would reopen a subscription
+// this Factory has stopped authorizing, on the same socket — the loop
+// `#onBindingError` refuses. It waits for a new connection instead.
 test("a peer's release does not re-drive a binding that has already subscribed", async () => {
   const link = new FakeClientLink();
   const store = new FactoryLinkStore(link);
   store.open();
-  const other = recorder("session-b");
-  const failing = recorder("session-a");
-  const peer = store.bind(other.options);
-  store.bind(failing.options);
-  await expect.poll(() => link.open.length).toBe(2);
-  expect(failing.joins).toEqual([0]);
+  const winner = recorder("session-a");
+  const loser = recorder("session-a");
+  store.bind(winner.options);
+  const second = store.bind(loser.options);
+  await expect.poll(() => link.open.length).toBe(1);
+  expect(winner.joins).toEqual([0]);
+  expect(loser.errors).toHaveLength(1);
 
+  // The winner's subscription dies and hands its channel back, so the channel
+  // is free when the loser's record is released below.
   link.forSession("session-a")[0]!.fail(new Error("no longer authorized"));
-  await expect.poll(() => failing.errors).toHaveLength(1);
-  peer.cancel();
+  await expect.poll(() => winner.errors).toHaveLength(1);
+  second.cancel();
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   expect(link.forSession("session-a")).toHaveLength(1);
   expect(link.connectCalls).toBe(1);
+  expect(winner.rejoins).toEqual([]);
   store.close();
 });
 

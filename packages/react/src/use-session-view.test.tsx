@@ -459,6 +459,12 @@ test("a superseded read commits nothing, even when it lands last", async () => {
 
   h.link.drop();
   await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
+  // The read taken on the subscription that just died is CANCELLED, not merely
+  // ignored on arrival: its signal is the one a real `FactoryRestReads` hands
+  // to `fetch`, so a repair loop does not leave a request per lost connection
+  // running to completion.
+  expect(h.reads.of("readJournal")[0]?.options.signal?.aborted).toBe(true);
+  expect(h.reads.of("readJournal")[1]?.options.signal?.aborted).toBe(false);
   h.reads.settle("readJournal");
   h.reads.settle("readStatus");
 
