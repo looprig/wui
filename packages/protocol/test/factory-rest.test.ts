@@ -321,15 +321,25 @@ describe("FactoryRestReads bounded object ranges", () => {
   // The response bound is DERIVED from the inclusive range, so the only way to
   // ask for an illegal number of bytes is to describe an illegal range. Every
   // row below is rejected before any request is issued, and the set is chosen
-  // so that no single guard can be deleted and leave them all still rejected:
-  // `{ start: 1e-17, end: 5 }` is rejected ONLY by the start guard, because
-  // 1e-17 rounds away in `end - start + 1` and the derived length is a safe
-  // integer — `{ start: 1.5, end: 3 }` cannot isolate it, since 2.5 is not a
-  // safe integer either and the length guard rejects it too. `{ start: 3, end:
-  // 2 }` is rejected only by the ordering guard, and
-  // `{ start: Number.MAX_SAFE_INTEGER, end: Number.MAX_SAFE_INTEGER + 1 }` only
-  // by the length guard: both endpoints are inside the safe domain and only the
-  // LENGTH, MAX_SAFE_INTEGER + 1 bytes, leaves it.
+  // so that no single guard can be deleted and leave them all still rejected.
+  // `readObjectRange` has five conjuncts and each one has a row below that is
+  // the SOLE reason that row is rejected:
+  //
+  //  - the START safe-integer guard: `{ start: 1e-17, end: 5 }`. 1e-17 rounds
+  //    away in `end - start + 1`, so the derived length is 6 and safe.
+  //    `{ start: 1.5, end: 3 }` cannot isolate it, since its length is 2.5 and
+  //    the length guard rejects it too; it is kept as the ordinary fractional
+  //    case, not as an isolator.
+  //  - the END safe-integer guard: `{ start: MAX_SAFE_INTEGER, end:
+  //    MAX_SAFE_INTEGER + 1 }`. `MAX_SAFE_INTEGER + 1` is 2**53 and is NOT a
+  //    safe integer. Its derived length is 2, so this row says nothing at all
+  //    about the length guard.
+  //  - `start < 0`: `{ start: -1, end: 3 }`. -1 is a safe integer, the range is
+  //    in order, and the derived length, 5, is safe.
+  //  - the ordering guard: `{ start: 3, end: 2 }`, whose derived length is 0.
+  //  - the LENGTH guard: `{ start: 0, end: MAX_SAFE_INTEGER }`. Both endpoints
+  //    are safe integers, non-negative and in order, and only `end - start + 1`
+  //    — 2**53 bytes — leaves the safe domain.
   it.each([
     { start: 1e-17, end: 5 },
     { start: 1.5, end: 3 },

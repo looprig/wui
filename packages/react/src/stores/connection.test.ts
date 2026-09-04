@@ -576,7 +576,7 @@ test("a rejoin on a new connection releases the subscription it is retaking", as
   // A second view mounts. Its join finds the link down, reconnects, and the
   // success loop rejoins every binding.
   store.bind(recorder("session-b").options);
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  await expect.poll(() => link.forSession("session-a").length).toBe(2);
 
   // The rejoin happened at all — this is what a discarded `subscribe` throw
   // costs, and the only signal of it: the view is never told to repair its gap.
@@ -614,5 +614,73 @@ test("a session rebound after its view unmounted takes the channel again", async
   for (const subscription of link.open) subscription.deliver(enduring("session-a", 11));
   expect(again.publications.map((p) => p.journal_seq)).toEqual([11]);
   expect(gone.publications).toHaveLength(0);
+  store.close();
+});
+
+// `bind()` is not keyed by session, and `useSessionBinding` is exported, so two
+// mounted views of one session is a supported call pattern: two records, one
+// channel. The link permits one subscription per channel and `subscribe` THROWS
+// on the second (`protocol/test/clientlink.test.ts` reads that throw off real
+// Centrifuge), inside an `async` method reached only as `void this.#join(...)`.
+// Unhandled, the loser was silently dead — no `onError`, and `bindingCount`
+// still counting it as healthy.
+test("a binding whose channel another binding already holds is told so", async () => {
+  const link = new FakeClientLink();
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const held = recorder("session-a");
+  const loser = recorder("session-a");
+  store.bind(held.options);
+  store.bind(loser.options);
+
+  // Both joins await the same in-flight connect, so they resume in bind order:
+  // by the time the winner's subscription is live the loser's attempt is done.
+  await expect.poll(() => link.open.length).toBe(1);
+  expect(loser.errors.map((error) => error.message)).toEqual([
+    "Subscription to the channel session:tenant-1:session-a already exists",
+  ]);
+  // The winner is untouched: one channel, one live subscription, no error.
+  expect(held.errors).toHaveLength(0);
+  expect(link.forSession("session-a")).toHaveLength(1);
+  expect(link.open).toHaveLength(1);
+  expect(store.snapshot().bindingCount).toBe(2);
+
+  // The live subscription is wired to the winner alone.
+  for (const subscription of link.open) subscription.deliver(enduring("session-a", 3));
+  expect(held.publications.map((p) => p.journal_seq)).toEqual([3]);
+  expect(loser.publications).toHaveLength(0);
+  store.close();
+});
+
+// The other half of the same fix, and what keeps `onRejoin` honest for U4.2: a
+// binding that lost the channel has never subscribed, so when it finally does,
+// that is its FIRST join. Setting `record.joined` before the subscribe that
+// threw would deliver it through `onRejoin` instead — a repair signal for a gap
+// that does not exist, on a binding that has read nothing yet.
+test("a binding that lost the channel joins, rather than rejoins, when it wins it", async () => {
+  const link = new FakeClientLink();
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const held = recorder("session-a");
+  const loser = recorder("session-a");
+  const first = store.bind(held.options);
+  store.bind(loser.options);
+  await expect.poll(() => link.open.length).toBe(1);
+  expect(loser.errors).toHaveLength(1);
+
+  // The channel is freed and a new connection gives the loser its chance.
+  first.cancel();
+  link.disconnect();
+  store.bind(recorder("session-b").options);
+  await expect.poll(() => link.forSession("session-a").length).toBe(2);
+  await expect.poll(() => link.open.map((s) => s.sessionId).sort()).toEqual([
+    "session-a",
+    "session-b",
+  ]);
+
+  expect(loser.rejoins).toEqual([]);
+  expect(loser.errors).toHaveLength(1);
+  for (const subscription of link.open) subscription.deliver(enduring(subscription.sessionId, 9));
+  expect(loser.publications.map((p) => p.journal_seq)).toEqual([9]);
   store.close();
 });

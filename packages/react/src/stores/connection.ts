@@ -1,5 +1,5 @@
 import { FoldError, type SessionViewStore } from "@looprig/protocol";
-import type { ClientLink, FactoryPublication, SessionReset } from "@looprig/protocol";
+import type { ClientLink, ClientSubscription, FactoryPublication, SessionReset } from "@looprig/protocol";
 import { asError, cancelOnce, Publisher, RefreshGuard } from "./publisher.js";
 
 export type ConnectionState = "idle" | "live" | "closed" | "failed";
@@ -402,7 +402,6 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     // an error path reaches a given subscribe first, the FIRST one is the join
     // and every later one is a rejoin.
     const rejoin = record.joined;
-    record.joined = true;
     // The previous subscription, if any, goes before the next one is opened —
     // not because unsubscribing is tidy, but because the link permits ONE
     // subscription per session at a time and `subscribe` throws on a second.
@@ -412,28 +411,52 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     // binding including the ones still holding a live subscription wired to
     // this same record.
     this.#release(record);
-    const subscription = this.#link.subscribe({
-      tenantId: record.options.tenantId,
-      sessionId: record.options.sessionId,
-      onPublication: (publication) => {
-        if (!record.cancelled) record.options.onPublication(publication);
-      },
-      onReset: (reset) => {
-        if (!record.cancelled) record.options.onReset(reset);
-      },
-      onError: (error) => {
-        this.#onBindingError(record, generation, error);
-      },
-    });
-    // No second CANCELLATION check between `subscribe` and here: `cancel` is
-    // only ever called from outside, and `subscribe` returns without yielding.
-    // The check that matters is the one after the await above. The narrower
-    // claim that nothing at all can run in this window would not hold: the
-    // `onError` above is installed before `subscribe` returns, so a link that
-    // delivered an error synchronously would reach `#onBindingError` and
-    // `#release` while `record.release` is still undefined. Centrifuge never
-    // does — every subscription error arrives from a socket event or a queued
-    // task — and this rests on that, not on the window being empty.
+    let subscription: ClientSubscription;
+    try {
+      subscription = this.#link.subscribe({
+        tenantId: record.options.tenantId,
+        sessionId: record.options.sessionId,
+        onPublication: (publication) => {
+          if (!record.cancelled) record.options.onPublication(publication);
+        },
+        onReset: (reset) => {
+          if (!record.cancelled) record.options.onReset(reset);
+        },
+        onError: (error) => {
+          this.#onBindingError(record, generation, error);
+        },
+      });
+    } catch (reason) {
+      // The link permits one subscription per session and this one is already
+      // held. `bind()` is not keyed by session, so two views of the same
+      // session are two records competing for one channel — a supported call
+      // pattern, since `useSessionBinding` is exported. Without this the throw
+      // escaped an `async` method reached only as `void this.#join(record)`:
+      // the second binding was dead with no `onError` and `bindingCount` still
+      // counting it, which is the "looks healthy, is down" signature.
+      //
+      // `joined` is deliberately NOT set above: this binding has never
+      // subscribed, so its first SUCCESSFUL subscribe must still be reported as
+      // a join and not as a rejoin. `attemptedGeneration` IS left set, because
+      // retrying on this same connection would find the channel still held and
+      // throw again; the next connection is what gives this record its chance.
+      record.options.onError?.(asError(reason));
+      return;
+    }
+    // Set only once a subscription actually exists, so the throw above cannot
+    // make this record's first real join look like a rejoin.
+    record.joined = true;
+    // No second CANCELLATION check between `subscribe` and here: `subscribe`
+    // returns without yielding, so the only thing that could reach `cancel` in
+    // this window is a callback `subscribe` itself invoked. The check that
+    // matters is the one after the await above. The narrower claim that nothing
+    // at all can run in this window would not hold: the `onError` above is
+    // installed before `subscribe` returns, so a link that delivered an error
+    // synchronously would reach `#onBindingError` and `#release` while
+    // `record.release` is still undefined — and a consumer `onError` could
+    // re-enter `cancel` from there. Centrifuge never does — every subscription
+    // error arrives from a socket event or a queued task — and both claims rest
+    // on that, not on the window being empty.
     record.release = () => {
       subscription.unsubscribe();
     };

@@ -224,10 +224,13 @@ test("a credential capability absent at mount is not installed later", async () 
     </FactoryLinkProvider>,
   );
 
-  // Re-reading `h.linkCredentials?.connectionToken` here would assert nothing:
-  // it is the forwarder captured at `create` and nothing mutates a forwarder in
-  // place. The only route a late capability has is a SECOND `create`, built
-  // from the new credentials, so that is what is observed.
+  // Re-reading `h.linkCredentials?.connectionToken` here would be REDUNDANT,
+  // not vacuous: `create` reassigns `h.linkCredentials`, and the rerender's
+  // credentials do carry a `connectionToken`, so a second `create` would make
+  // that re-read fail. It is implied by the assertion above together with the
+  // two below — same credentials object, no second `create` — and the only
+  // route a late capability has is that second `create`, so that is what is
+  // observed directly.
   expect(h.clientCalls).toBe(1);
   expect(h.linkCredentials).toBe(captured);
 });

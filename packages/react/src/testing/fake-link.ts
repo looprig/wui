@@ -21,14 +21,20 @@
  *    property of the caller, never of this fake;
  *  - **one live subscription per session.** Centrifuge keeps a per-channel
  *    registry and `newSubscription` THROWS on a second entry; `unsubscribe()`
- *    on the real link releases it (see `ClientSubscription.unsubscribe` in
- *    `protocol/src/clientlink.ts`, and `ClientLink over real Centrifuge` in
- *    `protocol/test/clientlink.test.ts`, which reads both halves off the
- *    library). A FAILED subscription is NOT released — an errored subscription
- *    stays in Centrifuge's registry — so a rejoin after an error must release
- *    before it subscribes, exactly as it must after a silent transport loss.
- *    A fake that accepted overlapping subscriptions would turn that throw into
- *    a passing test, which is what it did until this was added.
+ *    on the real link releases it. `ClientLink over real Centrifuge` in
+ *    `protocol/test/clientlink.test.ts` reads three things off the library: the
+ *    second-subscribe throw, the guard against a stale handle detaching its
+ *    successor, and the resubscribe-after-unsubscribe the rejoin path needs.
+ *    This fake ALSO declines to release a failed subscription, and that fourth
+ *    property is INFERRED rather than measured — driving a real subscription
+ *    into an errored state takes a server, so no subtest there reaches it. The
+ *    inference: centrifuge 5.7.2 empties `_subs` only through
+ *    `_removeSubscription`, which has exactly one call site, the public
+ *    `removeSubscription` that `CentrifugeSubscriptionAdapter.release` calls.
+ *    No error path can hand a channel back, so a rejoin after an error must
+ *    release before it subscribes, exactly as it must after a silent transport
+ *    loss. A fake that accepted overlapping subscriptions would turn that throw
+ *    into a passing test, which is what it did until this was added.
  *
  * Deliberately NOT mirrored, because nothing here reads them: schema validation
  * of publications (the real link validates and routes `session.reset` by its
