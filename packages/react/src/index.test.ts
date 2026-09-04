@@ -5,15 +5,21 @@ test("exports exactly the documented public surface", () => {
   // Sorted, exhaustive, and asserted as a whole: adding an export without
   // deciding it is public fails here rather than leaking into app/.
   expect(Object.keys(api).sort()).toStrictEqual([
+    "FactoryLinkProvider",
+    "FactoryLinkStore",
     "GATE_APPROVAL_ACTIONS",
     "SessionComposerStore",
     "SessionListStore",
     "useAttachOrRestore",
     "useComposer",
     "useConnection",
+    "useFactoryClient",
+    "useFactoryLink",
+    "useFactoryLinkStatus",
     "useGate",
     "useInterrupt",
     "useRowCount",
+    "useSessionBinding",
     "useSessionList",
     "useSessionView",
     "useSessionViewErrors",

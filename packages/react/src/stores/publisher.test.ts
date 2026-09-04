@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { Publisher, RefreshGuard, asError } from "./publisher.js";
+import { Publisher, RefreshGuard, asError, cancelOnce } from "./publisher.js";
 
 interface Snapshot {
   readonly n: number;
@@ -106,4 +106,28 @@ test("asError passes an Error through and wraps anything else", () => {
   expect(asError("nope")).toBeInstanceOf(Error);
   expect(asError("nope").message).toBe("nope");
   expect(asError("nope").cause).toBe("nope");
+});
+
+// Enumerated rather than a single pair: one repeat cannot tell "at most once"
+// from "at most twice", and the property is about any number of callers.
+for (const calls of [1, 2, 3, 5]) {
+  test(`cancelOnce forwards the first of ${calls} call(s) and no other`, () => {
+    let reached = 0;
+    const cancel = cancelOnce(() => {
+      reached += 1;
+    });
+
+    for (let index = 0; index < calls; index += 1) cancel();
+
+    expect(reached).toBe(1);
+  });
+}
+
+test("cancelOnce that is never called never reaches its subject", () => {
+  let reached = 0;
+  cancelOnce(() => {
+    reached += 1;
+  });
+
+  expect(reached).toBe(0);
 });

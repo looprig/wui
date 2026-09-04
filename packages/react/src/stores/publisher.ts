@@ -63,3 +63,24 @@ export class RefreshGuard {
 export function asError(cause: unknown): Error {
   return cause instanceof Error ? cause : new Error(String(cause), { cause });
 }
+
+/**
+ * Wraps a cancellation so that at most one call reaches `cancel`, however many
+ * callers hold the result and however often each calls it.
+ *
+ * Two owners legitimately hold a session binding's cancellation: the view whose
+ * effect created it, and the application-scoped link that tears every binding
+ * down when it closes. Neither can know whether the other ran first — React
+ * gives no ordering guarantee between a parent's cleanup and a child's — so the
+ * "cancelled exactly once" property has to live in the value they share rather
+ * than in either caller. `stores/connection.test.ts` counts the calls that
+ * reach the subscription for both orders.
+ */
+export function cancelOnce(cancel: () => void): () => void {
+  let cancelled = false;
+  return () => {
+    if (cancelled) return;
+    cancelled = true;
+    cancel();
+  };
+}

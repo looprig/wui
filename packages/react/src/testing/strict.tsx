@@ -75,3 +75,21 @@ export async function renderHookStrict<T>(hook: () => T): Promise<StrictHookResu
     unmount: () => rendered.unmount(),
   };
 }
+
+/**
+ * The same root-level `StrictMode` arrangement for a whole element tree, for a
+ * test whose subject is a PROVIDER with several children rather than one hook.
+ * `renderHookStrict` renders exactly one component, so it cannot express "two
+ * session views under one provider".
+ */
+export async function renderStrict(element: React.ReactElement): Promise<{
+  rerender: (next?: React.ReactElement) => Promise<void>;
+  unmount: () => Promise<void>;
+}> {
+  const wrap = (node: React.ReactElement): React.ReactElement => <StrictMode>{node}</StrictMode>;
+  const rendered = await render(wrap(element));
+  return {
+    rerender: (next?: React.ReactElement) => rendered.rerender(wrap(next ?? element)),
+    unmount: () => rendered.unmount(),
+  };
+}

@@ -41,11 +41,31 @@ export {
   type ConnectionStatus,
 } from "./use-connection.js";
 
+// The Factory plane. One client and one ClientLink for the whole application,
+// constructed above the route by FactoryLinkProvider; a session view takes a
+// binding and a cursor from useSessionBinding and owns nothing else. See
+// use-connection.ts for why the link cannot belong to a route.
+export {
+  FactoryLinkProvider,
+  useFactoryClient,
+  useFactoryLink,
+  useFactoryLinkStatus,
+  useSessionBinding,
+  type FactoryLinkProviderProps,
+  type FactoryLinkState,
+  type FactoryLinkStatus,
+  type FactoryScope,
+  type SessionBinding,
+  type SessionBindingHandle,
+  type SessionBindingOptions,
+} from "./use-connection.js";
+
 // Exported because app/ constructs these directly in a couple of places (a list
 // that outlives a route, a composer under test). Both are framework-neutral —
 // nothing in `src/stores/` imports React — and both move to @looprig/protocol
 // when a second framework adapter appears.
 export { SessionListStore, type SessionListSnapshot } from "./stores/session-list.js";
+export { FactoryLinkStore } from "./stores/connection.js";
 export {
   SessionComposerStore,
   type ComposerSnapshot,
