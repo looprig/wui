@@ -927,7 +927,10 @@ test("a rejoin after a give-up reads again", async () => {
   // view that reads once on reconnect and then ignores every signal that it is
   // out of date, for the rest of the connection.
   h.link.open[0]?.deliver({ ...enduringFor(9), session_id: "some-other-session" });
-  await expect.poll(() => h.reads.of("readStatus").length).toBe(reads + 2);
+  // A fixed wait and a plain assertion: a poll would report a timeout for a
+  // view that never re-arms, and a timeout is not evidence of an assertion.
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  expect(h.reads.of("readStatus")).toHaveLength(reads + 2);
 });
 
 test("only tailLimit is live; the other three take effect at the next session", async () => {
