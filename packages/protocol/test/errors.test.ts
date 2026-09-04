@@ -159,10 +159,12 @@ describe("the retained-tool-capture read errors are one catchable family without
   // The membership list is DERIVED from the barrel, not typed out here: a
   // guard that names its own subjects cannot fail for a subject that did not
   // exist when it was written, and the whole point of the base class is the
-  // FOURTH capture error someone adds later. Anything exported as
-  // `ToolCapture*Error` other than the base must be in the family.
+  // FOURTH capture error someone adds later. The base is excluded by the
+  // pattern alone — `.+` requires at least one character between `ToolCapture`
+  // and `Error`, so `ToolCaptureError` does not match — and that is the sole
+  // excluder; an identity comparison beside it would never decide anything.
   const family = Object.entries(protocol).filter(
-    ([name, value]) => /^ToolCapture.+Error$/.test(name) && typeof value === "function" && value !== ToolCaptureError,
+    ([name, value]) => /^ToolCapture.+Error$/.test(name) && typeof value === "function",
   ) as Array<[string, new () => Error]>;
 
   it("covers every exported capture error, and is not vacuous", () => {

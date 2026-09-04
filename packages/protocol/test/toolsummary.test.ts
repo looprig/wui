@@ -81,9 +81,10 @@ interface CaptureFixture {
  * and the first payload someone adds with a wrong one fails as a confusing
  * `ToolCaptureIntegrityError` about the code under test. This is an ASYNC
  * factory, not a value plus a `computeDigest()` step, so there is no window in
- * which a fixture exists carrying an empty digest: a fixture someone forgets to
- * initialise does not compile rather than reproducing the same confusing
- * failure the constants did. The NEGATIVE cases deliberately do not derive
+ * which a fixture exists carrying an empty digest: the digest is filled in
+ * before the fixture exists at all. The failure mode that remains is forgetting
+ * to `await` the factory, and that is a type error at every use of the result —
+ * not the silent half-built fixture a separate initialisation step allows. The NEGATIVE cases deliberately do not derive
  * anything (see the all-zeros digest below): an expected value a failing test
  * computes for itself is no longer an expectation.
  */

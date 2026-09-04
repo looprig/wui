@@ -213,6 +213,7 @@ test("a credential capability absent at mount is not installed later", async () 
   );
   await expect.poll(() => h.link.open.length).toBe(1);
   expect(h.linkCredentials?.connectionToken).toBeUndefined();
+  const captured = h.linkCredentials;
 
   await rendered.rerender(
     <FactoryLinkProvider
@@ -223,7 +224,12 @@ test("a credential capability absent at mount is not installed later", async () 
     </FactoryLinkProvider>,
   );
 
-  expect(h.linkCredentials?.connectionToken).toBeUndefined();
+  // Re-reading `h.linkCredentials?.connectionToken` here would assert nothing:
+  // it is the forwarder captured at `create` and nothing mutates a forwarder in
+  // place. The only route a late capability has is a SECOND `create`, built
+  // from the new credentials, so that is what is observed.
+  expect(h.clientCalls).toBe(1);
+  expect(h.linkCredentials).toBe(captured);
 });
 
 test("REST headers are read from the current credentials on every request", async () => {

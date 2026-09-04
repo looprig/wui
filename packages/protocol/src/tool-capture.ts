@@ -65,8 +65,12 @@ export async function readToolCapturePages(
   if (!Number.isSafeInteger(options.ceilingBytes) || options.ceilingBytes < 0) {
     throw new RangeError("tool capture ceilingBytes must be a non-negative safe integer");
   }
-  // Split into three guards, not collapsed into one `if`, so each bound has a
-  // sole killer: a mutation to any one of them fails a test of its own.
+  // Split into three guards, not collapsed into one `if`, so that each bound is
+  // a separate statement a mutation can reach without disturbing the other two.
+  // That the bounds are separately KILLED is supplied by the
+  // `rejects invalid pageBytes` rows in `test/toolsummary.test.ts` — 1.5 for the
+  // integrality bound, 0 and -1 for positivity, 11 for the ceiling — not by the
+  // split; the split only makes it possible to write them.
   if (!Number.isSafeInteger(options.pageBytes)) {
     throw new RangeError("tool capture pageBytes must be a positive safe integer within ceilingBytes");
   }

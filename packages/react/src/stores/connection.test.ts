@@ -84,16 +84,24 @@ for (const bindings of [1, 2, 3, 4]) {
     const store = new FactoryLinkStore(link);
     store.open();
     const recorders = Array.from({ length: bindings }, (_, index) => recorder(`session-${index}`));
-    for (const each of recorders) store.bind(each.options);
+    // Each binding is advanced to a DIFFERENT non-zero cursor: zero is also the
+    // default, so a rejoin reported at zero could not tell "at the binding's
+    // cursor" from "at nothing in particular".
+    const bound = recorders.map((each, index) => {
+      const binding = store.bind(each.options);
+      binding.advance(index + 1);
+      return binding;
+    });
     await expect.poll(() => link.open.length).toBe(bindings);
     expect(link.connectCalls).toBe(1);
+    expect(bound.map((binding) => binding.cursor)).toEqual(bound.map((_, index) => index + 1));
 
     link.drop();
 
     await expect.poll(() => link.open.length).toBe(bindings);
     expect(link.connectCalls).toBe(2);
     expect(link.maxLiveConnections).toBe(1);
-    for (const each of recorders) expect(each.rejoins).toEqual([0]);
+    recorders.forEach((each, index) => expect(each.rejoins).toEqual([index + 1]));
   });
 }
 
@@ -432,8 +440,10 @@ test("a binding that is down when the link reconnects rejoins with the rest", as
   store.open();
   const a = recorder("session-a");
   const b = recorder("session-b");
-  store.bind(a.options);
-  store.bind(b.options);
+  // Distinct non-zero cursors: zero is the default, so rejoining "at zero"
+  // would be indistinguishable from rejoining at nothing.
+  store.bind(a.options).advance(4);
+  store.bind(b.options).advance(9);
   await expect.poll(() => link.open.length).toBe(2);
 
   // `session-a` loses only its subscription; `session-b` keeps the connection.
@@ -447,8 +457,8 @@ test("a binding that is down when the link reconnects rejoins with the rest", as
     "session-a",
     "session-b",
   ]);
-  expect(a.rejoins).toEqual([0]);
-  expect(b.rejoins).toEqual([0]);
+  expect(a.rejoins).toEqual([4]);
+  expect(b.rejoins).toEqual([9]);
   expect(link.connectCalls).toBe(2);
   store.close();
 });
@@ -530,5 +540,79 @@ test("an error from a cancelled binding's subscription is not reported to the vi
   expect(a.errors).toHaveLength(0);
   // ... and it did not resubscribe a session nobody is watching.
   expect(link.forSession("session-a")).toHaveLength(1);
+  store.close();
+});
+
+// B2, and the rejoin half of B1. The connect-success loop rejoins EVERY binding,
+// including ones whose subscription never errored, so it is the one path that
+// reaches `#join` with a live subscription still in the record's `release` slot.
+// Reachable with no Centrifuge specifics: the transport loses the connection
+// without any subscription reporting it, then a second view mounts and its
+// `bind` drives the reconnect.
+//
+// Both defects are visible here and neither is visible without the other's fix:
+// with the channel left registered the rejoin `subscribe` THROWS inside an
+// `async` method nobody awaits, so the binding stays down and `onRejoin` never
+// fires; with the throw removed but the release still skipped, the superseded
+// subscription stays live and wired to the same record and the view receives
+// every publication twice.
+test("a rejoin on a new connection releases the subscription it is retaking", async () => {
+  const link = new FakeClientLink();
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const a = recorder("session-a");
+  const binding = store.bind(a.options);
+  await expect.poll(() => link.open.length).toBe(1);
+  binding.advance(6);
+  const first = link.forSession("session-a")[0];
+  expect(first?.state).toBe("subscribed");
+
+  // The transport goes; no subscription reports it, so `#onBindingError` never
+  // runs and `record.release` is still holding `first`.
+  link.disconnect();
+  expect(a.errors).toHaveLength(0);
+  expect(first?.state).toBe("subscribed");
+
+  // A second view mounts. Its join finds the link down, reconnects, and the
+  // success loop rejoins every binding.
+  store.bind(recorder("session-b").options);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  // The rejoin happened at all — this is what a discarded `subscribe` throw
+  // costs, and the only signal of it: the view is never told to repair its gap.
+  expect(a.rejoins).toEqual([6]);
+  const forA = link.forSession("session-a");
+  expect(forA).toHaveLength(2);
+  // Released BEFORE the retake, not left live alongside it.
+  expect(first?.unsubscribeCount).toBe(1);
+  expect(link.open.map((s) => s.sessionId).sort()).toEqual(["session-a", "session-b"]);
+
+  // Exactly one live subscription is wired to the binding, so one delivery.
+  for (const subscription of link.open) subscription.deliver(enduring(subscription.sessionId, 7));
+  expect(a.publications.map((p) => p.journal_seq)).toEqual([7]);
+  store.close();
+});
+
+// The remount path: a view unmounts and a later commit binds the same session
+// again, with no reconnect anywhere. It only works because a cancellation
+// releases the channel — `ClientSubscription.unsubscribe` detaches, which
+// `protocol/test/clientlink.test.ts` reads off Centrifuge itself.
+test("a session rebound after its view unmounted takes the channel again", async () => {
+  const link = new FakeClientLink();
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const gone = recorder("session-a");
+  const binding = store.bind(gone.options);
+  await expect.poll(() => link.open.length).toBe(1);
+
+  binding.cancel();
+  const again = recorder("session-a");
+  store.bind(again.options);
+  await expect.poll(() => link.open.length).toBe(1);
+
+  expect(link.forSession("session-a")).toHaveLength(2);
+  for (const subscription of link.open) subscription.deliver(enduring("session-a", 11));
+  expect(again.publications.map((p) => p.journal_seq)).toEqual([11]);
+  expect(gone.publications).toHaveLength(0);
   store.close();
 });

@@ -18,12 +18,46 @@
  *  - `subscribe()` returns synchronously with `ready` still pending, so a
  *    binding exists before it is authorized;
  *  - `unsubscribe()` is accepted any number of times, so "exactly once" is a
- *    property of the caller, never of this fake.
+ *    property of the caller, never of this fake;
+ *  - **one live subscription per session.** Centrifuge keeps a per-channel
+ *    registry and `newSubscription` THROWS on a second entry; `unsubscribe()`
+ *    on the real link releases it (see `ClientSubscription.unsubscribe` in
+ *    `protocol/src/clientlink.ts`, and `ClientLink over real Centrifuge` in
+ *    `protocol/test/clientlink.test.ts`, which reads both halves off the
+ *    library). A FAILED subscription is NOT released — an errored subscription
+ *    stays in Centrifuge's registry — so a rejoin after an error must release
+ *    before it subscribes, exactly as it must after a silent transport loss.
+ *    A fake that accepted overlapping subscriptions would turn that throw into
+ *    a passing test, which is what it did until this was added.
  *
  * Deliberately NOT mirrored, because nothing here reads them: schema validation
  * of publications (the real link validates and routes `session.reset` by its
- * `type` member; this one is handed already-typed values), Centrifuge's own
- * automatic reconnect and resubscribe, and the token/data option plumbing.
+ * `type` member; this one is handed already-typed values) and the token/data
+ * option plumbing.
+ *
+ * Three differences remain after auditing this against `clientlink.ts` in both
+ * directions, and none of them is inert:
+ *
+ *  - **Centrifuge's own automatic reconnect and resubscribe.** The real link
+ *    revives an existing subscription across a transport reconnect by itself, so
+ *    publications can keep arriving on a subscription `FactoryLinkStore`
+ *    believes it must rejoin; here they stop until the store resubscribes. The
+ *    cost is that this fake cannot show a failed rejoin being MASKED by live
+ *    publications — which is precisely why a failed rejoin goes unnoticed in a
+ *    browser — only whether the rejoin happened. `onRejoin` is therefore the
+ *    signal these tests assert on.
+ *  - **`ready` after an unsubscribe.** The real link REJECTS a `ready` that has
+ *    not settled when the subscription is torn down; `unsubscribe()` here leaves
+ *    it pending forever. `FactoryLinkStore` observes that rejection and ignores
+ *    it, so the two agree on what the store does — but a future consumer that
+ *    reads `ready` for a teardown signal would be tested against the weaker one.
+ *  - **`deliver()` on an unsubscribed subscription.** The real link stops
+ *    routing publications once the subscription is gone. `deliver()` is a test
+ *    ACTION rather than something this fake produces on its own, and one test
+ *    uses it deliberately to model a frame the socket had already handed up
+ *    before the unsubscribe; nothing calls it by accident. `link.open` is the
+ *    accessor to reach for when the question is what a live subscription
+ *    delivers.
  */
 import type {
   ClientLink,
@@ -38,6 +72,16 @@ import type {
 } from "@looprig/protocol";
 
 const NEGOTIATED: VersionNegotiationResponse = { version: 1 };
+
+/**
+ * The real link's channel grammar is reversible, so one channel per
+ * `(tenantId, sessionId)` and no collisions between distinct pairs; this
+ * reproduces that identity rather than the exact spelling, which no caller here
+ * can observe.
+ */
+function channelOf(tenantId: string, sessionId: string): string {
+  return `session:${encodeURIComponent(tenantId)}:${encodeURIComponent(sessionId)}`;
+}
 
 export class FakeSubscription implements ClientSubscription {
   /** How many times `unsubscribe()` reached this subscription. */
@@ -54,6 +98,8 @@ export class FakeSubscription implements ClientSubscription {
     readonly options: SubscribeOptions,
     /** The link connection generation this subscription was opened on. */
     readonly generation: number,
+    /** Hands the channel back to the link's registry. See `FakeClientLink`. */
+    private readonly release: (subscription: FakeSubscription) => void = () => {},
   ) {
     let resolve!: () => void;
     let reject!: (reason: unknown) => void;
@@ -101,6 +147,7 @@ export class FakeSubscription implements ClientSubscription {
   unsubscribe(): void {
     this.unsubscribeCount += 1;
     this.state = "unsubscribed";
+    this.release(this);
   }
 }
 
@@ -122,6 +169,8 @@ export class FakeClientLink implements ClientLink {
     | { promise: Promise<VersionNegotiationResponse>; resolve: () => void; reject: (reason: unknown) => void }
     | undefined;
   #generation = 0;
+  /** The channels currently holding a subscription, mirroring Centrifuge's `_subs`. */
+  readonly #registry = new Map<string, FakeSubscription>();
 
   get state(): ClientLinkState {
     return this.#state;
@@ -183,7 +232,17 @@ export class FakeClientLink implements ClientLink {
   }
 
   subscribe(options: SubscribeOptions): ClientSubscription {
-    const subscription = new FakeSubscription(options, this.#generation);
+    const channel = channelOf(options.tenantId, options.sessionId);
+    if (this.#registry.has(channel)) {
+      throw new Error(`Subscription to the channel ${channel} already exists`);
+    }
+    const subscription = new FakeSubscription(options, this.#generation, (released) => {
+      // Removal is by CHANNEL in Centrifuge, so a stale handle releasing a
+      // second time could take a successor's entry out. It does not, here or in
+      // the adapter, and this is the half of that pair the store's tests reach.
+      if (this.#registry.get(channel) === released) this.#registry.delete(channel);
+    });
+    this.#registry.set(channel, subscription);
     this.subscriptions.push(subscription);
     queueMicrotask(() => {
       if (subscription.state !== "subscribing") return;

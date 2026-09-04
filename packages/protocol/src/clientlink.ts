@@ -35,6 +35,19 @@ export interface ClientSubscription {
   readonly ready: Promise<void>;
   /** Negotiated sessionwire version, available after `ready` settles successfully. */
   readonly version?: number;
+  /**
+   * Ends the subscription AND detaches its channel, so the same
+   * `(tenantId, sessionId)` can be subscribed again on this link.
+   *
+   * The detach is the load-bearing half. Centrifuge allows one subscription per
+   * channel per client and `newSubscription` THROWS on a second one, while
+   * `Subscription.unsubscribe()` alone is documented as keeping position state
+   * and leaves the channel in the client's registry forever. A consumer that
+   * re-subscribes a session — on a new connection, or on a view remount —
+   * therefore cannot be served by `unsubscribe()` alone. Idempotent: a second
+   * call is a no-op and in particular never detaches a SUCCESSOR subscription
+   * that has since taken the same channel.
+   */
   unsubscribe(): void;
 }
 
@@ -73,7 +86,13 @@ export interface ClientLinkTransportSubscription {
   readonly state: string;
   on(event: string, handler: (context: any) => void): this;
   subscribe(): void;
-  unsubscribe(): void;
+  /**
+   * Unsubscribes and removes the subscription from the transport's per-channel
+   * registry. There is deliberately no plain `unsubscribe()` on this seam: no
+   * caller wants the position-keeping half without the detach, and offering it
+   * would let a rejoin path compile against the weaker of the two.
+   */
+  release(): void;
 }
 
 /** Internal structural seam used to test the adapter without an actual socket. */
@@ -82,6 +101,7 @@ export interface ClientLinkTransport {
   on(event: string, handler: (context: any) => void): this;
   connect(): void;
   disconnect(): void;
+  /** Throws if `channel` already has a subscription that has not been released. */
   newSubscription(channel: string, options: Record<string, unknown>): ClientLinkTransportSubscription;
   rpc(method: string, data: unknown): Promise<unknown>;
 }
@@ -93,14 +113,30 @@ export interface ClientLinkInternalOptions extends ClientLinkOptions {
 }
 
 class CentrifugeSubscriptionAdapter implements ClientLinkTransportSubscription {
-  constructor(private readonly subscription: ReturnType<Centrifuge["newSubscription"]>) {}
+  #released = false;
+
+  constructor(
+    private readonly subscription: ReturnType<Centrifuge["newSubscription"]>,
+    private readonly client: Centrifuge,
+  ) {}
   get state(): string { return this.subscription.state; }
   on(event: string, handler: (context: any) => void): this {
     this.subscription.on(event as never, handler as never);
     return this;
   }
   subscribe(): void { this.subscription.subscribe(); }
-  unsubscribe(): void { this.subscription.unsubscribe(); }
+  /**
+   * `removeSubscription` unsubscribes first when the subscription is still
+   * live, so this is the whole teardown. Guarded because it deletes the
+   * registry entry BY CHANNEL: a second call after a successor has taken the
+   * same channel would deregister the successor and let a third subscription
+   * open on a channel the server permits only one of.
+   */
+  release(): void {
+    if (this.#released) return;
+    this.#released = true;
+    this.client.removeSubscription(this.subscription);
+  }
 }
 
 class CentrifugeTransportAdapter implements ClientLinkTransport {
@@ -118,7 +154,7 @@ class CentrifugeTransportAdapter implements ClientLinkTransport {
   connect(): void { this.client.connect(); }
   disconnect(): void { this.client.disconnect(); }
   newSubscription(channel: string, options: Record<string, unknown>): ClientLinkTransportSubscription {
-    return new CentrifugeSubscriptionAdapter(this.client.newSubscription(channel, options));
+    return new CentrifugeSubscriptionAdapter(this.client.newSubscription(channel, options), this.client);
   }
   rpc(method: string, data: unknown): Promise<unknown> { return this.client.rpc(method, data); }
 }
@@ -315,7 +351,7 @@ class CentrifugeClientLink implements ClientLink {
       get state(): ClientSubscriptionState { return subscriptionState(transportSubscription.state); },
       ready,
       get version(): number | undefined { return authorized ? thisLink.negotiated?.version : undefined; },
-      unsubscribe: () => transportSubscription.unsubscribe(),
+      unsubscribe: () => transportSubscription.release(),
     };
   }
 

@@ -1,6 +1,6 @@
 import { FoldError, type SessionViewStore } from "@looprig/protocol";
 import type { ClientLink, FactoryPublication, SessionReset } from "@looprig/protocol";
-import { asError, cancelOnce, Publisher } from "./publisher.js";
+import { asError, cancelOnce, Publisher, RefreshGuard } from "./publisher.js";
 
 export type ConnectionState = "idle" | "live" | "closed" | "failed";
 
@@ -225,18 +225,32 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
    * Increments once per established connection. A binding subscribes at most
    * once per generation, which is what bounds recovery: a session the server
    * will not authorize retries when — and only when — a NEW connection exists.
+   *
+   * Zero is therefore not just "no connection yet", it is a value no binding may
+   * ever see: `BindingRecord.attemptedGeneration` starts at 0, so a `#join` that
+   * ran at generation 0 would compare `0 === 0` and return without subscribing.
+   * That is why `#ensureConnected`'s already-connected fast path also requires
+   * `#generation > 0` — see there.
    */
   #generation = 0;
   /**
-   * Bumped by `close()`, and read on BOTH settlement paths of an interrupted
-   * connect. `ClientLink.disconnect` REJECTS a pending connect, so the attempt
-   * a close interrupts settles just after it and the store would end up
-   * `"failed"` after a clean close. The success path is not the same case: a
-   * connect cannot resolve after a close, but its already-queued reaction can
-   * still RUN after one, which would leave the store `"connected"` over a
-   * disconnected link.
+   * Which connect attempt the store is still willing to hear from. Read on BOTH
+   * settlement paths of an interrupted connect. `ClientLink.disconnect` REJECTS
+   * a pending connect, so the attempt a close interrupts settles just after it
+   * and the store would end up `"failed"` after a clean close. The success path
+   * is not the same case: a connect cannot resolve after a close, but its
+   * already-queued reaction can still RUN after one, which would leave the store
+   * `"connected"` over a disconnected link.
+   *
+   * This is `RefreshGuard`'s exact shape — a last-starter wins over an earlier
+   * call's late result — so it is `RefreshGuard`, not a second hand-rolled
+   * counter. It cannot be merged with `#generation`: that one counts
+   * ESTABLISHED connections and is read out by `#join` and stored per binding,
+   * neither of which `RefreshGuard` offers, and a single counter bumped by
+   * `close()` as well would advance the "one subscribe per connection" bound
+   * without a new connection existing behind it.
    */
-  #epoch = 0;
+  readonly #epoch = new RefreshGuard();
   #connecting: Promise<boolean> | undefined;
 
   constructor(link: ClientLink) {
@@ -256,7 +270,7 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
 
   /** Cancels every binding exactly once, then drops the connection. */
   close(): void {
-    this.#epoch += 1;
+    this.#epoch.start();
     this.#connecting = undefined;
     for (const record of [...this.#bindings]) record.cancel();
     this.#bindings.clear();
@@ -299,9 +313,20 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
 
   /**
    * Take-and-clear: the release is read out of the record and the slot emptied
-   * BEFORE it is invoked, so the two callers that can reach it — a cancellation
-   * and a subscription error that triggers a rejoin — cannot between them
-   * unsubscribe the same subscription twice, in either order.
+   * BEFORE it is invoked, so no two callers can unsubscribe the same
+   * subscription twice, in either order.
+   *
+   * Counting the CALLERS of this method is not enough, and enumerating them was
+   * how a live subscription came to be stranded. The slot has three writers:
+   * `bind` initialises it to `undefined`, this method empties it, and `#join`
+   * FILLS it after every subscribe — and `#join` runs again for a binding on
+   * every new connection, not only for one whose subscription has ended. A
+   * `#join` that assigned over a slot still holding a live release would leave
+   * that subscription open with no way to reach it, so `#join` calls this first
+   * and the three writers stay disjoint.
+   *
+   * The callers, for the record, are a cancellation, a subscription error that
+   * triggers a rejoin, and that rejoin itself.
    */
   #release(record: BindingRecord): void {
     const release = record.release;
@@ -317,8 +342,19 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
    */
   #ensureConnected(): Promise<boolean> {
     if (this.#connecting !== undefined) return this.#connecting;
+    // `#generation > 0` is load-bearing, not defensive. A store constructed over
+    // a link something else already connected would otherwise take this fast
+    // path with `#generation` still 0, and every `#join` would then find
+    // `record.attemptedGeneration === 0 === generation` and return without
+    // subscribing — no binding on that store would ever open. Pinned by
+    // "a link that is already connected still gets a generation before any
+    // binding" in `connection.test.ts`.
     if (this.#link.state === "connected" && this.#generation > 0) return Promise.resolve(true);
-    const epoch = this.#epoch;
+    // Bumping here rather than only in `close()` changes nothing observable:
+    // reaching this line means `#connecting` is undefined, so the previous
+    // attempt has either already settled and run its handlers, or been
+    // abandoned by a `close()` that bumped anyway.
+    const epoch = this.#epoch.start();
     this.publish({ state: "connecting", connected: false });
     const attempt = this.#link.connect().then(
       () => {
@@ -329,7 +365,7 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
         // has resolved. A `close()` in that window runs first, and without this
         // the store would publish `"connected"` over a link it has already
         // disconnected, with nothing left to correct it.
-        if (epoch !== this.#epoch) return false;
+        if (!this.#epoch.isCurrent(epoch)) return false;
         this.#connecting = undefined;
         this.#generation += 1;
         this.publish({ state: "connected", connected: true, failure: null });
@@ -340,7 +376,7 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
         return true;
       },
       (reason: unknown) => {
-        if (epoch !== this.#epoch) return false;
+        if (!this.#epoch.isCurrent(epoch)) return false;
         this.#connecting = undefined;
         this.publish({ state: "failed", connected: false, failure: asError(reason) });
         return false;
@@ -367,6 +403,15 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     // and every later one is a rejoin.
     const rejoin = record.joined;
     record.joined = true;
+    // The previous subscription, if any, goes before the next one is opened —
+    // not because unsubscribing is tidy, but because the link permits ONE
+    // subscription per session at a time and `subscribe` throws on a second.
+    // The error path has already released by the time it gets here; the
+    // connect-success loop has not, because a transport can lose the connection
+    // without any subscription reporting an error, and that loop rejoins every
+    // binding including the ones still holding a live subscription wired to
+    // this same record.
+    this.#release(record);
     const subscription = this.#link.subscribe({
       tenantId: record.options.tenantId,
       sessionId: record.options.sessionId,
@@ -380,9 +425,15 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
         this.#onBindingError(record, generation, error);
       },
     });
-    // No second cancellation check between `subscribe` and here: `subscribe` is
-    // synchronous, so nothing can run in that window. The check that matters is
-    // the one after the await above.
+    // No second CANCELLATION check between `subscribe` and here: `cancel` is
+    // only ever called from outside, and `subscribe` returns without yielding.
+    // The check that matters is the one after the await above. The narrower
+    // claim that nothing at all can run in this window would not hold: the
+    // `onError` above is installed before `subscribe` returns, so a link that
+    // delivered an error synchronously would reach `#onBindingError` and
+    // `#release` while `record.release` is still undefined. Centrifuge never
+    // does — every subscription error arrives from a socket event or a queued
+    // task — and this rests on that, not on the window being empty.
     record.release = () => {
       subscription.unsubscribe();
     };

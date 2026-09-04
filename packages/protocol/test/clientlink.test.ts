@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
+import type { ClientSubscription } from "../src/clientlink.js";
 import {
+  createClientLink,
   createClientLinkWithTransport,
   type ClientLinkTransport,
   type ClientLinkTransportSubscription,
@@ -21,7 +23,12 @@ class FakeSubscription implements ClientLinkTransportSubscription {
   readonly handlers = new Map<string, Handler[]>();
   state = "unsubscribed";
   subscribeCalls = 0;
-  unsubscribeCalls = 0;
+  releaseCalls = 0;
+
+  constructor(
+    readonly channel: string,
+    private readonly onRelease: (sub: FakeSubscription) => void = () => {},
+  ) {}
 
   on(event: string, handler: Handler): this {
     this.handlers.set(event, [...(this.handlers.get(event) ?? []), handler]);
@@ -33,9 +40,10 @@ class FakeSubscription implements ClientLinkTransportSubscription {
     this.state = "subscribed";
   }
 
-  unsubscribe(): void {
-    this.unsubscribeCalls += 1;
+  release(): void {
+    this.releaseCalls += 1;
     this.state = "unsubscribed";
+    this.onRelease(this);
   }
 
   emit(event: string, context: unknown): void {
@@ -46,6 +54,8 @@ class FakeSubscription implements ClientLinkTransportSubscription {
 class FakeTransport implements ClientLinkTransport {
   readonly handlers = new Map<string, Handler[]>();
   readonly subscriptions: Array<{ channel: string; options: Record<string, unknown>; sub: FakeSubscription }> = [];
+  /** The channels currently registered, mirroring Centrifuge's `_subs`. */
+  readonly registry = new Map<string, FakeSubscription>();
   state = "disconnected";
   rpcResult: unknown = { data: fixture("command_status") };
   rpcFailure: unknown;
@@ -69,8 +79,24 @@ class FakeTransport implements ClientLinkTransport {
     if (this.emitDisconnectedOnDisconnect) this.emit("disconnected", { code: 0, reason: "client disconnect" });
   }
 
+  /**
+   * Mirrors `Centrifuge.newSubscription`, which throws when the channel is
+   * already in the client's registry, and `removeSubscription`, which is the
+   * only thing that takes it back out. A fake that accepted a second
+   * subscription to one channel would let a rejoin path pass here and throw in
+   * a browser.
+   */
   newSubscription(channel: string, options: Record<string, unknown>): FakeSubscription {
-    const sub = new FakeSubscription();
+    if (this.registry.has(channel)) {
+      throw new Error("Subscription to the channel " + channel + " already exists");
+    }
+    const sub = new FakeSubscription(channel, (released) => {
+      // By channel, exactly as `_removeSubscription` is — but only while this
+      // subscription is still the registered one, matching the adapter's
+      // release guard.
+      if (this.registry.get(channel) === released) this.registry.delete(channel);
+    });
+    this.registry.set(channel, sub);
     this.subscriptions.push({ channel, options, sub });
     return sub;
   }
@@ -199,7 +225,7 @@ describe("ClientLink", () => {
     });
 
     binding.unsubscribe();
-    expect(created?.sub.unsubscribeCalls).toBe(1);
+    expect(created?.sub.releaseCalls).toBe(1);
     expect(binding.state).toBe("unsubscribed");
   });
 
@@ -308,5 +334,84 @@ describe("ClientLink", () => {
     sub.emit("publication", { data: { ...reset, last_contiguous: 999 } });
     expect(errors).toHaveLength(2);
     expect(errors.every((error) => error instanceof ContractValidationError)).toBe(true);
+  });
+  // A session is subscribed more than once in normal operation: a view remounts,
+  // or a consumer rejoins every binding on a new connection. Centrifuge permits
+  // one subscription per channel per client and `newSubscription` THROWS on the
+  // second, so `unsubscribe()` has to hand the channel back or the second
+  // subscribe is unreachable. `real Centrifuge` below pins the same property
+  // against the library rather than against this fake.
+  it("refuses a second live subscription to one session and frees the channel on unsubscribe", () => {
+    const { link, transport } = setup();
+    const options = {
+      tenantId: "tenant-1",
+      sessionId: "session-1",
+      onPublication: () => undefined,
+      onReset: () => undefined,
+    };
+    const first = link.subscribe(options);
+    expect(() => link.subscribe(options)).toThrow(/already exists/);
+    // A different session is a different channel and is unaffected.
+    link.subscribe({ ...options, sessionId: "session-2" });
+
+    first.unsubscribe();
+    const second = link.subscribe(options);
+    expect(transport.subscriptions.filter((entry) => entry.channel.endsWith("session-1"))).toHaveLength(2);
+
+    // The stale handle releasing a second time must not deregister its
+    // successor: doing so would let a third subscription open on a channel the
+    // server permits only one of.
+    first.unsubscribe();
+    expect(() => link.subscribe(options)).toThrow(/already exists/);
+    second.unsubscribe();
+    expect(() => link.subscribe(options)).not.toThrow();
+  });
+});
+
+// The adapter's fake transport is only as good as the library it stands in for,
+// so the two constraints the fake encodes are read straight off Centrifuge here.
+// No socket is involved: the registry is client-side and populated by
+// `newSubscription` before any connect.
+describe("ClientLink over real Centrifuge", () => {
+  const options = {
+    tenantId: "tenant-1",
+    sessionId: "session-1",
+    onPublication: () => undefined,
+    onReset: () => undefined,
+    onError: () => undefined,
+  };
+
+  it("throws on a second live subscription to one session", () => {
+    const link = createClientLink({ endpoint: "ws://127.0.0.1:1/connection/websocket" });
+    link.subscribe(options);
+    expect(() => link.subscribe(options)).toThrow(/already exists/);
+  });
+
+  // `removeSubscription` deletes the registry entry BY CHANNEL, so a stale
+  // handle unsubscribing a second time would take the successor's entry out and
+  // let a third subscription open on a channel the server permits one of.
+  it("does not let a stale handle detach its successor", () => {
+    const link = createClientLink({ endpoint: "ws://127.0.0.1:1/connection/websocket" });
+    const first = link.subscribe(options);
+    first.ready.catch(() => {});
+    first.unsubscribe();
+    const second = link.subscribe(options);
+    second.ready.catch(() => {});
+
+    first.unsubscribe();
+    expect(() => link.subscribe(options)).toThrow(/already exists/);
+  });
+
+  it("accepts a resubscribe after unsubscribe, which is what the rejoin path needs", () => {
+    const link = createClientLink({ endpoint: "ws://127.0.0.1:1/connection/websocket" });
+    const first = link.subscribe(options);
+    // Real behaviour the React fake does not mirror: tearing a subscription
+    // down before it is authorized REJECTS `ready`. `FactoryLinkStore` observes
+    // that rejection; an unobserved one here would surface as a suite error.
+    first.ready.catch(() => {});
+    first.unsubscribe();
+    let second: ClientSubscription | undefined;
+    expect(() => { second = link.subscribe(options); }).not.toThrow();
+    second?.ready.catch(() => {});
   });
 });

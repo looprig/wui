@@ -58,7 +58,7 @@
   "suiteFiles": {
     "test/blocks.test.ts": 24,
     "test/conformance.test.ts": 40,
-    "test/clientlink.test.ts": 9,
+    "test/clientlink.test.ts": 13,
     "test/commands.test.ts": 18,
     "test/contract.test.ts": 66,
     "test/enduring.test.ts": 62,
