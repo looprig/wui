@@ -792,7 +792,20 @@ test("the default give-up bound is protocol's, not one and not unbounded", async
   await expect.poll(() => h.view.current?.state, { timeout: 4000 }).toBe("failed");
   stop();
 
-  expect(h.reads.of("readStatus")).toHaveLength(1 + DEFAULT_MAX_REPAIR_ATTEMPTS);
+  // The LITERAL, deliberately not the imported constant. An expectation that
+  // reads the value under test moves with it, so a mutant that changes the
+  // default to 1 would change this assertion to match and survive.
+  expect(h.reads.of("readStatus")).toHaveLength(1 + 32);
+});
+
+test("the shared repair bounds are protocol's, by value", () => {
+  // The constants are IMPORTED rather than retyped, so drift between this file
+  // and `joinFactorySessionView` is impossible by construction. What that
+  // cannot catch is the pair moving together, so their values are pinned here —
+  // the one place in either package that reads them as numbers.
+  expect(DEFAULT_MAX_REPAIR_ATTEMPTS).toBe(32);
+  expect(DEFAULT_REPAIR_DELAY_MS).toBe(250);
+  expect(MAX_REPAIR_BACKOFF_FACTOR).toBe(8);
 });
 
 test("consecutive repairs back off, doubling, and stop doubling at the cap", async () => {
@@ -817,10 +830,12 @@ test("consecutive repairs back off, doubling, and stop doubling at the cap", asy
   expect(gaps[1]).toBeGreaterThanOrEqual(base / 2);
   expect(gaps[1]).toBeLessThan(base * 1.6);
   // It doubles, and it stops: the largest wait is the capped one, not the last
-  // term of an unbounded series.
+  // term of an unbounded series. Bounded by LITERALS around the cap this suite
+  // pins separately, never by the constant under test — an oracle that reads
+  // the mutated value moves with it and kills nothing.
   const longest = Math.max(...gaps);
-  expect(longest).toBeGreaterThanOrEqual(base * MAX_REPAIR_BACKOFF_FACTOR * 0.6);
-  expect(longest).toBeLessThan(base * MAX_REPAIR_BACKOFF_FACTOR * 2);
+  expect(longest).toBeGreaterThanOrEqual(base * 8 * 0.6);
+  expect(longest).toBeLessThan(base * 8 * 2);
   // And the whole run is paced by the curve rather than by the macrotask queue.
   expect(times[times.length - 1]! - times[0]!).toBeGreaterThan(base * 12);
 });
@@ -834,12 +849,12 @@ test("the default repair delay is protocol's quarter second, not zero and not un
   const before = h.reads.of("readStatus").length;
 
   const stop = driveForeignFrames(h);
-  await new Promise((resolve) => setTimeout(resolve, DEFAULT_REPAIR_DELAY_MS / 4));
+  await new Promise((resolve) => setTimeout(resolve, 60));
   // The first repair is immediate; the second waits a base delay that has not
   // elapsed. A zero default would already have spent the whole budget.
   expect(h.reads.of("readStatus")).toHaveLength(before + 1);
 
-  await new Promise((resolve) => setTimeout(resolve, DEFAULT_REPAIR_DELAY_MS * 2));
+  await new Promise((resolve) => setTimeout(resolve, 500));
   stop();
   // And it is a quarter second, not a forever: the second repair has landed and
   // the run has given up.
