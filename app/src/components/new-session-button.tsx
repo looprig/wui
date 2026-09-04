@@ -23,7 +23,7 @@ export interface NewSessionButtonProps {
  *
  * `@looprig/react` has no `useCreateSession` — 05-app.md's Task 5.10 names one,
  * and Phase 4 shipped `useSessionList`, `useSessionView`, `useComposer`,
- * `useGate`, `useInterrupt`, `useAttachOrRestore` and `useConnection` and no
+ * `useGate`, `useInterrupt`, `useFactorySessionView` and `useConnection` and no
  * such hook. A create is one fire-and-report call with no state worth
  * outliving the component (the same reason `useInterrupt` keeps its store
  * private), so this is local state over the transport rather than a new

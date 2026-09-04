@@ -21,6 +21,8 @@ interface Recorder {
   readonly publications: EnduringPublication[];
   readonly resets: SessionReset[];
   readonly errors: Error[];
+  /** The cursor at each FIRST authorization — at most one entry, by contract. */
+  readonly joins: number[];
   readonly rejoins: number[];
   readonly options: SessionBindingOptions;
 }
@@ -29,6 +31,7 @@ function recorder(sessionId: string, cursor?: number): Recorder {
   const publications: EnduringPublication[] = [];
   const resets: SessionReset[] = [];
   const errors: Error[] = [];
+  const joins: number[] = [];
   const rejoins: number[] = [];
   const options: SessionBindingOptions = {
     tenantId: TENANT,
@@ -36,10 +39,11 @@ function recorder(sessionId: string, cursor?: number): Recorder {
     ...(cursor === undefined ? {} : { cursor }),
     onPublication: (publication) => publications.push(publication as EnduringPublication),
     onReset: (reset) => resets.push(reset),
+    onJoin: (at) => joins.push(at),
     onRejoin: (at) => rejoins.push(at),
     onError: (error) => errors.push(error),
   };
-  return { publications, resets, errors, rejoins, options };
+  return { publications, resets, errors, joins, rejoins, options };
 }
 
 test("two bindings share one connection on one link", async () => {
@@ -652,7 +656,7 @@ test("a binding whose channel another binding already holds is told so", async (
   store.close();
 });
 
-// The other half of the same fix, and what keeps `onRejoin` honest for U4.2: a
+// The other half of the same fix, and what keeps the two callbacks honest: a
 // binding that lost the channel has never subscribed, so when it finally does,
 // that is its FIRST join. Setting `record.joined` before the subscribe that
 // threw would deliver it through `onRejoin` instead — a repair signal for a gap
@@ -667,20 +671,95 @@ test("a binding that lost the channel joins, rather than rejoins, when it wins i
   store.bind(loser.options);
   await expect.poll(() => link.open.length).toBe(1);
   expect(loser.errors).toHaveLength(1);
+  expect(held.joins).toEqual([0]);
 
-  // The channel is freed and a new connection gives the loser its chance.
+  // The winner unmounts and hands the channel back. That release is what makes
+  // the loser reachable again: the connection has not changed, so nothing else
+  // would ever re-drive it.
   first.cancel();
-  link.disconnect();
-  store.bind(recorder("session-b").options);
-  await expect.poll(() => link.forSession("session-a").length).toBe(2);
-  await expect.poll(() => link.open.map((s) => s.sessionId).sort()).toEqual([
-    "session-a",
-    "session-b",
-  ]);
 
+  await expect.poll(() => link.forSession("session-a").length).toBe(2);
+  await expect.poll(() => loser.joins).toEqual([0]);
   expect(loser.rejoins).toEqual([]);
   expect(loser.errors).toHaveLength(1);
   for (const subscription of link.open) subscription.deliver(enduring(subscription.sessionId, 9));
   expect(loser.publications.map((p) => p.journal_seq)).toEqual([9]);
+  expect(held.publications).toHaveLength(0);
+  store.close();
+});
+
+// The lifecycle consequence U4.2 owns, stated as the thing that used to happen.
+// Reverting only `#redriveChannelPeers` leaves this test failing at the poll:
+// the loser stays silent for as long as the link stays up, uncancelled and
+// still counted in `bindingCount`, which is the "looks healthy, is down" shape.
+test("a loser is re-driven by the winner's unmount alone, with no reconnect", async () => {
+  const link = new FakeClientLink();
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const held = recorder("session-a");
+  const loser = recorder("session-a");
+  const first = store.bind(held.options);
+  store.bind(loser.options);
+  await expect.poll(() => link.open.length).toBe(1);
+
+  first.cancel();
+
+  await expect.poll(() => link.open.length).toBe(1);
+  // The same connection throughout: one connect, one generation.
+  expect(link.connectCalls).toBe(1);
+  expect(link.subscriptions.map((subscription) => subscription.generation)).toEqual([1, 1]);
+  expect(store.snapshot().bindingCount).toBe(1);
+  expect(loser.joins).toEqual([0]);
+  store.close();
+});
+
+// The bound the re-drive must not widen. A binding whose subscription was
+// AUTHORIZED and then failed has joined; re-driving it on a peer's release
+// would reopen a subscription this Factory has stopped authorizing, on the same
+// socket, which is the loop `#onBindingError` refuses.
+test("a peer's release does not re-drive a binding that has already subscribed", async () => {
+  const link = new FakeClientLink();
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const other = recorder("session-b");
+  const failing = recorder("session-a");
+  const peer = store.bind(other.options);
+  store.bind(failing.options);
+  await expect.poll(() => link.open.length).toBe(2);
+  expect(failing.joins).toEqual([0]);
+
+  link.forSession("session-a")[0]!.fail(new Error("no longer authorized"));
+  await expect.poll(() => failing.errors).toHaveLength(1);
+  peer.cancel();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  expect(link.forSession("session-a")).toHaveLength(1);
+  expect(link.connectCalls).toBe(1);
+  store.close();
+});
+
+// `onJoin` and `onRejoin` partition the authorizations: every one is reported
+// exactly once, and no callback covers two cases. A cold-read state machine
+// binds both to the same read, so a first subscribe reported as a rejoin — or
+// as nothing at all — is a session that never reads.
+test("onJoin reports the first authorization and onRejoin every later one", async () => {
+  const link = new FakeClientLink();
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const view = recorder("session-a", 4);
+  store.bind(view.options);
+  await expect.poll(() => link.open.length).toBe(1);
+  expect(view.joins).toEqual([4]);
+  expect(view.rejoins).toEqual([]);
+
+  link.drop();
+  await expect.poll(() => link.forSession("session-a").length).toBe(2);
+  await expect.poll(() => view.rejoins).toEqual([4]);
+
+  link.drop();
+  await expect.poll(() => link.forSession("session-a").length).toBe(3);
+  await expect.poll(() => view.rejoins).toEqual([4, 4]);
+  // Still exactly one join, however many times the connection came back.
+  expect(view.joins).toEqual([4]);
   store.close();
 });

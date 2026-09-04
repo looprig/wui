@@ -155,6 +155,19 @@ export interface SessionBindingOptions {
   onPublication(publication: FactoryPublication): void;
   onReset(reset: SessionReset): void;
   /**
+   * Called once, when this binding's FIRST subscription is authorized, with the
+   * cursor at that moment. `onRejoin` covers every later one, so between them
+   * every authorization has exactly one callback and no callback covers two
+   * cases.
+   *
+   * This exists because a cold-read + join state machine has to sequence
+   * subscribe -> read the durable plane -> reconcile, and the first subscribe
+   * is precisely the one `onRejoin` does not report. A view that timed the read
+   * instead would either read before it was subscribed (and lose whatever
+   * committed in between) or wait for no reason.
+   */
+  onJoin?(cursor: number): void;
+  /**
    * Called once each time this binding is re-authorized on a NEW connection,
    * with the cursor at that moment. This is the view's signal to repair the
    * span it may have missed through `FactoryReads` — the link cannot replay it.
@@ -292,6 +305,7 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
       record.cancelled = true;
       this.#bindings.delete(record);
       this.#release(record);
+      this.#redriveChannelPeers(record);
       this.publish({ bindingCount: this.#bindings.size });
     });
     this.#bindings.add(record);
@@ -332,6 +346,39 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     const release = record.release;
     record.release = undefined;
     release?.();
+  }
+
+  /**
+   * Re-drives any binding on `released`'s channel that lost the race for it.
+   *
+   * `bind()` is not keyed by session, so two mounted views of one session are
+   * two records competing for a channel the link permits ONE subscription on.
+   * The loser's `#join` threw, reported through `onError` and left
+   * `attemptedGeneration` set — deliberately, because retrying against a
+   * channel the winner still holds would only throw again. The consequence is
+   * that the loser recovers only across a NEW CONNECTION, so a winner that
+   * simply unmounts (a route change, a StrictMode remount) frees the channel
+   * and nothing re-drives the loser: it stays silent, uncancelled, and counted
+   * in `bindingCount`, for as long as the link stays up.
+   *
+   * The release is what makes the channel available, so the release is where
+   * the retry belongs. `attemptedGeneration` is reset to 0 rather than
+   * decremented: 0 is the value no live generation ever takes (see
+   * `#generation`), so `#join` cannot mistake it for an attempt already made.
+   *
+   * Only a record that has NEVER subscribed is eligible. `joined` is set the
+   * moment `subscribe` returns, so a binding whose subscription was authorized
+   * and later failed is not a loser and must keep the one-attempt-per-
+   * connection bound that stops a declining Factory being retried in a loop.
+   */
+  #redriveChannelPeers(released: BindingRecord): void {
+    for (const record of [...this.#bindings]) {
+      if (record.cancelled || record.joined) continue;
+      if (record.options.tenantId !== released.options.tenantId) continue;
+      if (record.options.sessionId !== released.options.sessionId) continue;
+      record.attemptedGeneration = 0;
+      void this.#join(record);
+    }
   }
 
   /**
@@ -462,7 +509,9 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     };
     void subscription.ready.then(
       () => {
-        if (!record.cancelled && rejoin) record.options.onRejoin?.(record.cursor);
+        if (record.cancelled) return;
+        if (rejoin) record.options.onRejoin?.(record.cursor);
+        else record.options.onJoin?.(record.cursor);
       },
       // The rejection is already delivered through `onError`; observing it here
       // only keeps it from surfacing as an unhandled rejection.

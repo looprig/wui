@@ -1,12 +1,7 @@
 import { page, userEvent } from "vitest/browser";
 import { describe, expect, it } from "vitest";
 import { render } from "vitest-browser-react";
-import {
-  InternalServerError,
-  NetworkError,
-  SessionNotFoundError,
-  type LiveFrameSource,
-} from "@looprig/protocol";
+import { NetworkError, type LiveFrameSource } from "@looprig/protocol";
 import { FakeTransport } from "../test/fakes";
 import {
   ControlledLiveSource,
@@ -31,18 +26,6 @@ const GATE_ID = "4f5a6b7c-8d9e-4f0a-8b1c-2d3e4f5a6b7c";
 const ONE_SHOT = { probeIntervalMs: 100_000, unreachableAfterMs: 100_000 };
 /** Same, but any failure is terminal at once, so the mount probe lands on "unreachable". */
 const ONE_SHOT_TERMINAL = { probeIntervalMs: 100_000, unreachableAfterMs: 0 };
-
-function notFound(): SessionNotFoundError {
-  return new SessionNotFoundError(404, {
-    error: { code: "session_not_found", message: "no such session", retryable: false },
-  });
-}
-
-function serverError(): InternalServerError {
-  return new InternalServerError(500, {
-    error: { code: "internal", message: "session lease is held", retryable: true },
-  });
-}
 
 interface Harness {
   transport: FakeTransport;
@@ -70,48 +53,38 @@ function renderPage(h: Harness, reachability = ONE_SHOT): void {
   );
 }
 
-describe("SessionDetailPage attach", () => {
-  it("says it is connecting before the session is live, and shows no transcript yet", async () => {
+describe("SessionDetailPage opening", () => {
+  it("renders the session without asking anything to be restored", async () => {
+    // The task this replaces: `useAttachOrRestore` made a POST the precondition
+    // of rendering anything, so opening a cold session PLACED it. Opening a
+    // view is a read.
     const h = harness();
-    h.transport.restoreSessionResponder = () => new Promise(() => {});
     renderPage(h);
-    const attaching = page.getByTestId("detail-attaching");
-    await expect.element(attaching).toBeInTheDocument();
-    expect(attaching.element().getAttribute("role")).toBe("status");
-    // Nothing may be sent to a session that is not live yet: /input, /gates and
-    // /interrupt all resolve the sid against the LIVE registry.
-    expect(document.querySelector("[data-testid=composer-input]")).toBeNull();
-    expect(document.querySelector("[data-testid=transcript-empty]")).toBeNull();
-  });
 
-  it("treats a 404 as a dead end, with no retry to press", async () => {
-    // serve returns session_not_found only when the rig itself reported no such
-    // session. No amount of retrying makes a journal exist.
-    const h = harness();
-    h.transport.restoreSessionResponder = () => Promise.reject(notFound());
-    renderPage(h);
-    const missing = page.getByTestId("detail-not-found");
-    await expect.element(missing).toBeInTheDocument();
-    expect(missing.element().textContent).toContain("no such session");
-    expect(document.querySelector("[data-testid=detail-retry]")).toBeNull();
-  });
-
-  it("offers a retry for a 500, and re-attempts on it", async () => {
-    // Every non-404 restore failure maps to a generic 500 — serve cannot tell a
-    // missing journal from a transient fault — and a concurrent cold restore
-    // that lost the exclusive session lease lands exactly there.
-    const h = harness();
-    h.transport.restoreSessionResponder = () => Promise.reject(serverError());
-    renderPage(h);
-    await expect.element(page.getByTestId("detail-retry")).toBeInTheDocument();
-    expect(page.getByTestId("detail-attach-error").element().textContent).toContain(
-      "session lease is held",
-    );
-
-    h.transport.restoreSessionResponder = () => Promise.resolve({ session_id: SID, restored: true });
-    await userEvent.click(page.getByTestId("detail-retry"));
     await expect.element(page.getByTestId("composer-input")).toBeInTheDocument();
-    expect(h.transport.restoreCalls).toEqual([SID, SID]);
+    expect(h.transport.restoreCalls).toEqual([]);
+
+    // The recorder is live. A negative assertion over a probe that cannot
+    // observe its subject asserts nothing, and this is the shortest path to
+    // showing that it can: the same array the deleted attach tests read.
+    await h.transport.restoreSession(SID);
+    expect(h.transport.restoreCalls).toEqual([SID]);
+  });
+
+  it("sends a state-changing call only once the user asks for one", async () => {
+    // Step 3's positive form, at the page rather than at the double: this page
+    // CAN reach the transport with a command, and one arrives after a user
+    // action and not before.
+    const h = harness();
+    renderPage(h);
+    await expect.element(page.getByTestId("composer-input")).toBeInTheDocument();
+    expect(h.transport.submitCalls).toEqual([]);
+
+    await userEvent.fill(page.getByTestId("composer-input"), "run the tests");
+    await userEvent.click(page.getByTestId("composer-submit"));
+
+    await expect.poll(() => h.transport.submitCalls.map((call) => call.sessionId)).toEqual([SID]);
+    expect(h.transport.restoreCalls).toEqual([]);
   });
 });
 

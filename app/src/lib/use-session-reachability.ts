@@ -125,7 +125,7 @@ export function useSessionReachability(
 
   useEffect(() => {
     // One probe on mount, before the first interval. Two reasons, both real:
-    // `alreadyLive` skips the restore entirely, so nothing has verified the
+    // opening a view sends nothing, so at that point nothing has verified the
     // host at all; and the session STATE this returns drives the header's
     // status dot, which would otherwise read "unknown" for a whole interval on
     // every session opened. Under StrictMode the effect runs twice and the

@@ -1,12 +1,5 @@
 import type { GateApprovalAction, LiveFrameSource, LooprigTransport } from "@looprig/protocol";
-import {
-  useAttachOrRestore,
-  useComposer,
-  useConnection,
-  useGate,
-  useInterrupt,
-  useSessionView,
-} from "@looprig/react";
+import { useComposer, useConnection, useGate, useInterrupt, useSessionView } from "@looprig/react";
 import { Composer } from "../components/composer";
 import { InterruptButton } from "../components/interrupt-button";
 import { StatusDot } from "../components/status-dot";
@@ -19,12 +12,6 @@ export interface SessionDetailPageProps {
   transport: LooprigTransport;
   liveSource: LiveFrameSource;
   /**
-   * True for a session this tab just created. `handleCreate` calls
-   * `registry.put` before it returns 201, so restoring it is a wasted round
-   * trip.
-   */
-  alreadyLive?: boolean;
-  /**
    * How often to check that the host is still reachable, and how long it may
    * stay unreachable before the page says so. Configuration, not a test seam —
    * though the tests do use it, because the defaults are measured in seconds.
@@ -33,22 +20,21 @@ export interface SessionDetailPageProps {
 }
 
 /**
- * The session view: attach, then header, transcript, gates and composer.
+ * The session view: header, transcript, gates and composer.
  *
- * ## Attach comes first, and gates everything else
+ * ## Opening a view sends nothing
  *
- * `/events`, `/input`, `/gates` and `/interrupt` all resolve `{sid}` against
- * the LIVE registry, so a cold session 404s on every one of them. `POST
- * /restore` is attach-or-restore — 200 `{restored:false}` for an
- * already-registered sid — so it is safe for a second tab and a second click as
- * well as for a genuinely cold session, and nothing else may run until it has
- * succeeded. That is why the live half lives in its own component: mounting it
- * is what starts the SSE connection, and `useSessionView` has no "not yet"
- * mode.
+ * This page used to `POST /restore` before it would render anything at all, so
+ * merely LOOKING at a cold session placed it — and a list of ten sessions was
+ * ten placements away from being browsable. Placement is the consequence of a
+ * command, so it happens when the user submits input, answers a gate or
+ * interrupts, and never because a route was opened. `use-session-reachability`
+ * still asks the host how the session is doing; that is a read.
  *
- * 404 is terminal (the rig itself reported no such session); every other
- * failure maps to a generic 500, which is where a concurrent cold restore that
- * lost the session lease lands, so it gets a retry.
+ * The residual gap is the legacy plane's, not this page's: `/events`, `/input`,
+ * `/gates` and `/interrupt` resolve `{sid}` against a LIVE registry, so a cold
+ * session is unreadable there until something places it. Factory's durable read
+ * plane is what closes that, and runbook 06's U5.1/U5.2 own the cut-over.
  *
  * ## Gates are not transcript rows
  *
@@ -61,98 +47,8 @@ export function SessionDetailPage({
   sid,
   transport,
   liveSource,
-  alreadyLive,
   reachability,
 }: SessionDetailPageProps): React.JSX.Element {
-  const attach = useAttachOrRestore(transport, sid, { alreadyLive: alreadyLive ?? false });
-
-  if (attach.state === "attaching") {
-    return (
-      <Shell sid={sid}>
-        <div role="status" data-testid="detail-attaching" className="flex items-center gap-2 p-8 text-muted">
-          <span
-            aria-hidden="true"
-            className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent"
-          />
-          <span>Connecting to the session…</span>
-        </div>
-      </Shell>
-    );
-  }
-
-  if (attach.state === "not-found") {
-    return (
-      <Shell sid={sid}>
-        <div
-          role="alert"
-          data-testid="detail-not-found"
-          className="m-4 rounded-md border border-border bg-card p-6"
-        >
-          <p className="font-medium">No such session</p>
-          <p className="mt-1 font-mono text-xs text-muted">{attach.error?.message}</p>
-        </div>
-      </Shell>
-    );
-  }
-
-  if (attach.state === "error") {
-    return (
-      <Shell sid={sid}>
-        <div
-          role="alert"
-          data-testid="detail-attach-error"
-          className="m-4 rounded-md border border-fail/50 bg-fail/10 p-6 text-fail"
-        >
-          <p className="font-medium">Couldn&rsquo;t open this session</p>
-          <p className="mt-1 font-mono text-xs">{attach.error?.message}</p>
-          <button
-            type="button"
-            data-testid="detail-retry"
-            onClick={attach.retry}
-            className="mt-3 rounded-md border border-fail px-3 py-1 text-xs font-medium text-fail"
-          >
-            Try again
-          </button>
-        </div>
-      </Shell>
-    );
-  }
-
-  return (
-    <LiveSession
-      sid={sid}
-      transport={transport}
-      liveSource={liveSource}
-      {...(reachability === undefined ? {} : { reachability })}
-    />
-  );
-}
-
-/** The frame every state shares, so the session's identity never disappears. */
-function Shell({ sid, children }: { sid: string; children: React.ReactNode }): React.JSX.Element {
-  return (
-    <main className="flex h-dvh flex-col">
-      <header className="flex items-center gap-3 border-b border-border px-4 py-3">
-        <span data-testid="detail-session-id" className="font-mono text-xs text-muted">
-          {sid}
-        </span>
-      </header>
-      {children}
-    </main>
-  );
-}
-
-function LiveSession({
-  sid,
-  transport,
-  liveSource,
-  reachability,
-}: {
-  sid: string;
-  transport: LooprigTransport;
-  liveSource: LiveFrameSource;
-  reachability?: ReachabilityOptions;
-}): React.JSX.Element {
   const { store } = useSessionView(transport, sid, liveSource);
   const connection = useConnection(store);
   const reach = useSessionReachability(transport, sid, store, reachability ?? {});

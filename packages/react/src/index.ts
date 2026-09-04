@@ -21,16 +21,22 @@ export {
   type SessionViewOptions,
   type UseSessionViewResult,
 } from "./use-session-view.js";
+// Opening a session view is a READ. `useAttachOrRestore` was deleted rather
+// than deprecated in U4.2: `@looprig/react` is `private: true`, has never been
+// published, and the only consumer in or out of this repository is `app/` —
+// there was no external caller a compatibility shim could have been for.
+export {
+  useFactorySessionView,
+  type FactoryColdReads,
+  type FactorySessionViewOptions,
+  type FactorySessionViewState,
+  type PublicJournalEvent,
+  type UseFactorySessionViewResult,
+} from "./use-session-view.js";
 export { useRowCount, useTranscriptRow } from "./use-transcript-row.js";
 export { useComposer, type UseComposerResult } from "./use-composer.js";
 export { GATE_APPROVAL_ACTIONS, useGate, type OpenGate, type UseGateResult } from "./use-gate.js";
 export { useInterrupt, type InterruptSnapshot, type UseInterruptResult } from "./use-interrupt.js";
-export {
-  useAttachOrRestore,
-  type AttachOptions,
-  type AttachState,
-  type UseAttachOrRestoreResult,
-} from "./use-attach-or-restore.js";
 // The connection plane. `SessionViewSnapshot` carries neither liveness nor
 // errors — they arrive on the store's own two out-of-band channels — so these
 // are how a component renders either. See use-connection.ts.

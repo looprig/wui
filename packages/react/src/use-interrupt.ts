@@ -51,8 +51,10 @@ export interface UseInterruptResult extends InterruptSnapshot {
  * process.
  *
  * `POST /v1/sessions/{sid}/interrupt` resolves `{sid}` against the live
- * registry, so a cold session 404s with `session_not_found`. Call this only on
- * a session `useAttachOrRestore` has reported ready.
+ * registry, so a cold session 404s with `session_not_found`. That is a property
+ * of the LEGACY plane, and it is not a reason to place a session on the way in:
+ * opening a view is a read, and this returns the 404 as an error rather than
+ * having something restore the session first so that a control can be shown.
  */
 export function useInterrupt(transport: LooprigTransport, sessionId: string): UseInterruptResult {
   const store = useMemo(() => new InterruptStore(transport, sessionId), [transport, sessionId]);

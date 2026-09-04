@@ -14,7 +14,7 @@ import { SessionDetailPage } from "./session-detail-page";
  * in Phase 4, and recorded in `packages/react/src/testing/strict.tsx`.
  */
 describe("SessionDetailPage under StrictMode", () => {
-  it("issues one restore and leaves exactly one live connection open", async () => {
+  it("issues no restore and leaves exactly one live connection open", async () => {
     const transport = new FakeTransport();
     const live = new ControlledLiveSource();
     render(
@@ -29,10 +29,10 @@ describe("SessionDetailPage under StrictMode", () => {
     );
     await expect.element(page.getByTestId("composer-input")).toBeInTheDocument();
 
-    // One POST. `useAttachOrRestore` caches the in-flight attempt on a ref
-    // keyed by sid plus a retry nonce, and the remount re-enters with the SAME
-    // key — so a second restore here would mean that dedupe had been lost.
-    expect(transport.restoreCalls).toEqual([SID]);
+    // No POST, from either mount. A StrictMode remount used to be the case a
+    // deduped restore had to survive; there is nothing left to dedupe, because
+    // opening a view sends nothing at all.
+    expect(transport.restoreCalls).toEqual([]);
 
     // The connection COUNT is deliberately not asserted: a remount legitimately
     // opens a second one. What must hold is that the first was closed, so the

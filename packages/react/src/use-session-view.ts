@@ -1,11 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import {
   SessionViewStore,
+  type FactoryJournalOptions,
+  type FactoryPageOptions,
+  type FactoryPublication,
+  type FactorySessionStatus,
   type JournalReader,
   type LiveFrameSource,
+  type PublicGatePage,
+  type PublicJournalPage,
+  type RequestOptions,
+  type SessionReset,
   type SessionView,
   type SessionViewStoreOptions,
 } from "@looprig/protocol";
+import { asError, Publisher } from "./stores/publisher.js";
+import { useSessionBinding } from "./use-connection.js";
 import { useStore } from "./use-store.js";
 
 export interface SessionViewOptions {
@@ -95,4 +105,331 @@ export function useSessionView(
     () => ({ version: snapshot.version, view: snapshot.view, store }),
     [snapshot, store],
   );
+}
+
+// --- The Factory cold-read + join state machine -------------------------------
+
+/** One public journal event, in the shape a tail page and a publication share. */
+export type PublicJournalEvent = PublicJournalPage["events"][number];
+
+/**
+ * The three durable reads a session view opens with. Narrow on purpose: a real
+ * `FactoryReads` (and so `FactoryClient.reads`) satisfies it structurally, so a
+ * caller needs no adapter and a test double needs three methods rather than
+ * seven.
+ */
+export interface FactoryColdReads {
+  readStatus(sessionId: string, options?: RequestOptions): Promise<FactorySessionStatus>;
+  listGates(sessionId: string, options?: FactoryPageOptions): Promise<PublicGatePage>;
+  readJournal(sessionId: string, options?: FactoryJournalOptions): Promise<PublicJournalPage>;
+}
+
+/**
+ * `"joining"` before the binding's first authorization, `"reading"` while a
+ * cold read is in flight, `"ready"` once one has landed, `"failed"` once one
+ * has failed. A repair goes back to `"reading"`; a `"ready"` view keeps its
+ * events while it repairs.
+ */
+export type FactorySessionViewState = "joining" | "reading" | "ready" | "failed";
+
+export interface FactorySessionViewOptions {
+  tenantId: string;
+  sessionId: string;
+  /**
+   * Greatest sequence the application has already durably applied. Read ONCE,
+   * at construction, like `FactoryLinkProvider`'s `options`: a value that moved
+   * later would have to rebuild the accumulated view to mean anything.
+   */
+  coveredThrough?: number;
+  /** Bound on the one tail read per join. Default 256, matching protocol's join. */
+  tailLimit?: number;
+}
+
+export interface UseFactorySessionViewResult {
+  readonly state: FactorySessionViewState;
+  /** The durable session/residency projection, or null before the first read. */
+  readonly status: FactorySessionStatus | null;
+  /** The bounded public gate projection, or null before the first read. */
+  readonly gates: PublicGatePage | null;
+  /** Every public event this view holds, ascending by `journal_seq`. */
+  readonly events: readonly PublicJournalEvent[];
+  /** Greatest sequence this view has covered, from a page or a publication. */
+  readonly coveredThrough: number;
+  /** The last error seen, from a cold read or from the binding. */
+  readonly error: Error | null;
+}
+
+const DEFAULT_TAIL_LIMIT = 256;
+
+const COLD: Omit<UseFactorySessionViewResult, "coveredThrough"> = {
+  state: "joining",
+  status: null,
+  gates: null,
+  events: [],
+  error: null,
+};
+
+/**
+ * Accumulates one session's durable plane from a cold read plus the live
+ * publications of an already-open subscription.
+ *
+ * ## Why the read is triggered by the binding, not by mounting
+ *
+ * A read issued at mount races the subscription: an event committed between the
+ * page being built and the channel being authorized is in neither, and is lost
+ * with nothing to notice it. The binding's `onJoin`/`onRejoin` fire when the
+ * subscription is authorized, so every read here starts with the channel
+ * already open — which is what makes the two sources jointly complete. That is
+ * the whole reason `onJoin` exists on `SessionBindingOptions`.
+ *
+ * ## What makes it exactly-once
+ *
+ * Events are keyed by `journal_seq`, which the wire contract makes monotonic
+ * and unique within a session. An event that lands in BOTH the page and the
+ * channel — the ordinary case for anything committed inside the read window —
+ * is one key, written twice. Nothing depends on which arrived first, so no
+ * buffering, no window and no drain ordering is needed.
+ *
+ * ## What it deliberately does NOT do
+ *
+ *  - It does not detect a gap. A page whose `covered_through` is below its own
+ *    `journal_tip`, or a live sequence beyond what the tail reached, leaves a
+ *    hole this class neither sees nor repairs; `joinFactorySessionView` in
+ *    `@looprig/protocol` is where that bound lives.
+ *  - It does not fold. `events` are wire events, not transcript rows.
+ *  - It drops ephemeral publications, which carry no sequence and so have no
+ *    place in a `journal_seq`-keyed accumulation.
+ *
+ * Nothing here imports React.
+ */
+class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
+  readonly #tenantId: string;
+  readonly #sessionId: string;
+  readonly #reads: () => FactoryColdReads;
+  readonly #tailLimit: () => number;
+  readonly #events = new Map<number, PublicJournalEvent>();
+  #coveredThrough: number;
+  #running = false;
+  /**
+   * Bumped by every read, every stop and every start, and captured by the read
+   * that started it. A read whose generation is no longer current commits
+   * nothing — which is what makes a superseded repair, and a read that lands
+   * after unmount, inert.
+   */
+  #generation = 0;
+  #controller: AbortController | undefined;
+
+  constructor(
+    tenantId: string,
+    sessionId: string,
+    coveredThrough: number,
+    reads: () => FactoryColdReads,
+    tailLimit: () => number,
+  ) {
+    super({ ...COLD, coveredThrough });
+    this.#tenantId = tenantId;
+    this.#sessionId = sessionId;
+    this.#coveredThrough = coveredThrough;
+    this.#reads = reads;
+    this.#tailLimit = tailLimit;
+  }
+
+  /**
+   * Reversible, because React's StrictMode mounts, unmounts and mounts again
+   * over ONE memoized instance. A stop that could not be undone would leave the
+   * second mount bound to a machine that ignores its own subscription.
+   */
+  start(): void {
+    this.#running = true;
+    this.#generation += 1;
+  }
+
+  stop(): void {
+    this.#running = false;
+    this.#generation += 1;
+    this.#controller?.abort();
+    this.#controller = undefined;
+  }
+
+  /** The binding's subscription is authorized: read the durable plane. */
+  join(): void {
+    if (!this.#running) return;
+    // The previous read is abandoned rather than awaited: it was taken against
+    // a subscription that is no longer the one delivering.
+    this.#controller?.abort();
+    const controller = new AbortController();
+    this.#controller = controller;
+    const generation = (this.#generation += 1);
+    this.publish({ state: "reading" });
+    void this.#read(generation, controller);
+  }
+
+  publication(value: FactoryPublication): void {
+    if (!this.#running) return;
+    if (value.tenant_id !== this.#tenantId || value.session_id !== this.#sessionId) {
+      // Never applied, and never trusted to move the cursor. A frame for
+      // another channel means this subscription is not what it claims to be, so
+      // the durable plane is re-read rather than believed.
+      this.join();
+      return;
+    }
+    if (value.type !== "enduring_publication") return;
+    this.#events.set(value.journal_seq, {
+      event_id: value.event_id,
+      journal_seq: value.journal_seq,
+      body: value.body,
+    });
+    this.#cover(value.covered_through);
+    this.publish({ events: this.#ordered(), coveredThrough: this.#coveredThrough });
+  }
+
+  /**
+   * `last_contiguous` is the greatest sequence the Factory still holds. Anything
+   * above it is gone, so it is DISCARDED rather than kept: a view that held on
+   * to events the server has truncated would show a transcript no read can ever
+   * reproduce. A reset naming another session still forces a repair but moves
+   * nothing, exactly as `joinFactorySessionView` treats a forged one.
+   */
+  reset(value: SessionReset): void {
+    if (!this.#running) return;
+    if (value.tenant_id === this.#tenantId && value.session_id === this.#sessionId) {
+      for (const sequence of [...this.#events.keys()]) {
+        if (sequence > value.last_contiguous) this.#events.delete(sequence);
+      }
+      if (this.#coveredThrough > value.last_contiguous) this.#coveredThrough = value.last_contiguous;
+      this.publish({ events: this.#ordered(), coveredThrough: this.#coveredThrough });
+    }
+    this.join();
+  }
+
+  /**
+   * Recorded, not acted on. A subscription error is followed by the link store
+   * rejoining this binding on the next connection, and that rejoin is what
+   * re-reads; retrying from here would be the same loop `#onBindingError`
+   * exists to refuse.
+   */
+  fail(error: Error): void {
+    if (!this.#running) return;
+    this.publish({ error });
+  }
+
+  get coveredThrough(): number {
+    return this.#coveredThrough;
+  }
+
+  async #read(generation: number, controller: AbortController): Promise<void> {
+    const reads = this.#reads();
+    const limit = this.#tailLimit();
+    try {
+      const [status, gates, page] = await Promise.all([
+        reads.readStatus(this.#sessionId, { signal: controller.signal }),
+        reads.listGates(this.#sessionId, { limit, signal: controller.signal }),
+        reads.readJournal(this.#sessionId, { tail: limit, limit, signal: controller.signal }),
+      ]);
+      if (generation !== this.#generation) return;
+      for (const event of page.events) this.#events.set(event.journal_seq, event);
+      this.#cover(page.covered_through);
+      this.publish({
+        state: "ready",
+        status,
+        gates,
+        events: this.#ordered(),
+        coveredThrough: this.#coveredThrough,
+        error: null,
+      });
+    } catch (cause) {
+      if (generation !== this.#generation) return;
+      this.publish({ state: "failed", error: asError(cause) });
+    }
+  }
+
+  #cover(sequence: number): void {
+    if (sequence > this.#coveredThrough) this.#coveredThrough = sequence;
+  }
+
+  #ordered(): readonly PublicJournalEvent[] {
+    return [...this.#events.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, event]) => event);
+  }
+}
+
+/**
+ * Opens one session's durable view over the application's Factory link.
+ *
+ * Opening a view is a READ. This hook subscribes, reads status, the public gate
+ * projection and a bounded tail, and reconciles them; it sends nothing. That is
+ * the whole difference from the `useAttachOrRestore` it replaces, which made a
+ * `POST /restore` the precondition of rendering anything at all — so merely
+ * looking at a cold session placed it, and a list of ten sessions was ten
+ * placements away from being browsable.
+ *
+ * Placement is a consequence of a COMMAND. `FactoryClient.commands` is where
+ * one is sent, from an explicit user action, and `use-connection.ts`'s
+ * `useFactoryClient` is how a component reaches it.
+ *
+ * `reads` and `tailLimit` are read through refs: both are inline at every real
+ * call site (`useFactoryClient().reads` is stable, but a caller composing its
+ * own three-method object is not), and depending on their identity would
+ * restart the join on every render.
+ */
+export function useFactorySessionView(
+  reads: FactoryColdReads,
+  options: FactorySessionViewOptions,
+): UseFactorySessionViewResult {
+  const { tenantId, sessionId } = options;
+  const tailLimit = options.tailLimit ?? DEFAULT_TAIL_LIMIT;
+
+  const readsRef = useRef(reads);
+  const tailLimitRef = useRef(tailLimit);
+  // No dependency array: the ref holds what the last RENDERED tree passed, and
+  // a render-phase write would be unsafe under concurrent rendering. Nothing
+  // reads either before the binding's first authorization, which is an effect.
+  useEffect(() => {
+    readsRef.current = reads;
+    tailLimitRef.current = tailLimit;
+  });
+
+  const initialCoveredThrough = useRef(options.coveredThrough ?? 0);
+  const machine = useMemo(
+    () =>
+      new FactoryColdJoin(
+        tenantId,
+        sessionId,
+        initialCoveredThrough.current,
+        () => readsRef.current,
+        () => tailLimitRef.current,
+      ),
+    // Safe to double-invoke and discard in StrictMode: the constructor opens
+    // nothing and issues no read. Everything starts from an effect below.
+    [tenantId, sessionId],
+  );
+
+  useEffect(() => {
+    machine.start();
+    return () => {
+      machine.stop();
+    };
+  }, [machine]);
+
+  const binding = useSessionBinding({
+    tenantId,
+    sessionId,
+    cursor: initialCoveredThrough.current,
+    onJoin: () => machine.join(),
+    onRejoin: () => machine.join(),
+    onPublication: (publication) => machine.publication(publication),
+    onReset: (value) => machine.reset(value),
+    onError: (error) => machine.fail(error),
+  });
+
+  const snapshot = useStore(machine);
+  // Records durable coverage on the binding, which is what a later `onRejoin`
+  // reports and what a reconnect resumes from. Done in an effect rather than
+  // inside the machine so that nothing in `src/stores/` has to know a binding
+  // exists.
+  useEffect(() => {
+    binding.advance(snapshot.coveredThrough);
+  }, [binding, snapshot]);
+  return snapshot;
 }

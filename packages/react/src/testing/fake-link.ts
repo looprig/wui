@@ -261,8 +261,28 @@ export class FakeClientLink implements ClientLink {
     return subscription;
   }
 
-  rpc(): Promise<CommandStatus> {
-    return Promise.resolve({ command_id: "fake", status: "accepted" });
+  /**
+   * Every command this link was asked to send, in order.
+   *
+   * This is the reader that makes "opening a session sends no restore or
+   * admission command" an assertion about behaviour rather than about types:
+   * `PendingCommand.submit()` reaches the transport ONLY here, whatever hook or
+   * store called it, so an empty list is a claim over the whole plane rather
+   * than over one hook's imports.
+   */
+  readonly rpcCalls: { method: string; request: unknown }[] = [];
+
+  rpc(method: string, request: unknown): Promise<CommandStatus> {
+    this.rpcCalls.push({ method, request });
+    // The command id is ECHOED, not invented. `PendingCommand.submit()` throws
+    // `CommandIdentityMismatchError` on a reply naming another command, so a
+    // canned id would make every send fail — and a positive control that cannot
+    // succeed proves nothing about a negative assertion.
+    const id = (request as { command_id?: unknown }).command_id;
+    return Promise.resolve({
+      command_id: typeof id === "string" ? id : "fake",
+      status: "accepted",
+    });
   }
 
   /** Every subscription ever opened for `sessionId`, oldest first. */

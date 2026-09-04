@@ -271,6 +271,7 @@ export function useSessionBinding(options: SessionBindingOptions): SessionBindin
       cursor: optionsRef.current.cursor ?? 0,
       onPublication: (publication) => optionsRef.current.onPublication(publication),
       onReset: (reset) => optionsRef.current.onReset(reset),
+      onJoin: (cursor) => optionsRef.current.onJoin?.(cursor),
       onRejoin: (cursor) => optionsRef.current.onRejoin?.(cursor),
       onError: (error) => optionsRef.current.onError?.(error),
     });
