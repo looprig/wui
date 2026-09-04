@@ -136,10 +136,12 @@ export interface FactorySessionViewOptions {
   tenantId: string;
   sessionId: string;
   /**
-   * Greatest sequence the application has already durably applied. It is a
-   * construction input, so CHANGING it rebuilds the machine and starts the
-   * session over from that cursor — a value that moved without rebuilding
-   * would describe an accumulation that never happened.
+   * Greatest sequence the application has already durably applied.
+   *
+   * A construction input, read when this view's machine is built — which is
+   * when the session identity changes, not on every render. Moving it alone
+   * does nothing until then, and the alternative is worse rather than
+   * stricter: see the memo in `useFactorySessionView`.
    */
   coveredThrough?: number;
   /** Bound on the one tail read per join. Default 256, matching protocol's join. */
@@ -515,12 +517,22 @@ export function useFactorySessionView(
     tailLimitRef.current = tailLimit;
   });
 
-  // Every construction input is a memo DEPENDENCY, not a ref read from inside
-  // the factory. A ref would hold whatever the FIRST render passed for as long
-  // as the component lives, so an in-place session change — supported, since
-  // `sessionId` is a dependency here — would build cold session B's machine and
-  // binding on session A's cursor and subscribe B at a sequence measured on
-  // another journal.
+  // The construction-only inputs are read STRAIGHT FROM THE RENDER inside the
+  // factory, and are deliberately not dependencies.
+  //
+  // Not a ref, because a ref holds whatever the FIRST render passed for as long
+  // as the component lives: an in-place session change — supported, since
+  // `sessionId` IS a dependency — would then build cold session B's machine and
+  // binding on session A's cursor, and subscribe B at a sequence measured on
+  // another journal. Reading the current render's value means every rebuild
+  // gets the caller's value at that moment.
+  //
+  // And not dependencies, because the binding below is keyed on the session
+  // alone. A machine rebuilt without a rebind is never authorized, so `onJoin`
+  // never fires and it never reads: changing `coveredThrough` alone would
+  // replace a working view with a permanently "joining" one. Measured. These
+  // therefore take effect at the next session change, which is the only moment
+  // a fresh cursor means anything anyway.
   const machine = useMemo(
     () =>
       new FactoryColdJoin(
@@ -534,7 +546,8 @@ export function useFactorySessionView(
       ),
     // Safe to double-invoke and discard in StrictMode: the constructor opens
     // nothing and issues no read. Everything starts from an effect below.
-    [tenantId, sessionId, coveredThrough, maxRepairAttempts, repairDelayMs],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see above
+    [tenantId, sessionId],
   );
 
   useEffect(() => {

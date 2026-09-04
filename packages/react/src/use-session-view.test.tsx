@@ -699,3 +699,22 @@ test("a repair never flashes failed between the abort and the replacement read",
   expect(states).not.toContain("failed");
   expect(h.view.current?.error).toBeNull();
 });
+
+test("changing coveredThrough alone leaves the working view alone", async () => {
+  // The documented no-op, pinned so that nobody turns it into a dependency.
+  // `useSessionBinding` is keyed on the session, so a machine rebuilt without a
+  // rebind is never authorized, never fires `onJoin` and never reads —
+  // measured: adding `coveredThrough` to the memo's dependencies replaces a
+  // working view with a permanently "joining" one. It takes effect at the next
+  // session change, which is the only moment a fresh cursor means anything.
+  const h = await mountFactoryView({ props: { coveredThrough: 40 } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+
+  await h.rerender({ coveredThrough: 80 });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  expect(h.view.current?.state).toBe("ready");
+  expect(h.view.current?.coveredThrough).toBe(40);
+  expect(h.reads.of("readStatus")).toHaveLength(1);
+  expect(h.link.open).toHaveLength(1);
+});
