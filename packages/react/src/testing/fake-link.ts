@@ -65,6 +65,7 @@
  *    accessor to reach for when the question is what a live subscription
  *    delivers.
  */
+import { RealtimeTransportError } from "@looprig/protocol";
 import type {
   ClientLink,
   ClientLinkState,
@@ -78,6 +79,23 @@ import type {
 } from "@looprig/protocol";
 
 const NEGOTIATED: VersionNegotiationResponse = { version: 1 };
+
+/**
+ * One command this link was asked to send, plus the settlement the test owns.
+ *
+ * `settle` merges over `{ command_id: <echoed>, status: "accepted" }`, so a
+ * test that wants a rejection writes only what differs and never has to
+ * re-state the echo the identity check depends on.
+ */
+export interface FakeRpcCall {
+  readonly method: string;
+  readonly request: unknown;
+  /** The `command_id` this call carried, and the one its reply will echo. */
+  readonly commandId: string;
+  settled: boolean;
+  settle(patch?: Partial<CommandStatus>): void;
+  fail(error: Error): void;
+}
 
 /**
  * The real link's channel grammar is reversible, so one channel per
@@ -228,13 +246,22 @@ export class FakeClientLink implements ClientLink {
     this.#state = "disconnected";
   }
 
-  /** Loses the connection underneath every open subscription. */
+  /**
+   * Loses the connection underneath every open subscription AND every command
+   * still awaiting a reply.
+   *
+   * The second half mirrors Centrifuge, which rejects an in-flight RPC when the
+   * transport goes down: that is precisely the moment a client learns nothing
+   * about whether the command was admitted, so a fake that left those replies
+   * pending would make the ambiguous case unreachable.
+   */
   drop(reason = "connection lost"): void {
     if (this.#state === "connected") this.liveConnections -= 1;
     this.#state = "disconnected";
     for (const subscription of this.subscriptions) {
       if (subscription.state === "subscribed") subscription.fail(new Error(reason));
     }
+    for (const call of this.outstanding) call.fail(new RealtimeTransportError(reason));
   }
 
   subscribe(options: SubscribeOptions): ClientSubscription {
@@ -269,20 +296,53 @@ export class FakeClientLink implements ClientLink {
    * `PendingCommand.submit()` reaches the transport ONLY here, whatever hook or
    * store called it, so an empty list is a claim over the whole plane rather
    * than over one hook's imports.
+   *
+   * Each entry also carries its own settlement, so a test can hold a command
+   * open, answer it with a durable status, or lose its reply. The real link
+   * settles an RPC exactly once; `settle` and `fail` here are therefore no-ops
+   * after the first, whichever ran.
    */
-  readonly rpcCalls: { method: string; request: unknown }[] = [];
+  readonly rpcCalls: FakeRpcCall[] = [];
+  /** While true, every `rpc` stays pending until the test settles its call. */
+  holdRpc = false;
 
   rpc(method: string, request: unknown): Promise<CommandStatus> {
-    this.rpcCalls.push({ method, request });
     // The command id is ECHOED, not invented. `PendingCommand.submit()` throws
     // `CommandIdentityMismatchError` on a reply naming another command, so a
     // canned id would make every send fail — and a positive control that cannot
     // succeed proves nothing about a negative assertion.
     const id = (request as { command_id?: unknown }).command_id;
-    return Promise.resolve({
-      command_id: typeof id === "string" ? id : "fake",
-      status: "accepted",
+    const commandId = typeof id === "string" ? id : "fake";
+    let settle!: (status: CommandStatus) => void;
+    let reject!: (error: Error) => void;
+    const reply = new Promise<CommandStatus>((res, rej) => {
+      settle = res;
+      reject = rej;
     });
+    const call: FakeRpcCall = {
+      method,
+      request,
+      commandId,
+      settled: false,
+      settle: (patch = {}) => {
+        if (call.settled) return;
+        call.settled = true;
+        settle({ command_id: commandId, status: "accepted", ...patch });
+      },
+      fail: (error: Error) => {
+        if (call.settled) return;
+        call.settled = true;
+        reject(error);
+      },
+    };
+    this.rpcCalls.push(call);
+    if (!this.holdRpc) call.settle();
+    return reply;
+  }
+
+  /** The calls still awaiting a settlement, oldest first. */
+  get outstanding(): FakeRpcCall[] {
+    return this.rpcCalls.filter((call) => !call.settled);
   }
 
   /** Every subscription ever opened for `sessionId`, oldest first. */

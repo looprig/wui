@@ -1,6 +1,20 @@
+import {
+  CoreCommandRejectedError,
+  CoreInvalidRequestError,
+  CoreSessionNotFoundError,
+  createFactoryCommands,
+} from "@looprig/protocol";
+import type { FactoryCommands } from "@looprig/protocol";
 import { expect, test } from "vitest";
+import { FakeClientLink } from "../testing/fake-link.js";
 import { FakeTransport, SID } from "../testing/fake-transport.js";
-import { SessionComposerStore } from "./composer.js";
+import {
+  COMPOSER_COMMAND_KEY,
+  FactoryComposerStore,
+  retainedComposerText,
+  SessionComposerStore,
+} from "./composer.js";
+import type { PendingCommandView } from "./pending.js";
 
 const CMD = "aabbccdd-1122-4334-8556-778899aabbcc";
 const OTHER_CMD = "11223344-5566-4778-899a-abbccddeeff0";
@@ -116,4 +130,295 @@ test("clearError only publishes when there is an error to clear", async () => {
 
   expect(store.snapshot().error).toBeNull();
   expect(notifies).toBe(1);
+});
+
+// --- FactoryComposerStore: one identity per action ----------------------------
+
+function plane(): { link: FakeClientLink; commands: FactoryCommands } {
+  const link = new FakeClientLink();
+  let minted = 0;
+  const commands = createFactoryCommands({
+    link,
+    idGenerator: () => {
+      minted += 1;
+      return `cmd-${minted}`;
+    },
+  });
+  return { link, commands };
+}
+
+function composer(): { link: FakeClientLink; store: FactoryComposerStore } {
+  const { link, commands } = plane();
+  return { link, store: new FactoryComposerStore(commands, SID) };
+}
+
+function retained(store: FactoryComposerStore): PendingCommandView | null {
+  return store.snapshot().pending.get(COMPOSER_COMMAND_KEY) ?? null;
+}
+
+test("an accepted submit sends one envelope and retains nothing", async () => {
+  const { link, store } = composer();
+
+  const result = await store.submit("  ship it  ");
+
+  expect(result).toMatchObject({ outcome: "accepted", commandId: "cmd-1" });
+  expect(link.rpcCalls.map((call) => call.method)).toStrictEqual(["session.input"]);
+  // Trimmed before it was SENT, and Go-cased, exactly as the legacy path is.
+  expect(link.rpcCalls[0]!.request).toStrictEqual({
+    version: 1,
+    command_id: "cmd-1",
+    session_id: SID,
+    blocks: [{ type: "text", Text: "ship it" }],
+  });
+  expect(retained(store)).toBeNull();
+});
+
+test("rapid repeat submits are one logical command, however many clicks land", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+
+  const inFlight = store.submit("one");
+  const repeats = [store.submit("one"), store.submit("one"), store.submit("two")];
+
+  // Read the count BEFORE awaiting: `send` reaches `link.rpc` synchronously, so
+  // a repeat that minted its own envelope is visible here — and a store that
+  // sent four held commands would never settle the await below, turning an
+  // assertion kill into a hang, which is not the same evidence.
+  expect(link.rpcCalls).toHaveLength(1);
+  // Every repeat names the FIRST command rather than minting its own.
+  await expect(Promise.all(repeats)).resolves.toStrictEqual([
+    { outcome: "refused", commandId: "cmd-1" },
+    { outcome: "refused", commandId: "cmd-1" },
+    { outcome: "refused", commandId: "cmd-1" },
+  ]);
+  expect(link.rpcCalls).toHaveLength(1);
+  link.rpcCalls[0]!.settle();
+  await expect(inFlight).resolves.toMatchObject({ outcome: "accepted", commandId: "cmd-1" });
+});
+
+test("a reply lost to a disconnect retains the envelope for a retry", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const first = store.submit("one");
+  await expect.poll(() => retained(store)?.sending).toBe(true);
+
+  link.drop();
+
+  await expect(first).resolves.toMatchObject({ outcome: "unknown", commandId: "cmd-1" });
+  expect(retained(store)).toMatchObject({ commandId: "cmd-1", sending: false });
+  expect(store.snapshot().errors.get(COMPOSER_COMMAND_KEY)).toBeInstanceOf(Error);
+});
+
+test("a retry replays the identical envelope rather than minting a second command", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const first = store.submit("one");
+  link.drop();
+  await first;
+  link.holdRpc = false;
+
+  await expect(store.retry()).resolves.toMatchObject({ outcome: "accepted", commandId: "cmd-1" });
+
+  expect(link.rpcCalls).toHaveLength(2);
+  // Byte-identical, not merely same-id: a replay that re-serialised the blocks
+  // could send a different turn under an identity that promises it did not.
+  expect(link.rpcCalls[1]!.request).toStrictEqual(link.rpcCalls[0]!.request);
+  expect(retained(store)).toBeNull();
+});
+
+test("the retained text is what a retry will replay, not what was typed after it", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const first = store.submit("one");
+  link.drop();
+  await first;
+
+  const refused = store.submit("two");
+  expect(link.rpcCalls).toHaveLength(1);
+  await expect(refused).resolves.toStrictEqual({ outcome: "refused", commandId: "cmd-1" });
+
+  expect(retainedComposerText(retained(store)!.request)).toBe("one");
+});
+
+test("a rejected status is definitive, typed, and releases the envelope", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const first = store.submit("one");
+  await expect.poll(() => link.outstanding).toHaveLength(1);
+
+  link.rpcCalls[0]!.settle({
+    status: "rejected",
+    error: { code: "session_not_found", message: "gone", retryable: false },
+  });
+
+  const result = await first;
+  expect(result.outcome).toBe("rejected");
+  expect(store.snapshot().errors.get(COMPOSER_COMMAND_KEY)).toBeInstanceOf(CoreSessionNotFoundError);
+  expect(retained(store)).toBeNull();
+});
+
+test("a rejected status with no detail is still typed, from Core's own vocabulary", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const first = store.submit("one");
+  await expect.poll(() => link.outstanding).toHaveLength(1);
+
+  link.rpcCalls[0]!.settle({ status: "rejected" });
+
+  await expect(first).resolves.toMatchObject({ outcome: "rejected" });
+  expect(store.snapshot().errors.get(COMPOSER_COMMAND_KEY)).toBeInstanceOf(CoreCommandRejectedError);
+});
+
+test("a rejection raised by the link itself is equally definitive", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const first = store.submit("one");
+  await expect.poll(() => link.outstanding).toHaveLength(1);
+
+  link.rpcCalls[0]!.fail(
+    new CoreInvalidRequestError({ error: { code: "invalid_request", retryable: false } }),
+  );
+
+  await expect(first).resolves.toMatchObject({ outcome: "rejected", commandId: "cmd-1" });
+  expect(retained(store)).toBeNull();
+});
+
+test.each(["accepted", "applied"] as const)("%s is durable and releases the envelope", async (status) => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const first = store.submit("one");
+  await expect.poll(() => link.outstanding).toHaveLength(1);
+
+  link.rpcCalls[0]!.settle({ status, accepted_order: 3 });
+
+  const result = await first;
+  expect(result).toMatchObject({ outcome: "accepted" });
+  // The durable record itself is carried through, not just the verdict: a
+  // caller that wants the admitted order has it without a second read.
+  expect(result.outcome === "accepted" && result.status).toStrictEqual({
+    command_id: "cmd-1",
+    status,
+    accepted_order: 3,
+  });
+  expect(retained(store)).toBeNull();
+});
+
+test("a pending status is not durable and keeps the envelope retryable", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const first = store.submit("one");
+  await expect.poll(() => link.outstanding).toHaveLength(1);
+
+  link.rpcCalls[0]!.settle({ status: "pending" });
+
+  const result = await first;
+  expect(result).toMatchObject({ outcome: "pending", commandId: "cmd-1" });
+  expect(result.outcome === "pending" && result.status.status).toBe("pending");
+  expect(retained(store)).toMatchObject({ commandId: "cmd-1", sending: false });
+  expect(store.snapshot().errors.get(COMPOSER_COMMAND_KEY)).toBeUndefined();
+});
+
+test("cancel withdraws the envelope and discards the reply that lands after it", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const first = store.submit("one");
+  await expect.poll(() => retained(store)?.sending).toBe(true);
+
+  store.cancel();
+  link.rpcCalls[0]!.settle();
+
+  await expect(first).resolves.toStrictEqual({ outcome: "cancelled", commandId: "cmd-1" });
+  expect(retained(store)).toBeNull();
+  // The next action is a NEW logical command: the user withdrew the first one.
+  link.holdRpc = false;
+  await expect(store.submit("two")).resolves.toMatchObject({ outcome: "accepted", commandId: "cmd-2" });
+});
+
+test("an empty draft and a retry with nothing retained both send nothing", async () => {
+  const { link, store } = composer();
+
+  await expect(store.submit("   ")).resolves.toStrictEqual({ outcome: "none" });
+  await expect(store.retry()).resolves.toStrictEqual({ outcome: "none" });
+
+  expect(link.rpcCalls).toStrictEqual([]);
+});
+
+test("clearError forgets a settled failure without publishing twice", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const first = store.submit("one");
+  await expect.poll(() => link.outstanding).toHaveLength(1);
+  link.rpcCalls[0]!.settle({ status: "rejected" });
+  await first;
+  let notifies = 0;
+  store.subscribe(() => {
+    notifies += 1;
+  });
+
+  store.clearError();
+  store.clearError();
+
+  expect(store.snapshot().errors.size).toBe(0);
+  expect(notifies).toBe(1);
+});
+
+test("two sessions on one command plane hold commands in flight at the same time", async () => {
+  const { link, commands } = plane();
+  link.holdRpc = true;
+  const one = new FactoryComposerStore(commands, "session-one");
+  const two = new FactoryComposerStore(commands, "session-two");
+
+  const first = one.submit("one");
+  const second = two.submit("two");
+
+  // The negative in the runbook — "do not globally serialize unrelated
+  // sessions" — read as a positive: BOTH are outstanding simultaneously, with
+  // distinct identities, and neither refused the other.
+  expect(link.rpcCalls.map((call) => call.commandId)).toStrictEqual(["cmd-1", "cmd-2"]);
+  expect(retained(one)?.sending).toBe(true);
+  expect(retained(two)?.sending).toBe(true);
+  link.rpcCalls[0]!.settle();
+  link.rpcCalls[1]!.settle();
+  await expect(first).resolves.toMatchObject({ outcome: "accepted", commandId: "cmd-1" });
+  await expect(second).resolves.toMatchObject({ outcome: "accepted", commandId: "cmd-2" });
+});
+
+test("a second store on the same session adopts the retained envelope and refuses to duplicate it", async () => {
+  const { link, commands } = plane();
+  link.holdRpc = true;
+  const first = new FactoryComposerStore(commands, SID);
+  const started = first.submit("one");
+  const detach = first.attach();
+
+  // What a remount does: a new store over the same command plane and session.
+  const second = new FactoryComposerStore(commands, SID);
+
+  expect(retained(second)).toMatchObject({ commandId: "cmd-1", sending: true });
+  const refused = second.submit("one");
+  expect(link.rpcCalls).toHaveLength(1);
+  await expect(refused).resolves.toStrictEqual({ outcome: "refused", commandId: "cmd-1" });
+  link.rpcCalls[0]!.settle();
+  await started;
+  detach();
+});
+
+test("one transition publishes once, attached or not", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const detach = store.attach();
+  let notifies = 0;
+  store.subscribe(() => {
+    notifies += 1;
+  });
+
+  const sent = store.submit("one");
+  expect(notifies).toBe(1);
+  link.rpcCalls[0]!.settle();
+  await sent;
+
+  // An ATTACHED store is reached through the scope's listener list; syncing
+  // itself as well would publish a second, equal snapshot for the same
+  // transition and notify every subscriber twice.
+  expect(notifies).toBe(2);
+  detach();
 });

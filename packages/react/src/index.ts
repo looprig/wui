@@ -35,6 +35,18 @@ export { useRowCount, useTranscriptRow } from "./use-transcript-row.js";
 export { useComposer, type UseComposerResult } from "./use-composer.js";
 export { GATE_APPROVAL_ACTIONS, useGate, type OpenGate, type UseGateResult } from "./use-gate.js";
 export { useInterrupt, type InterruptSnapshot, type UseInterruptResult } from "./use-interrupt.js";
+
+// The Factory control plane. Every one of these mints exactly one
+// `PendingCommand` per user action and retains it until Core reports a durable
+// accepted/applied/rejected outcome; a retry replays that same envelope rather
+// than minting a second logical command. The identity is scoped to
+// `FactoryClient.commands` and to the session, so two sessions never contend
+// and a component remount inherits an outstanding action instead of offering
+// the user a duplicate. See `stores/pending.ts`.
+export { useFactoryComposer, type UseFactoryComposerResult } from "./use-composer.js";
+export { useFactoryGate, type FactoryOpenGate, type UseFactoryGateResult } from "./use-gate.js";
+export { useFactoryInterrupt, type UseFactoryInterruptResult } from "./use-interrupt.js";
+export type { CommandResult, PendingCommandView } from "./stores/pending.js";
 // The connection plane. `SessionViewSnapshot` carries neither liveness nor
 // errors — they arrive on the store's own two out-of-band channels — so these
 // are how a component renders either. See use-connection.ts.
