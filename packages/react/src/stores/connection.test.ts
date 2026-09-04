@@ -905,8 +905,16 @@ test("a subscription that throws on unsubscribe does not strand close()", async 
     throw new Error("the socket is already gone");
   };
 
-  store.close();
+  let thrown: unknown;
+  try {
+    store.close();
+  } catch (error) {
+    // Caught so the mutant fails on an ASSERTION rather than on an exception
+    // escaping the test body, which is not the same evidence.
+    thrown = error;
+  }
 
+  expect(thrown).toBeUndefined();
   expect(store.snapshot().state).toBe("idle");
   expect(store.snapshot().bindingCount).toBe(0);
   // The teardown completed past the throw: the peer was cancelled and the link

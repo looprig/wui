@@ -921,6 +921,13 @@ test("a rejoin after a give-up reads again", async () => {
 
   await expect.poll(() => h.view.current?.state).toBe("ready");
   expect(h.reads.of("readStatus").length).toBe(reads + 1);
+
+  // And the view is RE-ARMED, not merely re-read: a fresh trigger on the new
+  // subscription schedules a repair again. Leaving `#gaveUp` set would give a
+  // view that reads once on reconnect and then ignores every signal that it is
+  // out of date, for the rest of the connection.
+  h.link.open[0]?.deliver({ ...enduringFor(9), session_id: "some-other-session" });
+  await expect.poll(() => h.reads.of("readStatus").length).toBe(reads + 2);
 });
 
 test("only tailLimit is live; the other three take effect at the next session", async () => {
