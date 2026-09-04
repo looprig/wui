@@ -774,22 +774,30 @@ test("onJoin reports the first authorization and onRejoin every later one", asyn
   store.close();
 });
 
-// M1. `close()` cancels every binding, and the cancel path re-drives a channel
-// peer. With `#bindings` still populated at that moment, the first cancel
-// re-enters `#join` -> `#ensureConnected`, which finds `#connecting` already
-// cleared and the link not yet disconnected, and starts a SECOND connect on a
-// fresh epoch. `close()` then disconnects, that connect rejects, and the
-// rejection is current — so the store publishes "failed" after it published
-// "idle". `#epoch`'s own doc says it exists to stop exactly this.
-test("closing with two bindings on one session leaves the store idle, not failed", async () => {
+// M1. `close()` cancels every binding, and a cancel that FREES A CHANNEL
+// re-drives a peer at it. With `#bindings` still populated at that moment the
+// first cancel re-enters `#join` -> `#ensureConnected`, which finds
+// `#connecting` already cleared and the link not yet disconnected, and starts a
+// SECOND connect on a fresh epoch. `close()` then disconnects, that connect
+// rejects, and the rejection is current — so the store publishes "failed" after
+// it published "idle". `#epoch`'s own doc says it exists to stop exactly this,
+// from a stale CALLER; nothing stopped it from inside.
+//
+// The socket is dropped by `disconnect()` rather than `drop()`, because a
+// transport can go without any subscription reporting an error — which is the
+// case where a binding still HOLDS its channel handle when the close arrives,
+// and so the case where the cancel frees something.
+test("closing while a binding still holds a channel over a lost link leaves the store idle", async () => {
   const link = new FakeClientLink();
-  link.holdConnect = true;
   const store = new FactoryLinkStore(link);
   store.open();
   const winner = recorder("session-a");
   const loser = recorder("session-a");
   store.bind(winner.options);
   store.bind(loser.options);
+  await expect.poll(() => link.open.length).toBe(1);
+  expect(loser.errors).toHaveLength(1);
+  link.disconnect();
 
   store.close();
   await new Promise((resolve) => setTimeout(resolve, 30));
@@ -797,21 +805,24 @@ test("closing with two bindings on one session leaves the store idle, not failed
   expect(store.snapshot().state).toBe("idle");
   expect(store.snapshot().failure).toBeNull();
   expect(store.snapshot().bindingCount).toBe(0);
-  // One connect, because the close never started a second one.
+  // One connect for the whole life of the store: the close started none.
   expect(link.connectCalls).toBe(1);
 });
 
-test("closing after a failed connect leaves the store idle, not failed again", async () => {
+// The same re-entrancy with the connect still PENDING when the close lands, so
+// the second attempt is the one `disconnect()` rejects rather than one that had
+// already resolved. Same store, different settlement path into `#epoch`.
+test("closing during a pending reconnect leaves the store idle, not failed", async () => {
   const link = new FakeClientLink();
-  link.holdConnect = true;
   const store = new FactoryLinkStore(link);
   store.open();
   const winner = recorder("session-a");
   const loser = recorder("session-a");
   store.bind(winner.options);
   store.bind(loser.options);
-  link.settleConnect(new Error("refused"));
-  await expect.poll(() => store.snapshot().state).toBe("failed");
+  await expect.poll(() => link.open.length).toBe(1);
+  link.disconnect();
+  link.holdConnect = true;
 
   store.close();
   await new Promise((resolve) => setTimeout(resolve, 30));
