@@ -228,10 +228,13 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
    */
   #generation = 0;
   /**
-   * Bumped by `close()`. `ClientLink.disconnect` REJECTS a pending connect, so
-   * the attempt a close interrupts settles just after it; without this the
-   * store would publish that rejection and end up `"failed"` after a clean
-   * close.
+   * Bumped by `close()`, and read on BOTH settlement paths of an interrupted
+   * connect. `ClientLink.disconnect` REJECTS a pending connect, so the attempt
+   * a close interrupts settles just after it and the store would end up
+   * `"failed"` after a clean close. The success path is not the same case: a
+   * connect cannot resolve after a close, but its already-queued reaction can
+   * still RUN after one, which would leave the store `"connected"` over a
+   * disconnected link.
    */
   #epoch = 0;
   #connecting: Promise<boolean> | undefined;
@@ -319,8 +322,14 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     this.publish({ state: "connecting", connected: false });
     const attempt = this.#link.connect().then(
       () => {
-        // No epoch check here, unlike the rejection path: `ClientLink.disconnect`
-        // rejects a pending connect, so a connect cannot RESOLVE after a close.
+        // Guarded for a different reason than the rejection path below. A
+        // connect genuinely cannot RESOLVE after a close — `ClientLink.disconnect`
+        // rejects a pending connect — but this handler is not the resolution, it
+        // is a REACTION the runtime queues as a microtask once the link's promise
+        // has resolved. A `close()` in that window runs first, and without this
+        // the store would publish `"connected"` over a link it has already
+        // disconnected, with nothing left to correct it.
+        if (epoch !== this.#epoch) return false;
         this.#connecting = undefined;
         this.#generation += 1;
         this.publish({ state: "connected", connected: true, failure: null });

@@ -220,6 +220,38 @@ test("a closed store reopens and binds again", async () => {
   store.close();
 });
 
+test("a connect whose reaction lands after close leaves the store idle", async () => {
+  const link = new FakeClientLink();
+  link.holdConnect = true;
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const a = recorder("session-a");
+  store.bind(a.options);
+  expect(store.snapshot().state).toBe("connecting");
+
+  // The link's promise resolves, so the store's `.then` reaction is queued as a
+  // microtask -- and `close()` lands in that window, before it runs. The link
+  // cannot reject a connect it has already resolved, so nothing downstream of
+  // the settled promise will correct a status published from that reaction.
+  link.settleConnect();
+  store.close();
+  expect(store.snapshot().state).toBe("idle");
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(store.snapshot()).toEqual({
+    state: "idle",
+    connected: false,
+    failure: null,
+    bindingCount: 0,
+  });
+  // The superseded attempt resolves `false`, but a binding cancelled by
+  // `close()` returns from `#join` before the unavailability path, so the
+  // discarded connect cannot deliver a spurious error either.
+  expect(a.errors).toHaveLength(0);
+  expect(link.subscriptions).toHaveLength(0);
+});
+
 test("a binding cancelled before it is authorized never delivers", async () => {
   const link = new FakeClientLink();
   link.holdConnect = true;
