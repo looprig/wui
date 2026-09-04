@@ -363,6 +363,9 @@ test("a read that lands after unmount commits nothing", async () => {
   const before = h.view.current;
 
   await h.unmount();
+  // The read is CANCELLED, not merely ignored: a real `FactoryRestReads` takes
+  // this signal into its fetch, so an abandoned view stops costing a request.
+  expect(h.reads.of("readJournal")[0]?.options.signal?.aborted).toBe(true);
   h.reads.page = { journal_tip: 9, covered_through: 9, events: [publicEvent(9)] };
   h.reads.settle("readJournal");
   await new Promise((resolve) => setTimeout(resolve, 50));
@@ -435,4 +438,53 @@ test("a reset discards what the Factory no longer holds and re-reads", async () 
   expect(h.view.current?.coveredThrough).toBe(1);
   expect(h.reads.of("readJournal").length).toBe(2);
   expect(h.link.rpcCalls).toStrictEqual([]);
+});
+
+test("a superseded read commits nothing, even when it lands last", async () => {
+  // The repair case, in the order that makes it a statement about the machine
+  // rather than about arrival timing: the stale read is released AFTER the
+  // current one (see `FakeFactoryReads.settle`), so a machine that committed
+  // whatever came back would end holding the stale page and the stale status.
+  const h = await mountFactoryView({
+    setup: (_link, reads) => {
+      reads.hold("readJournal");
+      reads.hold("readStatus");
+      reads.queue("readJournal", { journal_tip: 2, covered_through: 2, events: [publicEvent(2)] });
+      reads.queue("readStatus", { session_id: FSID, agent_id: "agent-1", state: "idle", residency: "cold", journal_tip: 2 });
+      reads.queue("readJournal", { journal_tip: 9, covered_through: 9, events: [publicEvent(9)] });
+      reads.queue("readStatus", { session_id: FSID, agent_id: "agent-1", state: "idle", residency: "resident", journal_tip: 9 });
+    },
+  });
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(1);
+
+  h.link.drop();
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
+  h.reads.settle("readJournal");
+  h.reads.settle("readStatus");
+
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([9]);
+  expect(h.view.current?.status?.journal_tip).toBe(9);
+  expect(h.view.current?.status?.residency).toBe("resident");
+});
+
+test("a publication for another channel is never applied, and forces a re-read", async () => {
+  // A frame naming another session means this subscription is not what it
+  // claims to be. Believing it would splice one session's events into another;
+  // ignoring it silently would leave a view that has stopped being correct with
+  // no way to notice. It is re-read instead.
+  const h = await mountFactoryView({
+    setup: (_link, reads) => {
+      reads.page = { journal_tip: 1, covered_through: 1, events: [publicEvent(1)] };
+    },
+  });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  expect(h.reads.of("readStatus")).toHaveLength(1);
+
+  h.link.open[0]?.deliver({ ...enduringFor(6), session_id: "some-other-session" });
+
+  await expect.poll(() => h.reads.of("readStatus").length).toBe(2);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([1]);
+  expect(h.view.current?.coveredThrough).toBe(1);
 });

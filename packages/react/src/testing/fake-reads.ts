@@ -67,18 +67,40 @@ export class FakeFactoryReads {
   readonly #held = new Map<ColdReadMethod, (() => void)[]>();
   readonly #holding = new Set<ColdReadMethod>();
   readonly #failures = new Map<ColdReadMethod, Error>();
+  readonly #queued = new Map<ColdReadMethod, unknown[]>();
 
   /** Leaves every subsequent read of `method` pending until `settle(method)`. */
   hold(method: ColdReadMethod): void {
     this.#holding.add(method);
   }
 
-  /** Releases every read of `method` held so far and stops holding new ones. */
+  /**
+   * Releases every read of `method` held so far, NEWEST FIRST, and stops
+   * holding new ones.
+   *
+   * The order is chosen, not incidental. Releasing oldest-first would let a
+   * superseded read commit before the current one and be overwritten by it, so
+   * a store with no generation guard would end in the right state anyway and
+   * the guard would be unkillable. Newest-first puts the stale commit LAST,
+   * which is the only order in which "a superseded read commits nothing" is a
+   * statement about the store.
+   */
   settle(method: ColdReadMethod): void {
     this.#holding.delete(method);
     const waiting = this.#held.get(method) ?? [];
     this.#held.set(method, []);
-    for (const release of waiting) release();
+    for (const release of [...waiting].reverse()) release();
+  }
+
+  /**
+   * The body the NEXT read of `method` answers with, consumed in order. Reads
+   * past the end of the queue fall back to `status`/`gates`/`page`, so a test
+   * that cares about one call in a sequence stages only that one.
+   */
+  queue(method: ColdReadMethod, body: unknown): void {
+    const pending = this.#queued.get(method) ?? [];
+    pending.push(body);
+    this.#queued.set(method, pending);
   }
 
   /** The next read of `method` rejects with `error`. */
@@ -105,6 +127,10 @@ export class FakeFactoryReads {
     produce: () => T,
   ): Promise<T> {
     this.calls.push({ method, sessionId, options });
+    // Taken at CALL time, so a queued body belongs to the call that was made
+    // while it was queued rather than to whichever call happens to be released
+    // first.
+    const queued = (this.#queued.get(method) ?? []).shift() as T | undefined;
     if (this.#holding.has(method)) {
       await new Promise<void>((resolve) => {
         const waiting = this.#held.get(method) ?? [];
@@ -120,7 +146,7 @@ export class FakeFactoryReads {
     // Read AFTER the hold, so a test can stage a different body while a read
     // is parked — which is how a repair is shown to see newer content than the
     // read it replaced.
-    return produce();
+    return (queued ?? produce()) as T;
   }
 
   /** Every call to `method`, in order. */
