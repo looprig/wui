@@ -500,3 +500,39 @@ test("a publication for another channel is never applied, and forces a re-read",
   expect(h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([1]);
   expect(h.view.current?.coveredThrough).toBe(1);
 });
+
+test("a publication carrying no sequence changes nothing", async () => {
+  // `FactoryPublication` is a union of three, and only the enduring member has
+  // a `journal_seq`. A machine keyed by that field which did not check the
+  // member first would write an `undefined` key — a fourth "event" with no
+  // identity, indistinguishable from the next one, in a map whose whole job is
+  // exactly-once. Both other members are dropped, and this is what says so.
+  const h = await mountFactoryView({
+    setup: (_link, reads) => {
+      reads.page = { journal_tip: 1, covered_through: 1, events: [publicEvent(1)] };
+    },
+  });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  const applied = h.view.current;
+
+  h.link.open[0]?.deliver({
+    type: "journal_tip",
+    tenant_id: TENANT,
+    session_id: FSID,
+    journal_tip: 12,
+  });
+  h.link.open[0]?.deliver({
+    type: "ephemeral_publication",
+    tenant_id: TENANT,
+    session_id: FSID,
+    kind: "turn.delta",
+    body: { text: "thinking" },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  expect(h.view.current).toBe(applied);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([1]);
+  expect(h.view.current?.coveredThrough).toBe(1);
+  // And neither is a repair: they are for this channel, so nothing is re-read.
+  expect(h.reads.of("readStatus")).toHaveLength(1);
+});
