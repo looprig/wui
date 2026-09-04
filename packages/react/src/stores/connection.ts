@@ -400,6 +400,13 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
    */
   #redriveChannelPeers(released: BindingRecord): void {
     for (const record of [...this.#bindings]) {
+      // A record is never its own peer. The cancel path has already removed it
+      // from the set, but `#onBindingError` has not — and a record that
+      // re-drove itself from its own error handler would subscribe, be
+      // declined, release, and re-drive again, on one connection, forever. That
+      // is the loop the one-attempt-per-connection bound exists to refuse, and
+      // it must not be reachable through this scan either.
+      if (record === released) continue;
       if (record.cancelled || record.joined) continue;
       if (record.options.tenantId !== released.options.tenantId) continue;
       if (record.options.sessionId !== released.options.sessionId) continue;
