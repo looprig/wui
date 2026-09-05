@@ -8,10 +8,6 @@ import {
   useParams,
   type RouterHistory,
 } from "@tanstack/react-router";
-import {
-  type LiveFrameSource,
-  type LooprigTransport,
-} from "@looprig/protocol";
 import { FactoryIdentityProvider, useFactoryClient, type FactoryIdentityProviderProps } from "@looprig/react";
 import { FactorySessionsPage } from "./routes/sessions-page";
 import { FactorySessionDetailRoute } from "./routes/session-detail-route";
@@ -29,26 +25,25 @@ export type FactoryComposition = Omit<FactoryIdentityProviderProps, "children" |
 export interface AppRouterOptions {
   /** Injected by tests (memory history); production uses the browser's own. */
   history?: RouterHistory;
-  transport?: LooprigTransport;
-  /**
-   * How a session's live frame source is built. Constructed ONCE per session by
-   * the detail route, which memoises it: every hook downstream keys its store —
-   * and so its connection — on the identity of what it is handed.
-   *
-   * This is an injection seam, not configuration. Before it existed the detail
-   * route built `createFetchLiveFrameSource(sid)` inline with no way to replace
-   * it, so a router test issued a real `/v1/sessions/{sid}/events` request
-   * through Vite's dev proxy to a port nothing listens on, and printed
-   * `ECONNREFUSED` on every run — nondeterministic only in whether the
-   * rejection landed inside a test's window or after teardown.
-   */
-  createLiveSource?: (sid: string) => LiveFrameSource;
   /**
    * The Factory plane. Production passes a base URL and nothing else; a test
    * passes a `clientLinkFactory` so no real WebSocket is opened.
    */
   factory?: FactoryComposition;
 }
+
+/**
+ * There is deliberately NO legacy `transport` and no `createLiveSource` here.
+ * Both existed for the Host-backed `SessionDetailRoute` this router mounted
+ * before U5.2; the detail route is now `FactorySessionDetailRoute`, which reads
+ * the Factory plane through the provider and constructs no live frame source of
+ * its own. They were kept for one checkpoint as options `createAppRouter` no
+ * longer destructured, with comments describing a seam that no longer carried
+ * anything — a claim made in prose and asserted nowhere, which is exactly what
+ * this module's drift gate exists to prevent. `router.test.tsx` asserts the
+ * property that was left over instead: mounting the detail route issues no
+ * `/v1/sessions/{sid}/events` request.
+ */
 
 /**
  * The build-time Factory origin, or `undefined` for same-origin.
@@ -114,11 +109,10 @@ export function browserFactoryComposition(env: Record<string, unknown>): Factory
  *
  * ## What the routes are handed
  *
- * Adapters, never globals. The legacy transport, the Factory client and a
- * session's live source are all constructed here and threaded through the route
- * tree, so a test can build a whole application over doubles with no module
- * mocking — and, just as importantly, so that nothing below this file reaches
- * for `fetch`, `WebSocket` or Centrifuge by itself.
+ * Adapters, never globals. The Factory composition is constructed here and
+ * threaded through the route tree, so a test can build a whole application over
+ * doubles with no module mocking — and, just as importantly, so that nothing
+ * below this file reaches for `fetch`, `WebSocket` or Centrifuge by itself.
  *
  * The Factory provider sits on the ROOT route rather than in `main.tsx`. The
  * root route component is mounted once for the lifetime of the router and

@@ -6,28 +6,29 @@ import { RouterProvider, createMemoryHistory } from "@tanstack/react-router";
 import { createFactoryClient, type FactoryClient } from "@looprig/protocol";
 import { browserFactoryComposition, createAppRouter, factoryBaseUrl } from "./router";
 import { FactoryLinkProbe, FakeTransport, emptySessionList } from "./test/fakes";
-import { ControlledLiveSource } from "./test/live";
 
 const SID = "44444444-4444-4444-4444-444444444444";
 
 interface Composed {
   transport: FakeTransport;
   probe: FactoryLinkProbe;
-  live: ControlledLiveSource;
   router: ReturnType<typeof createAppRouter>;
 }
 
 /**
  * A whole application, composed the way `main.tsx` composes it, over doubles.
  *
- * Both injections are load-bearing rather than convenience. The live source is
- * the seam U4.2 recorded as owed here: before it existed the detail route built
- * `createFetchLiveFrameSource(sid)` itself, so mounting it in a test issued a
- * real `/v1/sessions/{sid}/events` request through Vite's dev proxy to a port
- * nothing listens on, and `ECONNREFUSED` was printed on every run of this file.
- * The Factory link is the same hazard one layer up: the provider opens a
- * Centrifuge socket from an effect, so without a fake link every test in this
- * file would open a real WebSocket.
+ * ONE injection is load-bearing now, not two. The Factory link is a real
+ * hazard: the provider opens a Centrifuge socket from an effect, so without a
+ * fake link every test in this file would open a real WebSocket. The live-frame
+ * source that used to be injected alongside it is gone — the detail route is
+ * `FactorySessionDetailRoute`, which builds none — and passing a double into an
+ * option nothing reads asserts nothing. `fetchProbe` below keeps the property
+ * that injection was protecting, against the real global rather than a stub.
+ *
+ * `transport` is still constructed because the legacy `FakeTransport` is what
+ * the row fixtures are written against; `compose` projects its list into the
+ * probe's Factory reads. It is not passed to the router.
  */
 function compose(path: string, transport: FakeTransport, probe = new FactoryLinkProbe()): Composed {
   probe.recentSessionsResult = transport.listSessionsResult.then((legacy) => ({
@@ -38,14 +39,31 @@ function compose(path: string, transport: FakeTransport, probe = new FactoryLink
       last_active_at: session.last_active_at ?? session.created_at ?? "2026-09-05T12:00:00Z",
     })),
   }));
-  const live = new ControlledLiveSource();
   const router = createAppRouter({
     history: createMemoryHistory({ initialEntries: [path] }),
-    transport,
-    createLiveSource: () => live.source,
     factory: { options: probe.options() },
   });
-  return { transport, probe, live, router };
+  return { transport, probe, router };
+}
+
+/**
+ * Every URL the page's own `fetch` is asked for while the probe is installed.
+ *
+ * The property under test is negative — "the Factory detail route opens no Host
+ * event stream" — and a negative is only worth asserting against the thing that
+ * would actually carry it. The previous version of this assertion counted opens
+ * on an INJECTED live source; once the route stopped taking one, that count was
+ * zero because nothing could ever raise it. This watches `window.fetch`, which
+ * a route reaching for `createFetchLiveFrameSource` would have to go through.
+ */
+function fetchProbe(): { urls: string[]; restore: () => void } {
+  const urls: string[] = [];
+  const original = window.fetch;
+  window.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    urls.push(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    return original.call(window, input, init);
+  };
+  return { urls, restore: () => { window.fetch = original; } };
 }
 
 function at(path: string, transport: FakeTransport): ReturnType<typeof createAppRouter> {
@@ -116,7 +134,6 @@ describe("router", () => {
     let observed: { pathname: string; href: string };
     try {
       const router = createAppRouter({
-        transport: empty(),
         factory: { options: new FactoryLinkProbe().options() },
       });
       observed = {
@@ -136,28 +153,33 @@ describe("router", () => {
 describe("Factory detail composition", () => {
   it("binds the detail route through the shared Factory link without a Host event source", async () => {
     const composed = compose(`/sessions/${SID}`, new FakeTransport());
-    render(<RouterProvider router={composed.router} />);
-    await expect.element(page.getByTestId("detail-session-id")).toBeInTheDocument();
-    await expect.poll(() => composed.probe.only().open.length).toBe(1);
-    expect(composed.probe.only().open[0]?.sessionId).toBe(SID);
-    expect(composed.live.openCount).toBe(0);
+    const fetches = fetchProbe();
+    try {
+      render(<RouterProvider router={composed.router} />);
+      await expect.element(page.getByTestId("detail-session-id")).toBeInTheDocument();
+      await expect.poll(() => composed.probe.only().open.length).toBe(1);
+      expect(composed.probe.only().open[0]?.sessionId).toBe(SID);
+      // The whole Host event plane, not just this session's: a route that
+      // reached for one would name `/events` in the URL it asked `fetch` for.
+      expect(fetches.urls.filter((url) => url.includes("/events"))).toStrictEqual([]);
+    } finally {
+      fetches.restore();
+    }
   });
 
   it("releases the session binding when navigating back to the list", async () => {
     const composed = compose("/sessions", oneRow());
     const screen = await render(<RouterProvider router={composed.router} />);
     await expect.element(page.getByTestId("session-row-link")).toBeInTheDocument();
-    expect(composed.live.openCount).toBe(0);
 
     await userEvent.click(page.getByTestId("session-row-link"));
     await expect.element(page.getByTestId("detail-session-id")).toBeInTheDocument();
     await expect.poll(() => composed.probe.only().open.length).toBe(1);
 
-    // DEPARTURE closes it. `ControlledLiveSource` counts a close and nothing
-    // read the count, which is the same unread line as the one this file's
-    // first test exists to catch, one step later in the lifecycle: a source
-    // left open on the way back to the list is a live `/events` stream per
-    // session ever visited, for as long as the tab is open.
+    // DEPARTURE closes the session binding. A binding left open on the way back
+    // to the list is a live subscription per session ever visited, for as long
+    // as the tab is open, so the probe's live `open` count is read after the
+    // navigation rather than only after it was raised.
     await composed.router.navigate({ to: "/sessions" });
     await expect.element(page.getByTestId("session-row-link")).toBeInTheDocument();
     await expect.poll(() => composed.probe.only().open.length).toBe(0);
@@ -251,11 +273,8 @@ describe("one Factory client per application", () => {
     // mapping under test is production's.
     const probe = new FactoryLinkProbe();
     const clients: FactoryClient[] = [];
-    const live = new ControlledLiveSource();
     const router = createAppRouter({
       history: createMemoryHistory({ initialEntries: ["/sessions"] }),
-      transport: empty(),
-      createLiveSource: () => live.source,
       factory: {
         options: probe.options(),
         create: (options) => {
@@ -311,11 +330,8 @@ describe("Factory connection credentials", () => {
   it("re-mints the connection token on every connect, including a reconnect", async () => {
     let issued = 0;
     const probe = new FactoryLinkProbe();
-    const live = new ControlledLiveSource();
     const router = createAppRouter({
       history: createMemoryHistory({ initialEntries: ["/sessions"] }),
-      transport: empty(),
-      createLiveSource: () => live.source,
       factory: {
         options: probe.options(),
         credentials: {
@@ -360,11 +376,8 @@ describe("Factory connection credentials", () => {
 describe("Factory base URL", () => {
   it("derives the realtime endpoint from a custom base URL", async () => {
     const probe = new FactoryLinkProbe();
-    const live = new ControlledLiveSource();
     const router = createAppRouter({
       history: createMemoryHistory({ initialEntries: ["/sessions"] }),
-      transport: empty(),
-      createLiveSource: () => live.source,
       factory: { options: probe.options({ baseUrl: "https://factory.example.test:9443" }) },
     });
     render(<RouterProvider router={router} />);
