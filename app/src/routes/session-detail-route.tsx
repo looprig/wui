@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import {
   createFetchLiveFrameSource,
   createHostTransport,
+  type LiveFrameSource,
   type LooprigTransport,
 } from "@looprig/protocol";
 import { SessionDetailPage } from "./session-detail-page";
@@ -9,6 +10,13 @@ import { SessionDetailPage } from "./session-detail-page";
 export interface SessionDetailRouteProps {
   sid: string;
   transport?: LooprigTransport;
+  /**
+   * How this session's live frame source is built. An injection seam, like
+   * `transport`: without it this component reached for `fetch` itself, so a
+   * test that mounted it opened a real `/v1/sessions/{sid}/events` request
+   * against whatever the dev proxy pointed at.
+   */
+  createLiveSource?: (sid: string) => LiveFrameSource;
 }
 
 /**
@@ -24,8 +32,22 @@ export interface SessionDetailRouteProps {
  * abandon and reopen an SSE connection on every state change. 05-app.md's
  * version of this file constructs both inline.
  */
-export function SessionDetailRoute({ sid, transport }: SessionDetailRouteProps): React.JSX.Element {
+export function SessionDetailRoute({
+  sid,
+  transport,
+  createLiveSource,
+}: SessionDetailRouteProps): React.JSX.Element {
   const host = useMemo(() => transport ?? createHostTransport(), [transport]);
-  const liveSource = useMemo(() => createFetchLiveFrameSource(sid), [sid]);
+  // `createLiveSource` is in the dependency list because the memo factory reads
+  // it, not because anything can observe the difference today: `createAppRouter`
+  // fixes the factory for the router's whole life, and `useSessionView` holds
+  // the source in a ref behind a stable `useCallback` wrapper precisely so an
+  // inline arrow cannot tear the store down — so replacing it does not rebuild
+  // the store, and dropping it from this list survives the whole suite. Measured
+  // as an equivalent mutant, not left unread by oversight.
+  const liveSource = useMemo(
+    () => (createLiveSource ?? createFetchLiveFrameSource)(sid),
+    [createLiveSource, sid],
+  );
   return <SessionDetailPage sid={sid} transport={host} liveSource={liveSource} />;
 }

@@ -1,4 +1,16 @@
+import { RealtimeTransportError } from "@looprig/protocol";
 import type {
+  ClientLink,
+  ClientLinkConstructor,
+  ClientLinkCredentials,
+  ClientLinkOptions,
+  ClientLinkState,
+  ClientSubscription,
+  CommandStatus,
+  FactoryClientOptions,
+  FetchLike,
+  SubscribeOptions,
+  VersionNegotiationResponse,
   CreateRequest,
   CreateResponse,
   CreateSessionOptions,
@@ -96,3 +108,204 @@ export const emptySessionList: SessionList = {
   next_skip: 0,
   done: true,
 };
+
+/**
+ * A controllable `ClientLink` and the counting factory that mints them.
+ *
+ * ## Why this is here and not imported
+ *
+ * `@looprig/react` has a richer equivalent under `src/testing/`, and its module
+ * comment says it is "deliberately NOT exported… fixture code for this
+ * package's own tests, not a published test-kit"; `@looprig/protocol` exports
+ * `createClientLinkWithTransport` from its module but not from its barrel, so
+ * `app/` cannot reach the real adapter with a fake socket underneath it either.
+ * `src/test/live.ts` records the same reasoning for the live source. This is
+ * the subset `app/` composition tests actually drive.
+ *
+ * ## What is mirrored from `protocol/src/clientlink.ts`, and why each
+ *
+ *  - `connect()` returns the SAME promise while one is in flight and an
+ *    already-resolved one once connected, so a coalescing claim about
+ *    `FactoryLinkStore` stays a claim about the store rather than about this;
+ *  - `disconnect()` rejects a pending connect with the same
+ *    `RealtimeTransportError` the real link raises, which is the path
+ *    `FactoryLinkStore`'s epoch guard exists for and which StrictMode's
+ *    open/close/open takes on every mount;
+ *  - **a connection token is minted per connect ATTEMPT.** The real link passes
+ *    `getToken: () => credentials.connectionToken!()` to Centrifuge, and
+ *    Centrifuge calls it on every connect, including every automatic reconnect
+ *    — so a reconnect re-enters the application's token function rather than
+ *    replaying the first token. `connectTokens` records the mint at call time,
+ *    not at settlement, because an attempt a `disconnect()` interrupts has
+ *    still asked the application for a token.
+ *  - the token hook exists only when `connectionToken` was supplied, exactly as
+ *    `CentrifugeClientLink`'s constructor decides it: a forwarder installed for
+ *    a caller that supplies none is a hook that can only fail.
+ *
+ * ## Deliberate differences
+ *
+ *  - **`subscribe()` throws.** Nothing in `app/` binds a session to the Factory
+ *    link yet — `useSessionBinding` and `useFactorySessionView` have no
+ *    production caller until U5.2 — so a call is a route asking the wrong
+ *    question, and a fake that answers every question cannot catch that. It is
+ *    stricter than the real link, never looser. U5.2 replaces it with a
+ *    subscription fake mirroring Centrifuge's one-subscription-per-channel
+ *    registry (`newSubscription` THROWS on a second entry).
+ *  - **`rpc()` records and never settles.** Same reason, minus the throw: a
+ *    stored rejected promise nobody has awaited is an unhandled rejection the
+ *    moment it is created, and an unhandled rejection is not a test failure
+ *    anyone can read. Assert on `rpcCalls`.
+ *  - No schema validation of publications, and no automatic reconnect of its
+ *    own: this link connects when it is told to.
+ */
+export class FakeClientLink implements ClientLink {
+  state: ClientLinkState = "disconnected";
+  /** One entry per connect attempt that reached the application's token function. */
+  readonly connectTokens: string[] = [];
+  readonly rpcCalls: Array<{ method: string; request: unknown }> = [];
+  connectCalls = 0;
+  disconnectCalls = 0;
+
+  readonly endpoint: string | undefined;
+  readonly credentials: ClientLinkCredentials;
+
+  #pending: { promise: Promise<VersionNegotiationResponse>; settle(): void; fail(reason: unknown): void } | undefined;
+
+  constructor(
+    options: ClientLinkOptions,
+    private readonly probe: FactoryLinkProbe | undefined = undefined,
+  ) {
+    this.endpoint = options.endpoint;
+    this.credentials = options.credentials ?? {};
+  }
+
+  connect(): Promise<VersionNegotiationResponse> {
+    this.connectCalls += 1;
+    if (this.state === "connected") return Promise.resolve(NEGOTIATED_VERSION);
+    if (this.#pending !== undefined) return this.#pending.promise;
+
+    let resolve!: (value: VersionNegotiationResponse) => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<VersionNegotiationResponse>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    const attempt = {
+      promise,
+      settle: (): void => resolve(NEGOTIATED_VERSION),
+      fail: (reason: unknown): void => reject(reason),
+    };
+    this.#pending = attempt;
+    this.state = "connecting";
+
+    const mint = this.credentials.connectionToken;
+    const token = mint === undefined
+      ? Promise.resolve(undefined)
+      : mint().then((value) => {
+        this.connectTokens.push(value);
+        return value;
+      });
+    void token.then(
+      () => {
+        if (this.#pending !== attempt) return;
+        this.#pending = undefined;
+        this.state = "connected";
+        this.probe?.opened();
+        attempt.settle();
+      },
+      (error: unknown) => {
+        if (this.#pending !== attempt) return;
+        this.#pending = undefined;
+        this.state = "disconnected";
+        attempt.fail(error);
+      },
+    );
+    return promise;
+  }
+
+  disconnect(): void {
+    this.disconnectCalls += 1;
+    const wasConnected = this.state === "connected";
+    this.state = "disconnected";
+    const pending = this.#pending;
+    this.#pending = undefined;
+    pending?.fail(new RealtimeTransportError("connection closed"));
+    if (wasConnected) this.probe?.closed();
+  }
+
+  subscribe(options: SubscribeOptions): ClientSubscription {
+    throw new Error(
+      `FakeClientLink: nothing in app/ subscribes to the Factory link before U5.2 (asked for ${options.sessionId})`,
+    );
+  }
+
+  rpc(method: string, request: unknown): Promise<CommandStatus> {
+    this.rpcCalls.push({ method, request });
+    return new Promise<CommandStatus>(() => {});
+  }
+}
+
+const NEGOTIATED_VERSION: VersionNegotiationResponse = { version: 1 };
+
+/**
+ * Counts the Factory links an application constructs, and how many are open at
+ * once.
+ *
+ * "One WebSocket per app" is a NEGATIVE assertion, so the counter has to be
+ * able to observe two: `router.test.tsx` renders two applications over one
+ * probe and reads `links.length === 2` and `maxOpen === 2` before it asserts
+ * that one application reaches 1. The link is where the socket lives —
+ * `createClientLink` constructs the Centrifuge client, which owns the socket —
+ * so counting constructions counts sockets.
+ *
+ * `maxOpen` is the concurrency bound rather than a total: a reconnect is one
+ * socket after another, not two at once, and `connectCalls` on a link is how a
+ * test reads reconnects.
+ */
+export class FactoryLinkProbe {
+  readonly links: FakeClientLink[] = [];
+  readonly fetchCalls: Array<{ input: string; init?: RequestInit }> = [];
+  open = 0;
+  maxOpen = 0;
+
+  /** The exact `ClientLinkConstructor` `createFactoryClient` takes. */
+  readonly clientLinkFactory: ClientLinkConstructor = (options: ClientLinkOptions = {}): ClientLink => {
+    const link = new FakeClientLink(options, this);
+    this.links.push(link);
+    return link;
+  };
+
+  /**
+   * A `fetch` that records and never settles. `FactoryRestReads` and
+   * `createFactoryCommands` both take one; nothing in `app/` issues a Factory
+   * REST request before U5.2, so a call here is a finding, and a never-settling
+   * promise is the one shape that neither swallows it nor manufactures an
+   * unhandled rejection.
+   */
+  readonly fetch: FetchLike = (input: string, init?: RequestInit): Promise<Response> => {
+    this.fetchCalls.push(init === undefined ? { input } : { input, init });
+    return new Promise<Response>(() => {});
+  };
+
+  /** Everything `createAppRouter` needs to compose a Factory client over this probe. */
+  options(overrides: Partial<FactoryClientOptions> = {}): Omit<FactoryClientOptions, "credentials"> {
+    return { clientLinkFactory: this.clientLinkFactory, fetch: this.fetch, ...overrides };
+  }
+
+  /** The one link this application built, once its provider's effect has run. */
+  only(): FakeClientLink {
+    if (this.links.length !== 1) {
+      throw new Error(`FactoryLinkProbe: expected exactly one link, saw ${this.links.length}`);
+    }
+    return this.links[0]!;
+  }
+
+  opened(): void {
+    this.open += 1;
+    if (this.open > this.maxOpen) this.maxOpen = this.open;
+  }
+
+  closed(): void {
+    this.open -= 1;
+  }
+}
