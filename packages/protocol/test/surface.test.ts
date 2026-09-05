@@ -744,5 +744,10 @@ describe("@looprig/protocol public surface", () => {
     } finally {
       rmSync(fixture, { recursive: true, force: true });
     }
-  }, 30_000);
+    // 30 s was under the real cost of this case: a protocol build, an npm
+    // pack, a consumer `npm install`, a consumer tsc and a node run — measured
+    // at ~52 s of work on this host, so the cap failed the whole known-drift
+    // gate for machine speed rather than for drift. A per-test cap cannot be
+    // raised from the CLI, so it is raised here.
+  }, 300_000);
 });

@@ -204,6 +204,14 @@ export default defineConfig((env) => ({
           name: "node",
           environment: "node",
           include: ["vite.config.test.ts", "scripts/**/*.test.ts"],
+          // NOT vitest's 5 s default. `scripts/bundle-workflow.test.ts` drives
+          // the real release script: each of its cases clones a git fixture,
+          // runs two isolated builds through fake release tools and inspects
+          // the index, which is 6-8 s of genuine work per case on a warm host
+          // and more on a loaded one. Eleven of its cases failed here at the
+          // default while passing 28/28 at 60 s, so the cap was measuring the
+          // machine rather than the script.
+          testTimeout: 120_000,
         },
       },
     ],
