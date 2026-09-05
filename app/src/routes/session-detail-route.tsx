@@ -6,6 +6,8 @@ import {
   type LooprigTransport,
 } from "@looprig/protocol";
 import { SessionDetailPage } from "./session-detail-page";
+import { useFactoryClient, useFactorySessionView, useFactoryTenantId } from "@looprig/react";
+import { FactorySessionDetailPage } from "./factory-session-detail-page";
 
 export interface SessionDetailRouteProps {
   sid: string;
@@ -50,4 +52,12 @@ export function SessionDetailRoute({
     [createLiveSource, sid],
   );
   return <SessionDetailPage sid={sid} transport={host} liveSource={liveSource} />;
+}
+
+/** Official Factory route: verified tenant + durable cold projection + shared realtime link. */
+export function FactorySessionDetailRoute({ sid }: { sid: string }): React.JSX.Element {
+  const client = useFactoryClient();
+  const tenantId = useFactoryTenantId();
+  const view = useFactorySessionView(client.reads, { tenantId, sessionId: sid });
+  return <FactorySessionDetailPage sid={sid} view={view} />;
 }

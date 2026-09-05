@@ -9,14 +9,12 @@ import {
   type RouterHistory,
 } from "@tanstack/react-router";
 import {
-  createFetchLiveFrameSource,
-  createHostTransport,
   type LiveFrameSource,
   type LooprigTransport,
 } from "@looprig/protocol";
 import { FactoryIdentityProvider, useFactoryClient, type FactoryIdentityProviderProps } from "@looprig/react";
 import { FactorySessionsPage } from "./routes/sessions-page";
-import { SessionDetailRoute } from "./routes/session-detail-route";
+import { FactorySessionDetailRoute } from "./routes/session-detail-route";
 
 /**
  * How the application composes its Factory plane: exactly the props
@@ -129,15 +127,8 @@ export function browserFactoryComposition(env: Record<string, unknown>): Factory
  * `FactoryLinkProvider` constructs its client in a ref rather than a `useMemo`,
  * so StrictMode's double mount still yields exactly one client and one socket.
  */
-export function createAppRouter({
-  history,
-  transport,
-  createLiveSource,
-  factory,
-}: AppRouterOptions = {}) {
-  const host = transport ?? createHostTransport();
-  const liveSourceFor = createLiveSource ?? ((sid: string) => createFetchLiveFrameSource(sid));
-
+export function createAppRouter(options: AppRouterOptions = {}) {
+  const { history, factory } = options;
   const rootRoute = createRootRoute({
     component: function AppRoot() {
       return (
@@ -198,7 +189,7 @@ export function createAppRouter({
     path: "/sessions/$sid",
     component: function SessionDetailRouteComponent() {
       const { sid } = useParams({ from: sessionDetailRoute.id });
-      return <SessionDetailRoute sid={sid} transport={host} createLiveSource={liveSourceFor} />;
+      return <FactorySessionDetailRoute sid={sid} />;
     },
   });
 

@@ -187,6 +187,11 @@ export class FakeClientLink implements ClientLink {
   readonly rpcCalls: Array<{ method: string; request: unknown }> = [];
   connectCalls = 0;
   disconnectCalls = 0;
+  readonly subscriptions: Array<ClientSubscription & { sessionId: string; unsubscribeCount: number }> = [];
+
+  get open(): Array<ClientSubscription & { sessionId: string; unsubscribeCount: number }> {
+    return this.subscriptions.filter((subscription) => subscription.state !== "unsubscribed");
+  }
 
   readonly endpoint: string | undefined;
   readonly credentials: ClientLinkCredentials;
@@ -256,9 +261,24 @@ export class FakeClientLink implements ClientLink {
   }
 
   subscribe(options: SubscribeOptions): ClientSubscription {
-    throw new Error(
-      `FakeClientLink: nothing in app/ subscribes to the Factory link before U5.2 (asked for ${options.sessionId})`,
-    );
+    if (this.open.some((subscription) => subscription.sessionId === options.sessionId)) {
+      throw new Error(`duplicate session subscription: ${options.sessionId}`);
+    }
+    let state: "subscribed" | "unsubscribed" = "subscribed";
+    const subscription = {
+      sessionId: options.sessionId,
+      unsubscribeCount: 0,
+      ready: Promise.resolve(),
+      version: 1,
+      get state() { return state; },
+      unsubscribe() {
+        if (state === "unsubscribed") return;
+        state = "unsubscribed";
+        subscription.unsubscribeCount += 1;
+      },
+    } satisfies ClientSubscription & { sessionId: string; unsubscribeCount: number };
+    this.subscriptions.push(subscription);
+    return subscription;
   }
 
   rpc(method: string, request: unknown): Promise<CommandStatus> {
@@ -318,6 +338,17 @@ export class FactoryLinkProbe {
     }
     if (new URL(input, "https://factory.invalid").pathname === "/v1/sessions") {
       return this.recentSessionsResult.then((page) => new Response(JSON.stringify(page)));
+    }
+    const url = new URL(input, "https://factory.invalid");
+    const status = /^\/v1\/sessions\/([^/]+)\/status$/.exec(url.pathname);
+    if (status !== null) return Promise.resolve(new Response(JSON.stringify({
+      session_id: decodeURIComponent(status[1]!), agent_id: "agent-1", state: "idle", residency: "cold", journal_tip: 0,
+    })));
+    if (/^\/v1\/sessions\/[^/]+\/gates$/.test(url.pathname)) {
+      return Promise.resolve(new Response(JSON.stringify({ journal_tip: 0, open_gate_count: 0, gates: [] })));
+    }
+    if (/^\/v1\/sessions\/[^/]+\/journal$/.test(url.pathname)) {
+      return Promise.resolve(new Response(JSON.stringify({ journal_tip: 0, covered_through: 0, events: [] })));
     }
     return new Promise<Response>(() => {});
   };

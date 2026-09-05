@@ -133,18 +133,17 @@ describe("router", () => {
   });
 });
 
-describe("live source composition", () => {
-  it("hands the detail route the composed source rather than opening its own", async () => {
+describe("Factory detail composition", () => {
+  it("binds the detail route through the shared Factory link without a Host event source", async () => {
     const composed = compose(`/sessions/${SID}`, new FakeTransport());
     render(<RouterProvider router={composed.router} />);
     await expect.element(page.getByTestId("detail-session-id")).toBeInTheDocument();
-    // The reader for the seam: the route joined THIS source. A route that still
-    // built `createFetchLiveFrameSource(sid)` would leave this at zero and put
-    // a real request on the dev proxy instead.
-    await expect.poll(() => composed.live.openCount).toBe(1);
+    await expect.poll(() => composed.probe.only().open.length).toBe(1);
+    expect(composed.probe.only().open[0]?.sessionId).toBe(SID);
+    expect(composed.live.openCount).toBe(0);
   });
 
-  it("keeps one source per session across a navigation", async () => {
+  it("releases the session binding when navigating back to the list", async () => {
     const composed = compose("/sessions", oneRow());
     const screen = await render(<RouterProvider router={composed.router} />);
     await expect.element(page.getByTestId("session-row-link")).toBeInTheDocument();
@@ -152,8 +151,7 @@ describe("live source composition", () => {
 
     await userEvent.click(page.getByTestId("session-row-link"));
     await expect.element(page.getByTestId("detail-session-id")).toBeInTheDocument();
-    await expect.poll(() => composed.live.openCount).toBe(1);
-    expect(composed.live.closedCount).toBe(0);
+    await expect.poll(() => composed.probe.only().open.length).toBe(1);
 
     // DEPARTURE closes it. `ControlledLiveSource` counts a close and nothing
     // read the count, which is the same unread line as the one this file's
@@ -162,9 +160,8 @@ describe("live source composition", () => {
     // session ever visited, for as long as the tab is open.
     await composed.router.navigate({ to: "/sessions" });
     await expect.element(page.getByTestId("session-row-link")).toBeInTheDocument();
-    await expect.poll(() => composed.live.closedCount).toBe(1);
-    // And closed, not reopened: leaving does not count a second open.
-    expect(composed.live.openCount).toBe(1);
+    await expect.poll(() => composed.probe.only().open.length).toBe(0);
+    expect(composed.probe.only().subscriptions[0]?.unsubscribeCount).toBe(1);
 
     // Unmounting the application closes the FACTORY socket by the same
     // argument, one layer up. `open` is the probe's live count — `maxOpen` is a
@@ -187,9 +184,18 @@ describe("one Factory client per application", () => {
 
     expect(composed.probe.links.length).toBe(1);
     await expect.poll(() => composed.probe.maxOpen).toBe(1);
-    // Bootstrap is the sole initial Factory read. It verifies the ambient
-    // browser principal; opening the list sends no session command.
-    expect(composed.probe.fetchCalls.map((call) => call.input)).toEqual(["/v1/bootstrap", "/v1/sessions?limit=100"]);
+    // Bootstrap and bounded durable reads are the only network work: opening
+    // the detail sends no placement or other session command.
+    expect(composed.probe.fetchCalls.map((call) => call.input)).toEqual([
+      "/v1/bootstrap",
+      "/v1/sessions?limit=100",
+      `/v1/sessions/${SID}/status`,
+      `/v1/sessions/${SID}/gates?limit=256`,
+      `/v1/sessions/${SID}/journal?limit=256&tail=256`,
+      `/v1/sessions/${SID}/status`,
+      `/v1/sessions/${SID}/gates?limit=256`,
+      `/v1/sessions/${SID}/journal?limit=256&tail=256`,
+    ]);
     expect(composed.probe.only().rpcCalls).toEqual([]);
   });
 
