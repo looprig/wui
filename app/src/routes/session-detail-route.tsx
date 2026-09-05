@@ -70,6 +70,7 @@ export function FactorySessionDetailRoute({ sid }: { sid: string }): React.JSX.E
     <FactorySessionDetailPage
       sid={sid}
       view={view}
+      reads={client.reads}
       onGateRespond={(gateId, action) => {
         const gate = gateControls.gates.find((entry) => entry.gateId === gateId);
         if (gate !== undefined) void gateControls.respond(gate, action);
