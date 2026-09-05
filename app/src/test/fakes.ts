@@ -122,25 +122,46 @@ export const emptySessionList: SessionList = {
  * `src/test/live.ts` records the same reasoning for the live source. This is
  * the subset `app/` composition tests actually drive.
  *
- * ## What is mirrored from `protocol/src/clientlink.ts`, and why each
+ * ## What is mirrored from `protocol/src/clientlink.ts`, and what reads it
  *
- *  - `connect()` returns the SAME promise while one is in flight and an
- *    already-resolved one once connected, so a coalescing claim about
- *    `FactoryLinkStore` stays a claim about the store rather than about this;
- *  - `disconnect()` rejects a pending connect with the same
+ * Exactly ONE of the four is read by a test in `app/` today, and saying so is
+ * the point of this list. The three unread ones are not decoration and not
+ * dead: `FakeClientLink` is what U5.2's claims about `FactoryLinkStore` will be
+ * measured against, and a fake looser than the real link turns a claim about
+ * the store into a claim about the fake (§5 class 4). But "mirrors the
+ * semantics its readers depend on" is what this comment used to say, and it was
+ * false three ways: the quality gate removed each of the three below in turn and
+ * each survived. Re-measured on this commit's tree — each of the three removed
+ * alone, each surviving the app project's 182 tests with no failure.
+ *
+ *  - **UNREAD.** `connect()` returns the SAME promise while one is in flight and
+ *    an already-resolved one once connected, so a coalescing claim about
+ *    `FactoryLinkStore` stays a claim about the store rather than about this.
+ *    Deleting both early returns changes nothing here: no test in `app/` calls
+ *    `connect()` twice with the first still in flight.
+ *  - **UNREAD.** `disconnect()` rejects a pending connect with the same
  *    `RealtimeTransportError` the real link raises, which is the path
- *    `FactoryLinkStore`'s epoch guard exists for and which StrictMode's
- *    open/close/open takes on every mount;
- *  - **a connection token is minted per connect ATTEMPT.** The real link passes
- *    `getToken: () => credentials.connectionToken!()` to Centrifuge, and
- *    Centrifuge calls it on every connect, including every automatic reconnect
- *    — so a reconnect re-enters the application's token function rather than
- *    replaying the first token. `connectTokens` records the mint at call time,
- *    not at settlement, because an attempt a `disconnect()` interrupts has
- *    still asked the application for a token.
- *  - the token hook exists only when `connectionToken` was supplied, exactly as
- *    `CentrifugeClientLink`'s constructor decides it: a forwarder installed for
- *    a caller that supplies none is a hook that can only fail.
+ *    `FactoryLinkStore`'s epoch guard exists for. Deleting the rejection changes
+ *    nothing here either, which is the measurement: every `disconnect()` this
+ *    file reaches happens with no attempt still PENDING, so the rejected promise
+ *    has no awaiter to observe it — including StrictMode's open/close/open.
+ *  - **UNREAD.** A connection token is minted per connect ATTEMPT, recorded at
+ *    call time rather than at settlement, because an attempt a `disconnect()`
+ *    interrupts has still asked the application for a token. The
+ *    "re-mints on every connect" test reads mint-per-CONNECT, which the fake
+ *    would satisfy by recording at settlement too; only an interrupted attempt
+ *    separates the two, and nothing here interrupts one — recording at
+ *    settlement instead was measured to survive.
+ *  - **READ**, by "installs no token hook for an application that supplies no
+ *    credentials": the token hook exists only when `connectionToken` was
+ *    supplied, exactly as `CentrifugeClientLink`'s constructor decides it — a
+ *    forwarder installed for a caller that supplies none is a hook that can only
+ *    fail.
+ *
+ * The real link is the authority for all four regardless of who reads them: the
+ * direction that matters is that this is never LOOSER than
+ * `protocol/src/clientlink.ts`, and U5.2 is where the first three acquire
+ * readers, along with the subscription registry noted below.
  *
  * ## Deliberate differences
  *

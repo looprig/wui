@@ -2,7 +2,7 @@ import { fileURLToPath } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { playwright } from "@vitest/browser-playwright";
-import type { ProxyOptions } from "vite";
+import type { ConfigEnv, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
 
 /**
@@ -10,27 +10,49 @@ import { defineConfig } from "vitest/config";
  *
  * `npm run dev` serves the SPA from Vite and forwards `/v1` to Factory, so the
  * browser talks to one origin: no CORS, no BFF (there is no BFF in this design)
- * and no rewriting of the `Origin` a Factory CSRF/origin check needs to read.
+ * and no rewriting of the `Origin` or `Host` a Factory guard needs to read.
  * Both halves of the plane live under the same prefix — REST reads and commands
  * at `/v1/...`, and the Centrifuge socket at `/v1/realtime` — which is why
  * `createFactoryClient` derives its realtime endpoint from the same `baseUrl`.
  *
+ * "No CORS" is only half the sentence, and the other half is a configuration a
+ * developer must make on the Factory side. `factory/internal/httpapi/guard.go`
+ * runs a HOST rule BEFORE its Origin rule — `Guard.Check` calls `hostTrusted`
+ * first and answers `ReasonHostNotTrusted` ("host_not_trusted") — and both
+ * rules compare against the deployment's `TrustedOrigins`. Vite serves the page
+ * on its own dev origin, not on Factory's, so every proxied request arrives
+ * carrying that origin in BOTH headers. Factory must trust the Vite dev origin
+ * or it answers `host_not_trusted` before routing, which looks like a broken
+ * proxy and is not one.
+ *
  * ## The target, and what it is not
  *
  * Factory has no `cmd/factory` yet (runbook 05, task A9.1) and therefore no
- * canonical bind address: `factory/` declares no listen address anywhere. The
- * default below is the loopback address the local stack already uses — the one
- * `carbon serve` binds (Phase 6, `defaultServeAddr`) — and it is a DEVELOPMENT
- * default, not a claim about where Factory listens. A developer running Factory
+ * bind address of its own: there is no `factory/cmd` directory and no listen
+ * call anywhere in `factory/`. `127.0.0.1:8722` is CARBON's — it is
+ * `defaultServeAddr` in `carbon/cmd/carbon/main.go` — and it is a DEVELOPMENT
+ * default, not a claim about where Factory listens.
+ *
+ * Know what that buys, because it is worse than a dead port. With `carbon
+ * serve` running, `npm run dev` HALF-works: the LEGACY Host REST routes answer
+ * (`harness/pkg/serve/mux.go` serves `GET /v1/sessions`,
+ * `/v1/sessions/{sid}/events`, `/v1/sessions/{sid}/journal`), so the sessions
+ * list and the transcript load and the app looks wired up — while
+ * `/v1/realtime` reaches no Centrifuge endpoint at all, because `pkg/serve`
+ * registers none. A dead port fails uniformly and diagnoses itself; this fails
+ * on exactly the half that is new. **The Factory plane will not answer on this
+ * port until A9.1 ships a binary that serves it.** A developer running Factory
  * elsewhere states so explicitly with `WUI_DEV_FACTORY_TARGET`.
  *
  * Safe for local use means three specific things, each of which has a reader in
  * `vite.config.test.ts`: the default is loopback and never a wildcard or a
  * remote host; an override that is not an absolute `http:`/`https:` URL is
- * REFUSED at config load, because a bad target is otherwise silent (the dev
- * server still starts and every Factory route just fails); and `changeOrigin`
- * is left off, so the browser's `Origin` and `Host` reach Factory unmodified
- * rather than being rewritten to the target's.
+ * REFUSED when the DEV SERVER's configuration is built — not at module load,
+ * because `vite build` and every `vitest` run import this file and neither
+ * serves a proxy (see the default export); and `changeOrigin` is left off, so
+ * the browser's `Origin` and `Host` reach Factory unmodified rather than being
+ * rewritten to the target's authority, which is exactly the header the Host
+ * rule above reads.
  *
  * Exported, and asserted by `vite.config.test.ts`, because every one of these
  * is a single token in a file no other test loads.
@@ -83,7 +105,28 @@ export function devProxy(target: string): Record<string, ProxyOptions> {
   };
 }
 
-export default defineConfig({
+/**
+ * Whether this Vite invocation is the dev server the proxy exists for.
+ *
+ * The proxy — and therefore `resolveFactoryTarget()`'s refusal — used to live
+ * in the default export's object literal, which meant it ran at MODULE
+ * EVALUATION: a malformed `WUI_DEV_FACTORY_TARGET` failed `vite build` and
+ * every `vitest` run, neither of which forwards anything to Factory. Fail-fast
+ * was right; the blast radius was not.
+ *
+ * A lazy `get proxy()` does not fix it, measured: Vite's `resolveServerOptions`
+ * reads `server.proxy` while resolving a BUILD config too, so the getter throws
+ * under `vite build` exactly as the eager call did. The config-function env is
+ * what actually separates the three invocations, and all three were measured:
+ * `vite build` arrives as `{command: "build", mode: "production"}`, `vitest` as
+ * `{command: "serve", mode: "test"}`, and `npm run dev` is the remaining case —
+ * a serve that is not a test run.
+ */
+export function servesDevProxy(env: Pick<ConfigEnv, "command" | "mode">): boolean {
+  return env.command === "serve" && env.mode !== "test";
+}
+
+export default defineConfig((env) => ({
   plugins: [react(), tailwindcss()],
   resolve: {
     // One React instance for everything. Without this a prebundled dependency
@@ -128,9 +171,9 @@ export default defineConfig({
     // `all:dist`, so this is belt as well as braces.
     assetsDir: "assets",
   },
-  server: {
-    proxy: devProxy(resolveFactoryTarget()),
-  },
+  // Spread rather than `server: <cond> ? {...} : undefined`, so a build or a
+  // test run carries no `server` key at all rather than one holding undefined.
+  ...(servesDevProxy(env) ? { server: { proxy: devProxy(resolveFactoryTarget()) } } : {}),
   test: {
     // Same guard packages/protocol and packages/react use, and the same one
     // client/ uses: a test that asserts nothing is a test that passes for the
@@ -165,4 +208,4 @@ export default defineConfig({
       },
     ],
   },
-});
+}));

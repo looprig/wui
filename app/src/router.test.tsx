@@ -3,6 +3,7 @@ import { page, userEvent } from "vitest/browser";
 import { describe, expect, it } from "vitest";
 import { render } from "vitest-browser-react";
 import { RouterProvider, createMemoryHistory } from "@tanstack/react-router";
+import { createFactoryClient, type FactoryClient } from "@looprig/protocol";
 import { browserFactoryComposition, createAppRouter, factoryBaseUrl } from "./router";
 import { FactoryLinkProbe, FakeTransport, emptySessionList } from "./test/fakes";
 import { ControlledLiveSource } from "./test/live";
@@ -137,13 +138,33 @@ describe("live source composition", () => {
 
   it("keeps one source per session across a navigation", async () => {
     const composed = compose("/sessions", oneRow());
-    render(<RouterProvider router={composed.router} />);
+    const screen = await render(<RouterProvider router={composed.router} />);
     await expect.element(page.getByTestId("session-row-link")).toBeInTheDocument();
     expect(composed.live.openCount).toBe(0);
 
     await userEvent.click(page.getByTestId("session-row-link"));
     await expect.element(page.getByTestId("detail-session-id")).toBeInTheDocument();
     await expect.poll(() => composed.live.openCount).toBe(1);
+    expect(composed.live.closedCount).toBe(0);
+
+    // DEPARTURE closes it. `ControlledLiveSource` counts a close and nothing
+    // read the count, which is the same unread line as the one this file's
+    // first test exists to catch, one step later in the lifecycle: a source
+    // left open on the way back to the list is a live `/events` stream per
+    // session ever visited, for as long as the tab is open.
+    await composed.router.navigate({ to: "/sessions" });
+    await expect.element(page.getByTestId("session-row-link")).toBeInTheDocument();
+    await expect.poll(() => composed.live.closedCount).toBe(1);
+    // And closed, not reopened: leaving does not count a second open.
+    expect(composed.live.openCount).toBe(1);
+
+    // Unmounting the application closes the FACTORY socket by the same
+    // argument, one layer up. `open` is the probe's live count — `maxOpen` is a
+    // high-water mark and cannot fall — so this is the only assertion that can
+    // see a provider whose cleanup never ran.
+    await screen.unmount();
+    await expect.poll(() => composed.probe.open).toBe(0);
+    expect(composed.probe.only().state).toBe("disconnected");
   });
 });
 
@@ -201,6 +222,44 @@ describe("one Factory client per application", () => {
     );
     await expect.poll(() => probe.links.length).toBe(2);
     await expect.poll(() => probe.maxOpen).toBe(2);
+  });
+
+  it("records a Factory REST read, so the empty fetchCalls above is not vacuous", async () => {
+    // The other half of the same antidote, for the OTHER negative assertion.
+    // `expect(probe.fetchCalls).toEqual([])` cannot tell "the application issued
+    // no Factory REST request" from "the probe's `fetch` was never installed and
+    // the request went to the real one": deleting `fetch: this.fetch` from
+    // `FactoryLinkProbe.options()` left all sixteen tests in this file green.
+    //
+    // What makes it non-vacuous is showing that the plane the application
+    // composed issues ITS reads here. `create` is `FactoryLinkProvider`'s own
+    // construction seam and this one delegates to the real `createFactoryClient`
+    // — it captures the client, it does not replace it, so the options-to-client
+    // mapping under test is production's.
+    const probe = new FactoryLinkProbe();
+    const clients: FactoryClient[] = [];
+    const live = new ControlledLiveSource();
+    const router = createAppRouter({
+      history: createMemoryHistory({ initialEntries: ["/sessions"] }),
+      transport: empty(),
+      createLiveSource: () => live.source,
+      factory: {
+        options: probe.options(),
+        create: (options) => {
+          const client = createFactoryClient(options);
+          clients.push(client);
+          return client;
+        },
+      },
+    });
+    render(<RouterProvider router={router} />);
+    await expect.element(page.getByTestId("sessions-empty")).toBeInTheDocument();
+
+    expect(clients.length).toBe(1);
+    // Never settles (the probe's `fetch` returns a promise that does not), so
+    // it is deliberately not awaited; `fetchCalls` is the observation.
+    void clients[0]!.reads.listAgents();
+    await expect.poll(() => probe.fetchCalls.map((call) => call.input)).toEqual(["/v1/agents"]);
   });
 });
 

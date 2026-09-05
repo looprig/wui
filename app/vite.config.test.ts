@@ -1,7 +1,7 @@
 import { createServer as createHttpServer, request as httpRequest, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createServer, type ViteDevServer } from "vite";
+import { createServer, type ConfigEnv, type UserConfig, type ViteDevServer } from "vite";
 import config, {
   DEFAULT_DEV_FACTORY_TARGET,
   DEV_API_PREFIX,
@@ -9,7 +9,43 @@ import config, {
   DEV_REALTIME_PATH,
   devProxy,
   resolveFactoryTarget,
+  servesDevProxy,
 } from "./vite.config";
+
+/**
+ * The three invocations Vite distinguishes, exactly as it hands them over —
+ * measured by logging the env from the config function under `vite build` and
+ * under `vitest run`, not assumed from the documentation.
+ */
+const BUILD: ConfigEnv = { command: "build", mode: "production", isSsrBuild: false, isPreview: false };
+const TEST: ConfigEnv = { command: "serve", mode: "test", isSsrBuild: false, isPreview: false };
+const DEV: ConfigEnv = { command: "serve", mode: "development", isSsrBuild: false, isPreview: false };
+
+/** The default export is a config FUNCTION now; this is the one call site shape. */
+function resolved(env: ConfigEnv): UserConfig {
+  return config(env) as UserConfig;
+}
+
+/**
+ * Runs `body` with `WUI_DEV_FACTORY_TARGET` set to `value`, restored after.
+ *
+ * The default export reads the AMBIENT environment — `resolveFactoryTarget()`
+ * defaults its parameter to `process.env` — so a test about what a real
+ * invocation gets has to state the environment rather than pass a record. It
+ * restores rather than deletes, because the variable may legitimately be set in
+ * the shell that started vitest and the other tests here would then be reading
+ * a value this file invented.
+ */
+function withTargetEnv<T>(value: string, body: () => T): T {
+  const previous = process.env[DEV_FACTORY_TARGET_ENV];
+  process.env[DEV_FACTORY_TARGET_ENV] = value;
+  try {
+    return body();
+  } finally {
+    if (previous === undefined) delete process.env[DEV_FACTORY_TARGET_ENV];
+    else process.env[DEV_FACTORY_TARGET_ENV] = previous;
+  }
+}
 
 /**
  * The build and dev-server settings are load-bearing in ways nothing else can
@@ -31,12 +67,12 @@ import config, {
  */
 describe("vite config", () => {
   it("builds into the //go:embed directory without emptying it", () => {
-    expect(config.build?.outDir).toBe("../dist");
-    expect(config.build?.emptyOutDir).toBe(false);
+    expect(resolved(BUILD).build?.outDir).toBe("../dist");
+    expect(resolved(BUILD).build?.emptyOutDir).toBe(false);
   });
 
   it("names an asset directory //go:embed will not skip", () => {
-    const assetsDir = config.build?.assetsDir;
+    const assetsDir = resolved(BUILD).build?.assetsDir;
     expect(assetsDir).toBe("assets");
     expect(assetsDir?.startsWith("_")).toBe(false);
     expect(assetsDir?.startsWith(".")).toBe(false);
@@ -89,8 +125,44 @@ describe("dev proxy target", () => {
     expect(proxy[DEV_API_PREFIX]).toEqual({ target: "http://127.0.0.1:1", changeOrigin: false });
   });
 
-  it("is what the exported config actually installs", () => {
-    expect(config.server?.proxy).toEqual(devProxy(resolveFactoryTarget()));
+  it("is what the dev server actually installs, and nothing else installs it", () => {
+    // The environment is STATED, not read: `toEqual(devProxy(resolveFactoryTarget()))`
+    // would pass for a config that resolved the target some other way, because
+    // both sides would be the same call. A value only this test knows is what
+    // shows the env reaches the installed record.
+    withTargetEnv("http://127.0.0.1:9999", () => {
+      expect(resolved(DEV).server?.proxy).toEqual(devProxy("http://127.0.0.1:9999"));
+      // A build writes files and a vitest run drives a browser over its own
+      // fixtures; neither forwards anything to Factory, so neither carries the
+      // proxy — and, below, neither pays for a malformed target either.
+      expect(resolved(BUILD).server).toBeUndefined();
+      expect(resolved(TEST).server).toBeUndefined();
+    });
+    expect(servesDevProxy(DEV)).toBe(true);
+    expect(servesDevProxy(BUILD)).toBe(false);
+    expect(servesDevProxy(TEST)).toBe(false);
+  });
+
+  it("confines a malformed target's refusal to the dev server", () => {
+    // The defect: `resolveFactoryTarget()` was called in the default export's
+    // object literal, so it ran at MODULE EVALUATION and a bad value failed
+    // `vite build` and every `vitest` run — neither of which touches the proxy.
+    // A lazy `get proxy()` is not the fix either; Vite's `resolveServerOptions`
+    // reads `server.proxy` while resolving a build config too.
+    //
+    // Measured end to end at both ends of the fix, not only here:
+    // `WUI_DEV_FACTORY_TARGET=nonsense npx vite build` exited 1 before and
+    // exits 0 after, and `npx vite` with the same value exits 1 with this
+    // message in both.
+    withTargetEnv("127.0.0.1:8722", () => {
+      expect(() => resolved(BUILD)).not.toThrow();
+      expect(() => resolved(TEST)).not.toThrow();
+      expect(() => resolved(DEV)).toThrow(DEV_FACTORY_TARGET_ENV);
+      // Still the WHOLE config, not a stub with the proxy chopped out: the
+      // build path a bad target must not break is the one that emits the
+      // //go:embed bundle.
+      expect(resolved(BUILD).build?.outDir).toBe("../dist");
+    });
   });
 });
 
@@ -103,14 +175,17 @@ describe("dev proxy target", () => {
  */
 describe("dev proxy behaviour", () => {
   const paths: string[] = [];
+  const received: Array<{ host?: string; origin?: string }> = [];
   const upgrades: string[] = [];
   let factory: Server;
   let vite: ViteDevServer;
   let port = 0;
+  let factoryOrigin = "";
 
   beforeAll(async () => {
     factory = createHttpServer((req, res) => {
       paths.push(req.url ?? "");
+      received.push({ host: req.headers.host, origin: req.headers.origin });
       res.writeHead(200, { "content-type": "text/plain", connection: "close" });
       res.end("factory");
     });
@@ -120,6 +195,7 @@ describe("dev proxy behaviour", () => {
     });
     await new Promise<void>((resolve) => factory.listen(0, "127.0.0.1", resolve));
     const target = `http://127.0.0.1:${(factory.address() as AddressInfo).port}`;
+    factoryOrigin = target;
 
     vite = await createServer({
       configFile: false,
@@ -137,10 +213,10 @@ describe("dev proxy behaviour", () => {
     await new Promise<void>((resolve) => factory.close(() => resolve()));
   });
 
-  function get(path: string): Promise<number> {
+  function get(path: string, extra: Record<string, string> = {}): Promise<number> {
     return new Promise((resolve, reject) => {
       const req = httpRequest(
-        { host: "127.0.0.1", port, path, headers: { connection: "close" } },
+        { host: "127.0.0.1", port, path, headers: { connection: "close", ...extra } },
         (res: IncomingMessage) => {
           res.resume();
           res.on("end", () => resolve(res.statusCode ?? 0));
@@ -155,6 +231,25 @@ describe("dev proxy behaviour", () => {
     const path = "/v1/sessions/44444444-4444-4444-4444-444444444444/events?since=7";
     expect(await get(path)).toBe(200);
     expect(paths).toContain(path);
+  });
+
+  it("hands Factory the browser's own Host and Origin rather than the target's", async () => {
+    // `changeOrigin: false` is load-bearing and this is its behavioural reader.
+    // http-proxy's `changeOrigin: true` rewrites the outbound Host header to the
+    // TARGET's authority, and Factory's guard runs a HOST rule — `Guard.Check`
+    // calls `hostTrusted` first and answers `ReasonHostNotTrusted` — before its
+    // Origin rule, so the rewrite lands on exactly what that rule reads.
+    //
+    // The discriminator is that the Vite port and the fixture-Factory port are
+    // different: asserting the VITE authority is what fails the moment
+    // changeOrigin flips, where asserting "some host" would not.
+    const browserOrigin = `http://127.0.0.1:${port}`;
+    const before = received.length;
+    expect(await get("/v1/capabilities", { origin: browserOrigin })).toBe(200);
+    const seen = received.slice(before);
+    expect(seen).toEqual([{ host: `127.0.0.1:${port}`, origin: browserOrigin }]);
+    // And not the target's, which is the value the rewrite would substitute.
+    expect(seen[0]?.host).not.toBe(new URL(factoryOrigin).host);
   });
 
   it("does not proxy a path outside the API prefix", async () => {
