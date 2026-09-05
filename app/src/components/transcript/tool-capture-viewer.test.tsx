@@ -44,7 +44,14 @@ async function fixture(text: string, encoding: "utf-8" | "binary" = "utf-8") {
 }
 
 test("loads no object bytes until asked, then shows only whole-verified local pages", async () => {
-  const body = `${"a".repeat(64 * 1024)}é`;
+  // One byte short of the 64 KiB page, so the two UTF-8 bytes of `é` STRADDLE the
+  // page boundary: byte 65535 ends page one and byte 65536 opens page two. A
+  // decoder that did not carry its state across pages would emit a replacement
+  // character on each side, so the round-trip below is what pins the streaming
+  // decode. `'a'.repeat(64 * 1024)` put the whole character inside page two and
+  // could not tell the two apart. The capture is still 65 537 bytes, so the
+  // two-range assertion below is unchanged.
+  const body = `${"a".repeat(64 * 1024 - 1)}é`;
   const { capture, reads } = await fixture(body);
   render(<ToolCaptureViewer reads={reads} sessionId="session-1" toolUseId="tool-1" capture={capture} />);
 
