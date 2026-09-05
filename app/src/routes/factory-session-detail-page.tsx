@@ -1,4 +1,4 @@
-import type { FactorySessionStatus } from "@looprig/protocol";
+import { GATE_APPROVAL_ACTIONS, type FactorySessionStatus, type GateApprovalAction } from "@looprig/protocol";
 import type { UseFactorySessionViewResult } from "@looprig/react";
 
 const TERMINAL_STATES = new Set(["failed", "interrupted", "stopped", "completed", "cancelled"]);
@@ -13,10 +13,11 @@ export function durableStateLabel(status: FactorySessionStatus): string {
 export interface FactorySessionDetailPageProps {
   sid: string;
   view: UseFactorySessionViewResult;
+  onGateRespond?: (gateId: string, action: GateApprovalAction) => void;
 }
 
 /** Durable session projection. Realtime health is metadata, never a render prerequisite. */
-export function FactorySessionDetailPage({ sid, view }: FactorySessionDetailPageProps): React.JSX.Element {
+export function FactorySessionDetailPage({ sid, view, onGateRespond }: FactorySessionDetailPageProps): React.JSX.Element {
   if (view.status === null && view.state !== "failed") {
     return <main className="p-6"><p role="status">Loading session…</p></main>;
   }
@@ -57,6 +58,19 @@ export function FactorySessionDetailPage({ sid, view }: FactorySessionDetailPage
               <p className="font-medium">{gate.prompt.title ?? "Decision required"}</p>
               <p className="text-sm text-muted">{gate.prompt.body ?? ""}</p>
               <p className="font-mono text-xs text-muted">{gate.kind} · {gate.answerability}</p>
+              {gate.kind === "harness.permission" && gate.answerability === "resident" && onGateRespond !== undefined ? (
+                <div data-testid="factory-gate-actions" className="mt-2 flex gap-2">
+                  {Object.values(GATE_APPROVAL_ACTIONS).map((action) => (
+                    <button key={action} type="button" onClick={() => onGateRespond(gate.gate_id, action)} className="rounded border border-border px-2 py-1 text-xs">
+                      {action}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <p data-testid="factory-gate-unavailable" className="mt-2 text-xs text-muted">
+                  {gate.answerability === "resident" ? "Answer this gate in a supported client" : "No resident action is available"}
+                </p>
+              )}
             </article>
           ))}
         </section>

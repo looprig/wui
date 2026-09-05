@@ -1,12 +1,14 @@
 import { useMemo } from "react";
 import {
+  emptyPublicGateBoard,
+  foldPublicGatePage,
   createFetchLiveFrameSource,
   createHostTransport,
   type LiveFrameSource,
   type LooprigTransport,
 } from "@looprig/protocol";
 import { SessionDetailPage } from "./session-detail-page";
-import { useFactoryClient, useFactorySessionView, useFactoryTenantId } from "@looprig/react";
+import { useFactoryClient, useFactoryGate, useFactorySessionView, useFactoryTenantId } from "@looprig/react";
 import { FactorySessionDetailPage } from "./factory-session-detail-page";
 
 export interface SessionDetailRouteProps {
@@ -59,5 +61,19 @@ export function FactorySessionDetailRoute({ sid }: { sid: string }): React.JSX.E
   const client = useFactoryClient();
   const tenantId = useFactoryTenantId();
   const view = useFactorySessionView(client.reads, { tenantId, sessionId: sid });
-  return <FactorySessionDetailPage sid={sid} view={view} />;
+  const gateBoard = useMemo(
+    () => view.gates === null ? emptyPublicGateBoard() : foldPublicGatePage(emptyPublicGateBoard(), view.gates, sid),
+    [sid, view.gates],
+  );
+  const gateControls = useFactoryGate(sid, gateBoard);
+  return (
+    <FactorySessionDetailPage
+      sid={sid}
+      view={view}
+      onGateRespond={(gateId, action) => {
+        const gate = gateControls.gates.find((entry) => entry.gateId === gateId);
+        if (gate !== undefined) void gateControls.respond(gate, action);
+      }}
+    />
+  );
 }

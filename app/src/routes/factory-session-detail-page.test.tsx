@@ -52,3 +52,33 @@ test("loads older history only from the explicit user control", async () => {
   await userEvent.click(page.getByTestId("browse-earlier-history"));
   expect(browseEarlier).toHaveBeenCalledTimes(1);
 });
+
+test("renders multiple gates while separating supported resident actions", async () => {
+  const gates = {
+    journal_tip: 4,
+    open_gate_count: 3,
+    gates: [
+      {
+        gate_id: "gate-1", kind: "harness.permission", prompt: { title: "Allow shell?" },
+        opened_event_id: "event-1", opened_journal_seq: 1,
+        deadline: "2026-09-05T13:00:00Z", answerability: "resident" as const,
+      },
+      {
+        gate_id: "gate-2", kind: "harness.permission", prompt: { title: "Allow edit?" },
+        opened_event_id: "event-2", opened_journal_seq: 2,
+        deadline: "2026-09-05T13:00:00Z", answerability: "suspended" as const,
+      },
+      {
+        gate_id: "gate-3", kind: "harness.ask_user", prompt: { title: "Choose one" },
+        opened_event_id: "event-3", opened_journal_seq: 3,
+        deadline: "2026-09-05T13:00:00Z", answerability: "resident" as const,
+      },
+    ],
+  };
+  render(<FactorySessionDetailPage sid="session-1" view={view({ gates })} onGateRespond={vi.fn()} />);
+
+  await expect.element(page.getByTestId("factory-gate-stack")).toBeInTheDocument();
+  expect(document.querySelectorAll("[data-testid=factory-gate-card]")).toHaveLength(3);
+  expect(document.querySelectorAll("[data-testid=factory-gate-actions]")).toHaveLength(1);
+  expect(document.querySelectorAll("[data-testid=factory-gate-unavailable]")).toHaveLength(2);
+});
