@@ -19,6 +19,7 @@ test("exports exactly the documented public surface", () => {
     "useFactoryInterrupt",
     "useFactoryLink",
     "useFactoryLinkStatus",
+    "useFactorySessionList",
     "useFactorySessionView",
     "useFactoryTenantId",
     "useGate",

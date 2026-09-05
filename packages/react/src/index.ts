@@ -16,6 +16,12 @@ export {
   type SessionListQuery,
   type UseSessionListResult,
 } from "./use-session-list.js";
+export {
+  useFactorySessionList,
+  type FactorySessionListReads,
+  type FactorySessionListSnapshot,
+  type UseFactorySessionListResult,
+} from "./use-factory-session-list.js";
 // Opening a session view is a READ. `useAttachOrRestore` was deleted rather
 // than deprecated in U4.2: `@looprig/react` is `private: true`, has never been
 // published, and the only consumer in or out of this repository is `app/` —
