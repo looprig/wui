@@ -288,6 +288,10 @@ export class FactoryLinkProbe {
   readonly fetchCalls: Array<{ input: string; init?: RequestInit }> = [];
   open = 0;
   maxOpen = 0;
+  bootstrapResult: Promise<Response> = Promise.resolve(new Response(
+    JSON.stringify({ tenant_id: "tenant-1" }),
+    { headers: { "Cache-Control": "no-store", "Content-Type": "application/json" } },
+  ));
 
   /** The exact `ClientLinkConstructor` `createFactoryClient` takes. */
   readonly clientLinkFactory: ClientLinkConstructor = (options: ClientLinkOptions = {}): ClientLink => {
@@ -305,6 +309,11 @@ export class FactoryLinkProbe {
    */
   readonly fetch: FetchLike = (input: string, init?: RequestInit): Promise<Response> => {
     this.fetchCalls.push(init === undefined ? { input } : { input, init });
+    if (new URL(input, "https://factory.invalid").pathname === "/v1/bootstrap") {
+      // StrictMode runs the bootstrap effect twice. A Response body is
+      // one-shot, so every HTTP call must receive its own response instance.
+      return this.bootstrapResult.then((response) => response.clone());
+    }
     return new Promise<Response>(() => {});
   };
 

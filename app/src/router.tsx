@@ -14,7 +14,7 @@ import {
   type LiveFrameSource,
   type LooprigTransport,
 } from "@looprig/protocol";
-import { FactoryLinkProvider, useFactoryClient, type FactoryLinkProviderProps } from "@looprig/react";
+import { FactoryIdentityProvider, useFactoryClient, type FactoryIdentityProviderProps } from "@looprig/react";
 import { SessionsPage } from "./routes/sessions-page";
 import { SessionDetailRoute } from "./routes/session-detail-route";
 
@@ -26,7 +26,7 @@ import { SessionDetailRoute } from "./routes/session-detail-route";
  * new provider option cannot become unreachable from the composition root by
  * omission — which is the failure mode a hand-copied interface has.
  */
-export type FactoryComposition = Omit<FactoryLinkProviderProps, "children">;
+export type FactoryComposition = Omit<FactoryIdentityProviderProps, "children" | "pending" | "renderBootstrapError">;
 
 export interface AppRouterOptions {
   /** Injected by tests (memory history); production uses the browser's own. */
@@ -146,9 +146,29 @@ export function createAppRouter({
   const rootRoute = createRootRoute({
     component: function AppRoot() {
       return (
-        <FactoryLinkProvider {...factory}>
+        <FactoryIdentityProvider
+          {...factory}
+          pending={(
+            <main className="mx-auto max-w-4xl p-6">
+              <p role="status" data-testid="factory-bootstrap-loading" className="text-sm text-muted">
+                Identifying…
+              </p>
+            </main>
+          )}
+          renderBootstrapError={(error, retry) => (
+            <main className="mx-auto max-w-4xl p-6">
+              <div role="alert" data-testid="factory-bootstrap-error" className="rounded-md border border-fail/50 bg-fail/10 p-4 text-fail">
+                <p className="font-medium">Couldn&rsquo;t verify this account</p>
+                <p className="font-mono text-sm">{error.message}</p>
+                <button type="button" onClick={retry} className="mt-2 rounded-md border border-fail px-3 py-1 text-xs font-medium">
+                  Try again
+                </button>
+              </div>
+            </main>
+          )}
+        >
           <FactoryPlane />
-        </FactoryLinkProvider>
+        </FactoryIdentityProvider>
       );
     },
   });

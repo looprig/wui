@@ -179,10 +179,9 @@ describe("one Factory client per application", () => {
 
     expect(composed.probe.links.length).toBe(1);
     await expect.poll(() => composed.probe.maxOpen).toBe(1);
-    // Constructing the plane performs no I/O of its own: no Factory REST read
-    // and no command RPC is issued merely by opening the application. U5.2 is
-    // what gives either a caller.
-    expect(composed.probe.fetchCalls).toEqual([]);
+    // Bootstrap is the sole initial Factory read. It verifies the ambient
+    // browser principal; opening the list sends no session command.
+    expect(composed.probe.fetchCalls.map((call) => call.input)).toEqual(["/v1/bootstrap"]);
     expect(composed.probe.only().rpcCalls).toEqual([]);
   });
 
@@ -259,7 +258,37 @@ describe("one Factory client per application", () => {
     // Never settles (the probe's `fetch` returns a promise that does not), so
     // it is deliberately not awaited; `fetchCalls` is the observation.
     void clients[0]!.reads.listAgents();
-    await expect.poll(() => probe.fetchCalls.map((call) => call.input)).toEqual(["/v1/agents"]);
+    await expect.poll(() => probe.fetchCalls.map((call) => call.input)).toEqual([
+      "/v1/bootstrap", "/v1/agents",
+    ]);
+  });
+});
+
+describe("authenticated browser bootstrap", () => {
+  it("does not mount routes or construct a socket before tenant verification", async () => {
+    const probe = new FactoryLinkProbe();
+    probe.bootstrapResult = new Promise(() => {});
+    const composed = compose("/sessions", empty(), probe);
+    render(<RouterProvider router={composed.router} />);
+
+    await expect.element(page.getByTestId("factory-bootstrap-loading")).toBeInTheDocument();
+    await expect.element(page.getByTestId("sessions-page")).not.toBeInTheDocument();
+    expect(probe.links).toEqual([]);
+    expect(probe.fetchCalls.map((call) => call.input)).toEqual(["/v1/bootstrap"]);
+    expect(probe.fetchCalls[0]?.init?.cache).toBe("no-store");
+  });
+
+  it("fails closed on an authoritative bootstrap denial", async () => {
+    const probe = new FactoryLinkProbe();
+    probe.bootstrapResult = Promise.resolve(new Response(JSON.stringify({
+      error: { code: "not_authorized", message: "tenant access denied", retryable: false },
+    }), { status: 403 }));
+    const composed = compose("/sessions", empty(), probe);
+    render(<RouterProvider router={composed.router} />);
+
+    await expect.element(page.getByTestId("factory-bootstrap-error")).toHaveTextContent("tenant access denied");
+    await expect.element(page.getByTestId("sessions-page")).not.toBeInTheDocument();
+    expect(probe.links).toEqual([]);
   });
 });
 
