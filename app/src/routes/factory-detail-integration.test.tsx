@@ -34,7 +34,6 @@ import { RouterProvider, createMemoryHistory } from "@tanstack/react-router";
 import { createAppRouter } from "../router";
 import { FactoryLinkProbe, type FakeClientLink } from "../test/fakes";
 import { FactoryPlane, enduringFor, publicEvent } from "../test/factory-plane";
-import { TOOL_CAPTURE_CEILING_BYTES } from "../components/transcript/tool-capture-viewer";
 
 const SID = "44444444-4444-4444-4444-444444444444";
 const OTHER = "55555555-5555-5555-5555-555555555555";
@@ -151,15 +150,29 @@ test("an overflowing live buffer repairs from the durable plane rather than rend
   const subscription = live.open[0]!;
   for (let sequence = 1; sequence <= 258; sequence++) subscription.deliver(enduringFor(SID, sequence));
 
-  // The durable plane's own answer is far BELOW the flood, which is what makes
-  // the two policies distinguishable on screen: an overflow that discarded the
-  // buffer and repaired renders this page, while one that dropped the oldest
-  // frame and kept applying the rest would render the survivors above its tip.
+  // The durable plane's own answer is far BELOW the flood, so a buffered frame
+  // that leaked into the view would be visible above this tip.
+  //
+  // What this row is and is not, measured rather than asserted. It is the
+  // application-level statement of the criterion: a flooded live buffer renders
+  // the durable page and never a fabricated one. It is NOT the sole killer of
+  // `FactorySignalQueue`'s overflow branch — three mutants of that branch were
+  // run against this file (drop-oldest `shift()`, discard without
+  // `requiresRepair`, and both) and all three still render exactly this and
+  // still rejoin, because `mergeFactoryEvents` fails closed on the same
+  // non-contiguous survivors and repairs anyway. Two independent guards reach
+  // one screen. The discard mechanism's own killer is in
+  // `packages/protocol`'s backpressure tests, which is the right layer for it.
   plane.setPage(SID, 10, [10]);
   plane.settleJournal();
 
   await expect.element(page.getByTestId("factory-event-10")).toBeInTheDocument();
   expect(rendered()).toStrictEqual([1, 10]);
+  // And it REPAIRED rather than quietly continuing on the connection whose
+  // buffer it just threw away: the binding rejoined, so the durable page it
+  // rendered was read after a fresh subscribe rather than being whatever the
+  // flooded connection happened to hold.
+  expect(live.subscriptions.length).toBeGreaterThan(1);
 });
 
 test.each([
@@ -260,16 +273,18 @@ test("live callbacks for a superseded session cannot render into the one now on 
 });
 
 test("a capture above the viewer's own ceiling is refused before any object request", async () => {
-  // Pins `TOOL_CAPTURE_CEILING_BYTES` by BEHAVIOUR: raise the constant and this
-  // capture is read instead of refused, which both assertions below catch.
-  expect(TOOL_CAPTURE_CEILING_BYTES).toBe(1024 * 1024);
+  // The ceiling is written as a LITERAL here, not read from the module under
+  // test. Reading the constant would make this capture "one over whatever the
+  // constant says", which is true for every value it could hold and therefore
+  // pins none of them. With the literal, raising the constant admits this
+  // capture and fails both assertions below.
   const plane = new FactoryPlane();
   plane.session(SID).status = {
     session_id: SID, agent_id: "agent-1", state: "idle", residency: "cold", journal_tip: 1,
   };
   plane.session(SID).page = {
     journal_tip: 1, covered_through: 1,
-    events: [captureEvent(1, "object-1", TOOL_CAPTURE_CEILING_BYTES + 1)],
+    events: [captureEvent(1, "object-1", 1024 * 1024 + 1)],
   };
   const app = compose(plane);
   render(<RouterProvider router={app.router} />);
@@ -283,15 +298,16 @@ test("a capture above the viewer's own ceiling is refused before any object requ
 });
 
 test("a capture at exactly the ceiling is admitted and reaches the object plane", async () => {
-  // The other side of the same boundary. Without this row a LOWERED ceiling
-  // would pass the refusal test above and never be noticed.
+  // The other side of the same boundary, and the reason the literal matters:
+  // a LOWERED ceiling refuses this capture, so only the value 1024 * 1024
+  // passes both rows.
   const plane = new FactoryPlane();
   plane.session(SID).status = {
     session_id: SID, agent_id: "agent-1", state: "idle", residency: "cold", journal_tip: 1,
   };
   plane.session(SID).page = {
     journal_tip: 1, covered_through: 1,
-    events: [captureEvent(1, "object-1", TOOL_CAPTURE_CEILING_BYTES)],
+    events: [captureEvent(1, "object-1", 1024 * 1024)],
   };
   const app = compose(plane);
   render(<RouterProvider router={app.router} />);
