@@ -15,7 +15,7 @@ import {
   type LooprigTransport,
 } from "@looprig/protocol";
 import { FactoryIdentityProvider, useFactoryClient, type FactoryIdentityProviderProps } from "@looprig/react";
-import { SessionsPage } from "./routes/sessions-page";
+import { FactorySessionsPage } from "./routes/sessions-page";
 import { SessionDetailRoute } from "./routes/session-detail-route";
 
 /**
@@ -105,11 +105,6 @@ export function browserFactoryComposition(env: Record<string, unknown>): Factory
  * stable value held in the provider's ref, so this subscribes to nothing and
  * re-renders the whole route tree on no state change.
  */
-function FactoryPlane(): React.JSX.Element {
-  useFactoryClient();
-  return <Outlet />;
-}
-
 /**
  * TanStack Router with BROWSER history, not hash history.
  *
@@ -167,7 +162,7 @@ export function createAppRouter({
             </main>
           )}
         >
-          <FactoryPlane />
+          <Outlet />
         </FactoryIdentityProvider>
       );
     },
@@ -186,9 +181,10 @@ export function createAppRouter({
     path: "/sessions",
     component: function SessionsRouteComponent() {
       const navigate = useNavigate();
+      const client = useFactoryClient();
       return (
-        <SessionsPage
-          transport={host}
+        <FactorySessionsPage
+          reads={client.reads}
           onOpenSession={(sid) => {
             void navigate({ to: "/sessions/$sid", params: { sid } });
           }}

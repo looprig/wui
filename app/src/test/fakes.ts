@@ -22,6 +22,7 @@ import type {
   ListSessionsOptions,
   LooprigTransport,
   RestoreResponse,
+  RecentSessionPage,
   SessionList,
   SessionStatus,
 } from "@looprig/protocol";
@@ -292,6 +293,7 @@ export class FactoryLinkProbe {
     JSON.stringify({ tenant_id: "tenant-1" }),
     { headers: { "Cache-Control": "no-store", "Content-Type": "application/json" } },
   ));
+  recentSessionsResult: Promise<RecentSessionPage> = Promise.resolve({ sessions: [] });
 
   /** The exact `ClientLinkConstructor` `createFactoryClient` takes. */
   readonly clientLinkFactory: ClientLinkConstructor = (options: ClientLinkOptions = {}): ClientLink => {
@@ -313,6 +315,9 @@ export class FactoryLinkProbe {
       // StrictMode runs the bootstrap effect twice. A Response body is
       // one-shot, so every HTTP call must receive its own response instance.
       return this.bootstrapResult.then((response) => response.clone());
+    }
+    if (new URL(input, "https://factory.invalid").pathname === "/v1/sessions") {
+      return this.recentSessionsResult.then((page) => new Response(JSON.stringify(page)));
     }
     return new Promise<Response>(() => {});
   };

@@ -30,6 +30,14 @@ interface Composed {
  * file would open a real WebSocket.
  */
 function compose(path: string, transport: FakeTransport, probe = new FactoryLinkProbe()): Composed {
+  probe.recentSessionsResult = transport.listSessionsResult.then((legacy) => ({
+    sessions: legacy.sessions.map((session) => ({
+      ...session,
+      agent_id: "agent-1",
+      state: session.state ?? "idle",
+      last_active_at: session.last_active_at ?? session.created_at ?? "2026-09-05T12:00:00Z",
+    })),
+  }));
   const live = new ControlledLiveSource();
   const router = createAppRouter({
     history: createMemoryHistory({ initialEntries: [path] }),
@@ -181,7 +189,7 @@ describe("one Factory client per application", () => {
     await expect.poll(() => composed.probe.maxOpen).toBe(1);
     // Bootstrap is the sole initial Factory read. It verifies the ambient
     // browser principal; opening the list sends no session command.
-    expect(composed.probe.fetchCalls.map((call) => call.input)).toEqual(["/v1/bootstrap"]);
+    expect(composed.probe.fetchCalls.map((call) => call.input)).toEqual(["/v1/bootstrap", "/v1/sessions?limit=100"]);
     expect(composed.probe.only().rpcCalls).toEqual([]);
   });
 
@@ -258,8 +266,9 @@ describe("one Factory client per application", () => {
     // Never settles (the probe's `fetch` returns a promise that does not), so
     // it is deliberately not awaited; `fetchCalls` is the observation.
     void clients[0]!.reads.listAgents();
-    await expect.poll(() => probe.fetchCalls.map((call) => call.input)).toEqual([
-      "/v1/bootstrap", "/v1/agents",
+    await expect.poll(() => probe.fetchCalls.some((call) => call.input === "/v1/agents")).toBe(true);
+    expect(probe.fetchCalls.map((call) => call.input)).toEqual([
+      "/v1/bootstrap", "/v1/sessions?limit=100", "/v1/agents",
     ]);
   });
 });
