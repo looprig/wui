@@ -402,6 +402,82 @@ class ScriptedFactoryReads implements FactoryJoinReads {
 /** A tail page that fails a coverage guard on every generation. */
 const behindPage: PublicJournalPage = { journal_tip: 4, covered_through: 4, events: [] };
 
+it("a failed journal read aborts its generation's still-pending status read", async () => {
+  const controller = new AbortController();
+  const first = new FakeFactoryLink();
+  const second = new FakeFactoryLink();
+  first.ready.resolve();
+  let subscriptions = 0;
+  const link: FactoryJoinLink = {
+    subscribe: (options) => (subscriptions++ === 0 ? first : second).subscribe(options),
+  };
+  const signals: AbortSignal[] = [];
+  const reads: FactoryJoinReads = {
+    readStatus: (_sessionId, options) => {
+      signals.push(options!.signal!);
+      return new Promise(() => {});
+    },
+    readJournal: async () => { throw new Error("journal unavailable"); },
+  };
+  const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+    signal: controller.signal, repairDelayMs: 0,
+  });
+  const pending = gen.next();
+  try {
+    await vi.waitFor(() => expect(subscriptions).toBe(2));
+    expect(signals[0]?.aborted).toBe(true);
+  } finally {
+    controller.abort();
+    await pending;
+    await gen.return();
+  }
+});
+
+type JournalRequest = { tail?: number; limit?: number; cursor?: string; signal?: AbortSignal };
+
+/**
+ * Answers a scripted sequence of journal pages — one per read, ACROSS
+ * generations — and records every request. Unlike `ScriptedFactoryReads` it
+ * scripts the journal alone, because a captured-tail continuation issues
+ * several journal reads against ONE status read, and it records the `cursor`
+ * each one carried, which is the whole point of these cases.
+ */
+class TailPageReads implements FactoryJoinReads {
+  statusCalls = 0;
+  readonly journalOptions: JournalRequest[] = [];
+  private index = 0;
+  constructor(
+    private readonly status: FactorySessionStatus,
+    private readonly pages: PublicJournalPage[],
+  ) {}
+  async readStatus(): Promise<FactorySessionStatus> {
+    this.statusCalls += 1;
+    return this.status;
+  }
+  async readJournal(_sessionId: string, options: JournalRequest = {}): Promise<PublicJournalPage> {
+    this.journalOptions.push(options);
+    const page = this.pages[Math.min(this.index, this.pages.length - 1)]!;
+    this.index += 1;
+    return page;
+  }
+}
+
+/** Every journal read parks on its own deferred, so a test can abort mid-walk. */
+class DeferredTailReads implements FactoryJoinReads {
+  readonly status = new Deferred<FactorySessionStatus>();
+  readonly journals: Deferred<PublicJournalPage>[] = [];
+  readonly journalOptions: JournalRequest[] = [];
+  readStatus(): Promise<FactorySessionStatus> {
+    return this.status.promise;
+  }
+  readJournal(_sessionId: string, options: JournalRequest = {}): Promise<PublicJournalPage> {
+    this.journalOptions.push(options);
+    const deferred = new Deferred<PublicJournalPage>();
+    this.journals.push(deferred);
+    return deferred.promise;
+  }
+}
+
 async function factoryNext(gen: AsyncGenerator<FactoryJoinEvent>): Promise<FactoryJoinEvent> {
   const next = await gen.next();
   if (next.done) throw new Error("factory join ended unexpectedly");
@@ -1030,6 +1106,156 @@ describe("joinFactorySessionView", () => {
     expect(event).toMatchObject({ kind: "projection", generation: 3, coveredThrough: 6 });
     expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 3, coveredThrough: 7 });
     await gen.return();
+  });
+
+  // --- Bounded captured-tail continuation --------------------------------------
+
+  it("follows the captured tail's cursor to its own tip, without ever restarting at zero", async () => {
+    const reads = new TailPageReads(factoryStatus(5), [
+      { journal_tip: 5, covered_through: 2, events: [publicEvent(2)], next_cursor: "cursor-1" },
+      { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      tailLimit: 3,
+      repairDelayMs: 0,
+    });
+    const events = [await factoryNext(gen), await factoryNext(gen), await factoryNext(gen)];
+    expect(events.map((event) => event.kind)).toStrictEqual(["projection", "public", "public"]);
+    // ONE generation: a byte-budgeted page is a continuation, not a failure.
+    expect(events.map((event) => event.generation)).toStrictEqual([1, 1, 1]);
+    expect(events.map((event) => event.coveredThrough)).toStrictEqual([0, 2, 5]);
+    // The captured tail is entered ONCE, by `tail`, and continued ONLY by the
+    // opaque cursor the page handed back: no second `tail`, and nothing that
+    // walks the journal from sequence 0.
+    expect(reads.journalOptions).toMatchObject([
+      { tail: 3, limit: 3 },
+      { cursor: "cursor-1", limit: 3 },
+    ]);
+    expect("cursor" in reads.journalOptions[0]!).toBe(false);
+    expect("tail" in reads.journalOptions[1]!).toBe(false);
+    expect(reads.statusCalls).toBe(1);
+    await gen.return();
+  });
+
+  it("bridges a private byte-limited page that carries no events at all", async () => {
+    const reads = new TailPageReads(factoryStatus(6), [
+      { journal_tip: 6, covered_through: 3, events: [], next_cursor: "cursor-1" },
+      { journal_tip: 6, covered_through: 6, events: [publicEvent(6)] },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { repairDelayMs: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 1, coveredThrough: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 1, coveredThrough: 6 });
+    await gen.return();
+  });
+
+  it("repairs, rather than covering, a continuation that exhausts the page budget", async () => {
+    // Two reads are allowed and neither reaches the tip. The generation must
+    // end with NOTHING emitted — coverage that stopped short is the one thing a
+    // durable cursor may never be advanced over.
+    const reads = new TailPageReads(factoryStatus(9), [
+      { journal_tip: 9, covered_through: 2, events: [publicEvent(2)], next_cursor: "cursor-1" },
+      { journal_tip: 9, covered_through: 4, events: [publicEvent(4)], next_cursor: "cursor-2" },
+      { journal_tip: 9, covered_through: 9, events: [publicEvent(9)] },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      maxTailPages: 2,
+      repairDelayMs: 0,
+    });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 9 });
+    expect(link.links[0]!.unsubscribed).toBe(1);
+    await gen.return();
+  });
+
+  it("repairs, rather than covering, a captured tail over its byte budget", async () => {
+    const heavy = {
+      event_id: "event-2",
+      journal_seq: 2,
+      body: { type: "session.message", text: "x".repeat(512) },
+    };
+    const reads = new TailPageReads(factoryStatus(5), [
+      { journal_tip: 5, covered_through: 2, events: [heavy], next_cursor: "cursor-1" },
+      { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      // Comfortably above one ordinary event's encoding — the REPAIRING
+      // generation's page has to fit, or this passes for the wrong reason —
+      // and far below the 512-character body above.
+      maxTailBytes: 256,
+      repairDelayMs: 0,
+    });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 5 });
+    await gen.return();
+  });
+
+  it("repairs a continuation that hands back a cursor it has already been given", async () => {
+    const reads = new TailPageReads(factoryStatus(9), [
+      { journal_tip: 9, covered_through: 2, events: [publicEvent(2)], next_cursor: "cursor-1" },
+      { journal_tip: 9, covered_through: 4, events: [publicEvent(4)], next_cursor: "cursor-1" },
+      { journal_tip: 9, covered_through: 9, events: [publicEvent(9)] },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { repairDelayMs: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 9 });
+    await gen.return();
+  });
+
+  it.each([
+    {
+      name: "coverage that does not advance",
+      page: { journal_tip: 9, covered_through: 2, events: [], next_cursor: "cursor-2" },
+    },
+    {
+      name: "a tip that moved under the capture",
+      page: { journal_tip: 11, covered_through: 9, events: [publicEvent(9)], next_cursor: "cursor-2" },
+    },
+    {
+      name: "a contradicted event identity",
+      page: { journal_tip: 9, covered_through: 9, events: [publicEvent(2, "other-event"), publicEvent(9)] },
+    },
+  ])("repairs a continuation page carrying $name", async ({ page }) => {
+    const reads = new TailPageReads(factoryStatus(9), [
+      { journal_tip: 9, covered_through: 2, events: [publicEvent(2)], next_cursor: "cursor-1" },
+      page,
+      { journal_tip: 9, covered_through: 9, events: [publicEvent(9)] },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { repairDelayMs: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 9 });
+    await gen.return();
+  });
+
+  it("aborts an in-flight continuation request and unsubscribes", async () => {
+    const reads = new DeferredTailReads();
+    const link = new FakeFactoryLink();
+    const controller = new AbortController();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { signal: controller.signal });
+    const pending = gen.next();
+    link.ready.resolve();
+    await vi.waitFor(() => expect(reads.journals).toHaveLength(1));
+    reads.status.resolve(factoryStatus(5));
+    reads.journals[0]!.resolve({
+      journal_tip: 5,
+      covered_through: 2,
+      events: [publicEvent(2)],
+      next_cursor: "cursor-1",
+    });
+    await vi.waitFor(() => expect(reads.journals).toHaveLength(2));
+
+    controller.abort();
+
+    // The continuation is CANCELLED, not merely ignored, and the generation
+    // ends without ever emitting the partial coverage it had accumulated.
+    await expect(pending).resolves.toMatchObject({ done: true });
+    expect(reads.journalOptions[1]!.signal?.aborted).toBe(true);
+    expect(link.unsubscribed).toBe(1);
   });
 });
 

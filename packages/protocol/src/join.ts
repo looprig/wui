@@ -215,7 +215,11 @@ export interface FactoryJoinLink {
 export interface FactoryJoinOptions {
   /** Greatest authenticated sequence durably persisted by the application. */
   initialCoveredThrough?: number;
-  /** Bound used for the one current-view tail request. Default 256. */
+  /**
+   * Per-page bound: the `tail` the capture is taken with, and the `limit` every
+   * continuation page of that capture is read with. Default 256. It bounds ONE
+   * page; `maxTailPages`/`maxTailEvents`/`maxTailBytes` bound the walk.
+   */
   tailLimit?: number;
   /** Maximum publications retained while the tail is in flight. Default 256. */
   maxPrejoinPublications?: number;
@@ -230,6 +234,17 @@ export interface FactoryJoinOptions {
    * bounded" note on `joinFactorySessionView`.
    */
   maxRepairAttempts?: number;
+  /**
+   * Journal reads allowed per generation to walk ONE captured tail, including
+   * the `tail` read that captured it. Default `DEFAULT_MAX_TAIL_PAGES`. A
+   * capture that has not reached its own `journal_tip` when this is spent is
+   * REFUSED — see `CapturedTail`.
+   */
+  maxTailPages?: number;
+  /** Public events admitted across one captured tail. Default `DEFAULT_MAX_TAIL_EVENTS`. */
+  maxTailEvents?: number;
+  /** Encoded event bytes admitted across one captured tail. Default `DEFAULT_MAX_TAIL_BYTES`. */
+  maxTailBytes?: number;
   /**
    * Base delay before the SECOND and later consecutive non-progressing repair
    * attempts, doubling per attempt and capped at eight times this value.
@@ -276,20 +291,239 @@ type FactorySignal =
   | { kind: "repair"; error?: Error };
 
 /**
- * The Factory join's bounds, exported because a framework adapter that drives
- * the same algorithm over its own transport seam must use the same numbers.
- *
- * `packages/react`'s `useFactorySessionView` does exactly that: it cannot use
- * `joinFactorySessionView` itself yet — the join owns its subscription while
- * `FactoryLinkStore` owns the socket — so it re-derives the loop, and until
- * that seam is resolved these are the one place the constants live. Retyping
- * them there let the two drift silently in either direction with nothing
- * failing.
+ * Shared defaults for the protocol join and framework adapters. React delegates
+ * live reconciliation to this join and uses CapturedTail independently for an
+ * initial REST snapshot while realtime authorization is unavailable.
  */
 export const DEFAULT_FACTORY_TAIL_LIMIT = 256;
 export const DEFAULT_MAX_REPAIR_ATTEMPTS = 32;
 export const DEFAULT_REPAIR_DELAY_MS = 250;
 export const MAX_REPAIR_BACKOFF_FACTOR = 8;
+
+/**
+ * The bounds on ONE captured tail's continuation, exported for the same reason
+ * the four above are: `packages/react`'s `useFactorySessionView` drives the same
+ * `CapturedTail` over its own transport seam.
+ *
+ * `DEFAULT_MAX_TAIL_PAGES` counts the capturing `tail` read too, so the default
+ * admits the capture plus seven continuations — `DEFAULT_MAX_TAIL_PAGES` times
+ * `DEFAULT_FACTORY_TAIL_LIMIT` events, which is what `DEFAULT_MAX_TAIL_EVENTS`
+ * is. The byte ceiling is the one that actually binds against a Factory paging
+ * on a byte budget: it is the reason a page may come back EMPTY with coverage
+ * that still advanced.
+ */
+export const DEFAULT_MAX_TAIL_PAGES = 8;
+export const DEFAULT_MAX_TAIL_EVENTS = 2048;
+export const DEFAULT_MAX_TAIL_BYTES = 1_048_576;
+
+// --- The bounded captured-tail continuation -----------------------------------
+
+/** Why a captured tail was refused. Reported, never repaired in place. */
+export type CapturedTailRefusal =
+  | "page_budget"
+  | "event_budget"
+  | "byte_budget"
+  | "page_limit_exceeded"
+  | "tip_moved"
+  | "coverage_stalled"
+  | "missing_cursor"
+  | "cursor_repeated"
+  | "event_conflict";
+
+/**
+ * What to do after a page: read `cursor` next, stop (the capture is whole), or
+ * abandon this capture entirely.
+ */
+export type CapturedTailStep =
+  | { readonly kind: "complete" }
+  | { readonly kind: "continue"; readonly cursor: string }
+  | { readonly kind: "refused"; readonly reason: CapturedTailRefusal };
+
+export interface CapturedTailBounds {
+  /** Journal reads per capture, INCLUDING the `tail` read that captured it. */
+  maxPages: number;
+  /** Public events admitted across the whole capture. */
+  maxEvents: number;
+  /** Encoded event bytes admitted across the whole capture. */
+  maxBytes: number;
+  /** Per-page event ceiling: the `limit` the reads are issued with. */
+  pageLimit: number;
+}
+
+/** A whole capture: every public event in it, and the coverage it attests. */
+export interface CapturedTailResult {
+  readonly events: PublicJournalPage["events"];
+  readonly coveredThrough: number;
+}
+
+/**
+ * Accumulates ONE captured tail across a Factory's byte-budgeted continuation
+ * pages, and refuses anything that is not that.
+ *
+ * ## What this is for
+ *
+ * A tail read captures a tip `T` and answers with as much of `(0, T]` as its
+ * budget allowed: `covered_through` may stop short of `T`, `events` may be
+ * EMPTY (a page holding only private records still advances coverage), and the
+ * page hands back an opaque `next_cursor` for the rest. Before this class the
+ * join treated `covered_through !== journal_tip` as a fault and repaired, which
+ * is correct only while every tail read is whole: against a Factory that pages,
+ * a bounded session repairs forever and never renders.
+ *
+ * ## What it will not do
+ *
+ * It follows the cursor the pages hand back, and NOTHING else. It never issues
+ * a second `tail`, never names a sequence, and so can never restart at zero or
+ * walk an entire history: the only reachable content is `(0, T]` for the ONE
+ * `T` the capture began with, under three finite ceilings (`maxPages`,
+ * `maxEvents`, `maxBytes`) that bound the walk even if the Factory keeps
+ * offering cursors.
+ *
+ * Every step is checked against the capture rather than believed:
+ *
+ *  - the tip must not move (`tip_moved`) — a page describing a different tip
+ *    describes a different capture, and a later generation recaptures it;
+ *  - coverage must strictly ADVANCE (`coverage_stalled`), which is also what
+ *    makes the walk terminate rather than loop on a stationary page;
+ *  - a cursor is used at most once (`cursor_repeated`), so a Factory handing
+ *    back the cursor it was given cannot spin the caller;
+ *  - a `journal_seq` present twice must carry one `event_id`
+ *    (`event_conflict`).
+ *
+ * ## Refusal is not partial success
+ *
+ * `result` is `undefined` unless the capture reached its own tip, so a caller
+ * cannot advance a durable cursor over coverage that was never attested — the
+ * fail-open direction the join's `covered_through !== journal_tip` guard was
+ * written for, which this class preserves rather than relaxes. A refused
+ * capture is repaired from the last COMMITTED cursor, exactly like every other
+ * fault in the join.
+ *
+ * Nothing here does I/O: the caller owns the reads, their cancellation and
+ * their generation, which is what lets `joinFactorySessionView` and
+ * `packages/react`'s `useFactorySessionView` share one set of rules over two
+ * very different transport seams.
+ */
+export class CapturedTail {
+  readonly #bounds: CapturedTailBounds;
+  readonly #tip: number;
+  readonly #events = new Map<number, PublicJournalPage["events"][number]>();
+  readonly #cursors = new Set<string>();
+  #coveredThrough = -1;
+  #pages = 0;
+  #eventCount = 0;
+  #bytes = 0;
+  #step: CapturedTailStep;
+
+  /** `first` is the answered `tail` read, already validated by the caller. */
+  constructor(first: PublicJournalPage, bounds: CapturedTailBounds) {
+    this.#bounds = bounds;
+    this.#tip = first.journal_tip;
+    this.#step = this.#admit(first);
+  }
+
+  /** The tip this capture is pinned to, for the whole walk. */
+  get tip(): number {
+    return this.#tip;
+  }
+
+  /** What the last admitted page asks the caller to do next. */
+  get step(): CapturedTailStep {
+    return this.#step;
+  }
+
+  /** The capture, or `undefined` until it has actually reached its tip. */
+  get result(): CapturedTailResult | undefined {
+    if (this.#step.kind !== "complete") return undefined;
+    const events = [...this.#events.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, event]) => event);
+    return { events, coveredThrough: this.#coveredThrough };
+  }
+
+  /** Admits one continuation page, read with the cursor `step` named. */
+  accept(page: PublicJournalPage): CapturedTailStep {
+    if (this.#step.kind !== "continue") return this.#step;
+    this.#step = page.journal_tip === this.#tip
+      ? this.#admit(page)
+      : { kind: "refused", reason: "tip_moved" };
+    return this.#step;
+  }
+
+  #admit(page: PublicJournalPage): CapturedTailStep {
+    this.#pages += 1;
+    if (page.events.length > this.#bounds.pageLimit) return refused("page_limit_exceeded");
+    if (page.covered_through <= this.#coveredThrough) return refused("coverage_stalled");
+    if (page.covered_through > this.#tip) return refused("tip_moved");
+    this.#eventCount += page.events.length;
+    if (this.#eventCount > this.#bounds.maxEvents) return refused("event_budget");
+    this.#bytes += capturedTailBytes(page);
+    if (this.#bytes > this.#bounds.maxBytes) return refused("byte_budget");
+    for (const event of page.events) {
+      const prior = this.#events.get(event.journal_seq);
+      if (prior === undefined) this.#events.set(event.journal_seq, event);
+      else if (prior.event_id !== event.event_id) return refused("event_conflict");
+    }
+    this.#coveredThrough = page.covered_through;
+    if (this.#coveredThrough === this.#tip) return { kind: "complete" };
+    const cursor = page.next_cursor;
+    // Coverage stopped short and the Factory offered no way to continue: the
+    // gap is real, and this is where the join's original fail-closed reading
+    // still applies.
+    if (cursor === undefined || cursor === "") return refused("missing_cursor");
+    if (this.#cursors.has(cursor)) return refused("cursor_repeated");
+    this.#cursors.add(cursor);
+    if (this.#pages >= this.#bounds.maxPages) return refused("page_budget");
+    return { kind: "continue", cursor };
+  }
+}
+
+function refused(reason: CapturedTailRefusal): CapturedTailStep {
+  return { kind: "refused", reason };
+}
+
+const capturedTailEncoder = new TextEncoder();
+
+/**
+ * The encoded size of a page's events, in UTF-8 bytes rather than UTF-16 code
+ * units: a `length` would UNDER-count every non-ASCII transcript, which is the
+ * wrong direction for a ceiling.
+ */
+function capturedTailBytes(page: PublicJournalPage): number {
+  return capturedTailEncoder.encode(JSON.stringify(page.events)).length;
+}
+
+/**
+ * Reads `tail`'s continuation pages until it is whole, refused, aborted, or the
+ * generation is superseded by something the queue is holding.
+ *
+ * Each read carries `controller.signal` and NO `tail` parameter, so a
+ * cancelled generation cancels the walk in flight and a continuation can never
+ * re-enter the journal anywhere but where the cursor points.
+ */
+async function followCapturedTail(
+  reads: FactoryJoinReads,
+  sessionId: string,
+  tail: CapturedTail,
+  pageLimit: number,
+  queue: FactorySignalQueue,
+  controller: AbortController,
+  signal?: AbortSignal,
+): Promise<"complete" | "repair" | "aborted"> {
+  let step = tail.step;
+  while (step.kind === "continue") {
+    if (signal?.aborted) return "aborted";
+    const page = reads.readJournal(sessionId, {
+      cursor: step.cursor,
+      limit: pageLimit,
+      signal: controller.signal,
+    });
+    const result = await raceGeneration(page, queue, signal);
+    if (typeof result === "string") return result === "repair" ? "repair" : "aborted";
+    step = tail.accept(validatePublicJournalPage(result.value));
+  }
+  return step.kind === "complete" ? "complete" : "repair";
+}
 
 /**
  * Subscribe-first Factory join. Each repair replaces the complete generation;
@@ -336,6 +570,19 @@ export const MAX_REPAIR_BACKOFF_FACTOR = 8;
  * replacement generation starts. A reset that fails validation, or that names
  * another tenant/session, still forces a repair (matching every publication
  * path) but must NOT move the cursor.
+ *
+ * ## The tail may arrive in several pages, and only within itself
+ *
+ * The tail read captures a tip `T` and may answer with less than `(0, T]` when
+ * the Factory is paging on a byte budget — coverage short of `T`, possibly no
+ * events at all, plus an opaque `next_cursor`. `CapturedTail` walks that
+ * continuation, under finite page/event/byte ceilings, and NOTHING else: the
+ * walk cannot re-enter the journal at a sequence, so it can never restart at
+ * zero or wander off the captured tail. A capture that has not reached `T` when
+ * a ceiling is spent, or that fails any of that class's consistency rules, is
+ * REFUSED and repaired from the last committed cursor — never committed
+ * halfway, because a durable cursor over unattested coverage is the failure
+ * this join exists to prevent.
  */
 export async function* joinFactorySessionView(
   reads: FactoryJoinReads,
@@ -347,6 +594,12 @@ export async function* joinFactorySessionView(
   const tailLimit = positiveBound(options.tailLimit ?? DEFAULT_FACTORY_TAIL_LIMIT, "tailLimit");
   const maxBuffered = positiveBound(options.maxPrejoinPublications ?? DEFAULT_FACTORY_TAIL_LIMIT, "maxPrejoinPublications");
   const maxRepairAttempts = positiveBound(options.maxRepairAttempts ?? DEFAULT_MAX_REPAIR_ATTEMPTS, "maxRepairAttempts");
+  const tailBounds: CapturedTailBounds = {
+    maxPages: positiveBound(options.maxTailPages ?? DEFAULT_MAX_TAIL_PAGES, "maxTailPages"),
+    maxEvents: positiveBound(options.maxTailEvents ?? DEFAULT_MAX_TAIL_EVENTS, "maxTailEvents"),
+    maxBytes: positiveBound(options.maxTailBytes ?? DEFAULT_MAX_TAIL_BYTES, "maxTailBytes"),
+    pageLimit: tailLimit,
+  };
   const repairDelayMs = safeSequence(options.repairDelayMs ?? DEFAULT_REPAIR_DELAY_MS, "repairDelayMs");
   let coveredThrough = safeSequence(options.initialCoveredThrough ?? 0, "initialCoveredThrough");
   let generation = 0;
@@ -452,7 +705,8 @@ export async function* joinFactorySessionView(
       const abort = (): void => controller.abort(options.signal?.reason);
       options.signal?.addEventListener("abort", abort, { once: true });
       let status: FactorySessionStatus;
-      let page: PublicJournalPage;
+      let tail: CapturedTail;
+      let followed: "complete" | "repair" | "aborted";
       try {
         const cold = Promise.all([
           reads.readStatus(sessionId, { signal: controller.signal }),
@@ -464,42 +718,56 @@ export async function* joinFactorySessionView(
           repair = result === "repair";
           continue;
         }
-        [status, page] = result.value;
+        status = validateFactorySessionStatus(result.value[0]);
+        const captured = validatePublicJournalPage(result.value[1]);
+        // Checked BEFORE any continuation is paid for: a capture the status
+        // does not agree with is not worth walking.
+        if (status.session_id !== sessionId || status.journal_tip !== captured.journal_tip) {
+          controller.abort();
+          repair = true;
+          continue;
+        }
+        tail = new CapturedTail(captured, tailBounds);
+        followed = await followCapturedTail(reads, sessionId, tail, tailLimit, queue, controller, options.signal);
       } finally {
         options.signal?.removeEventListener("abort", abort);
+        // Promise.all may reject while its sibling request is still in flight.
+        // Every exit ends this generation's REST work, including read failures.
+        controller.abort();
       }
-
-      status = validateFactorySessionStatus(status);
-      page = validatePublicJournalPage(page);
-      // `page.covered_through !== page.journal_tip` is the fail-CLOSED half of
-      // taking T from `journal_tip`. Only events at or below `covered_through`
-      // are attested by this page (the validator rejects any event above it),
-      // so a tail page reporting a lower coverage than its own tip leaves
-      // (covered_through, T] neither in the page, nor necessarily in the
-      // prejoin buffer — anything that committed there BEFORE subscribe was
-      // never buffered — nor repaired. Measured without this guard, a page
-      // {journal_tip: 5, covered_through: 2, events: [1, 2]} plus a prejoin
-      // publication at 4 rendered [1, 2, 4], silently dropping public
-      // sequence 5, and then walked the durable cursor over it to 6. That is
-      // the fail-open direction twice: a missing event AND a persisted cursor
-      // asserting it was covered, which licenses never fetching it again.
-      if (status.session_id !== sessionId
-        || status.journal_tip !== page.journal_tip
-        || page.covered_through !== page.journal_tip
-        || page.covered_through < coveredThrough
-        || page.events.length > tailLimit) {
+      // A capture is committed WHOLE or not at all. `tail.result` is defined
+      // only once coverage actually reached the captured tip, which is the
+      // fail-CLOSED half of taking T from `journal_tip`: only events at or
+      // below `covered_through` are attested (the validator rejects any event
+      // above it), so coverage short of T leaves (covered_through, T] neither
+      // in the capture, nor necessarily in the prejoin buffer — anything that
+      // committed there BEFORE subscribe was never buffered — nor repaired.
+      // Measured before the guard existed, a page {journal_tip: 5,
+      // covered_through: 2, events: [1, 2]} plus a prejoin publication at 4
+      // rendered [1, 2, 4], silently dropping public sequence 5, and then
+      // walked the durable cursor over it to 6: a missing event AND a
+      // persisted cursor asserting it was covered. What U5.2 changed is only
+      // WHERE that coverage may come from — the continuation pages of the same
+      // capture now count, a budget-exhausted walk still does not.
+      if (followed !== "complete") {
+        controller.abort();
+        repair = followed === "repair";
+        continue;
+      }
+      const captured = tail.result;
+      if (captured === undefined || captured.coveredThrough < coveredThrough) {
         repair = true;
         continue;
       }
       if (queue.requiresRepair) { repair = true; continue; }
-      const tip = page.journal_tip;
+      const tip = tail.tip;
       const prejoin = queue.drainPublications();
       prejoinOpen = false;
       if (queue.requiresRepair) { repair = true; continue; }
       yield { kind: "projection", generation: currentGeneration, status, coveredThrough };
 
       const enduring = prejoin.filter((item): item is EnduringPublication => item.type === "enduring_publication");
-      const candidates = mergeFactoryEvents(page.events, enduring, coveredThrough, tip);
+      const candidates = mergeFactoryEvents(captured.events, enduring, coveredThrough, tip);
       if (candidates === undefined) { repair = true; continue; }
       const seen = new Map<number, string>();
       for (const event of candidates) {
@@ -508,8 +776,8 @@ export async function* joinFactorySessionView(
         coveredThrough = event.journal_seq;
         yield { kind: "public", generation: currentGeneration, status, event, coveredThrough };
       }
-      if (page.covered_through > coveredThrough) {
-        coveredThrough = page.covered_through;
+      if (captured.coveredThrough > coveredThrough) {
+        coveredThrough = captured.coveredThrough;
         yield { kind: "coverage", generation: currentGeneration, status, coveredThrough };
       }
 
