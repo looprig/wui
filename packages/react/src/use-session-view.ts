@@ -210,6 +210,10 @@ export interface UseFactorySessionViewResult {
   readonly coveredThrough: number;
   /** The last error seen, from a cold read or from the binding. */
   readonly error: Error | null;
+  /** State of the explicit, one-page-per-action beginning-first history walk. */
+  readonly earlierState: "idle" | "loading" | "available" | "complete" | "failed";
+  /** Reads at most one bounded page. The first call has neither cursor nor tail. */
+  readonly browseEarlier: () => Promise<void>;
 }
 
 /**
@@ -220,13 +224,16 @@ export interface UseFactorySessionViewResult {
  * impossible instead of merely tested for.
  */
 
-const COLD: Omit<UseFactorySessionViewResult, "coveredThrough"> = {
+type FactorySessionViewSnapshot = Omit<UseFactorySessionViewResult, "browseEarlier">;
+
+const COLD: Omit<FactorySessionViewSnapshot, "coveredThrough"> = {
   state: "joining",
   liveState: "joining",
   status: null,
   gates: null,
   events: [],
   error: null,
+  earlierState: "idle",
 };
 
 /**
@@ -235,11 +242,15 @@ const COLD: Omit<UseFactorySessionViewResult, "coveredThrough"> = {
  * The cold capture is never used as that join's starting cursor: events produced
  * between its capture and authorization must still be reconciled.
  */
-class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
+class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
   readonly #events = new Map<number, PublicJournalEvent>();
   #controller: AbortController | undefined;
   #coldController: AbortController | undefined;
   #generation = 0;
+  #earlierCursor: string | undefined;
+  #earlierStarted = false;
+  #earlierController: AbortController | undefined;
+  #earlierInFlight: Promise<void> | undefined;
 
   constructor(
     readonly tenantId: string,
@@ -270,6 +281,58 @@ class FactoryColdJoin extends Publisher<UseFactorySessionViewResult> {
     ++this.#generation;
     this.#controller?.abort();
     this.#coldController?.abort();
+    this.#earlierController?.abort();
+  }
+
+  browseEarlier(): Promise<void> {
+    if (this.#earlierInFlight !== undefined) return this.#earlierInFlight;
+    if (this.snapshot().earlierState === "complete") return Promise.resolve();
+    const controller = new AbortController();
+    this.#earlierController?.abort();
+    this.#earlierController = controller;
+    const generation = this.#generation;
+    const cursor = this.#earlierCursor;
+    const started = this.#earlierStarted;
+    this.publish({ earlierState: "loading", error: null });
+    const read = this.#readEarlier(generation, controller, started, cursor);
+    this.#earlierInFlight = read;
+    void read.finally(() => {
+      if (this.#earlierInFlight === read) this.#earlierInFlight = undefined;
+    });
+    return read;
+  }
+
+  async #readEarlier(
+    generation: number,
+    controller: AbortController,
+    started: boolean,
+    cursor: string | undefined,
+  ): Promise<void> {
+    const signal = controller.signal;
+    try {
+      const options: FactoryJournalOptions = { limit: this.tailLimit, signal };
+      if (started && cursor !== undefined) options.cursor = cursor;
+      const page = validateFactory(
+        "public_journal_page",
+        await this.reads().readJournal(this.sessionId, options),
+      );
+      if (!this.#current(generation, signal)) return;
+      for (const event of page.events) this.#events.set(event.journal_seq, event);
+      this.#earlierStarted = true;
+      this.#earlierCursor = page.next_cursor;
+      this.publish({
+        events: this.#ordered(),
+        earlierState: page.next_cursor === undefined ? "complete" : "available",
+        error: null,
+      });
+    } catch (cause) {
+      if (this.#rejectAccess(cause, generation, signal)) return;
+      if (this.#current(generation, signal)) {
+        this.publish({ earlierState: "failed", error: asError(cause) });
+      }
+    } finally {
+      controller.abort();
+    }
   }
 
   #current(generation: number, signal: AbortSignal): boolean {
@@ -501,5 +564,7 @@ export function useFactorySessionView(
     };
   }, [machine]);
 
-  return useStore(machine);
+  const snapshot = useStore(machine);
+  const browseEarlier = useCallback(() => machine.browseEarlier(), [machine]);
+  return useMemo(() => ({ ...snapshot, browseEarlier }), [snapshot, browseEarlier]);
 }

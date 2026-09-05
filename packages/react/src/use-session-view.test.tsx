@@ -427,6 +427,53 @@ test("empty continuation coverage reaches the immutable captured tip", async () 
   expect(h.reads.of("readJournal")).toHaveLength(3);
 });
 
+test("earlier history is never read automatically and starts only on an explicit action", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 9, [8, 9]);
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(9);
+  expect(h.reads.of("readJournal").map((call) => call.options)).toMatchObject([
+    { tail: 256, limit: 256 },
+  ]);
+
+  h.reads.queue("readJournal", {
+    journal_tip: 9,
+    covered_through: 2,
+    events: [publicEvent(1), publicEvent(2)],
+    next_cursor: "older-cursor-1",
+  });
+  await h.view.current!.browseEarlier();
+
+  expect(h.reads.of("readJournal")[1]?.options).toMatchObject({ limit: 256 });
+  expect(h.reads.of("readJournal")[1]?.options.cursor).toBeUndefined();
+  expect(h.reads.of("readJournal")[1]?.options.tail).toBeUndefined();
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([1, 2, 8, 9]);
+  expect(h.view.current?.earlierState).toBe("available");
+});
+
+test("each earlier-history action follows one opaque cursor, including across an empty page", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 9, [9]);
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(9);
+  h.reads.queue("readJournal", {
+    journal_tip: 9, covered_through: 2, events: [], next_cursor: "older-cursor-2",
+  });
+  await h.view.current!.browseEarlier();
+  expect(h.view.current?.earlierState).toBe("available");
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([9]);
+
+  h.reads.queue("readJournal", {
+    journal_tip: 9, covered_through: 5, events: [publicEvent(5)],
+  });
+  await h.view.current!.browseEarlier();
+  expect(h.reads.of("readJournal")[2]?.options).toMatchObject({ cursor: "older-cursor-2", limit: 256 });
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([5, 9]);
+  expect(h.view.current?.earlierState).toBe("complete");
+});
+
 test("authorized join also follows captured-tail continuations", async () => {
   const h = await mountFactoryView({ setup: (link) => { link.holdConnect = true; } });
   await expect.poll(() => h.view.current?.state).toBe("ready");
