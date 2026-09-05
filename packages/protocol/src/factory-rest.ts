@@ -27,6 +27,11 @@ export interface FactoryRestCredentials {
   restHeaders?(): Promise<Record<string, string>> | Record<string, string>;
 }
 
+/** Factory-owned identity document for the authenticated browser caller. */
+export interface FactoryBootstrap {
+  readonly tenant_id: string;
+}
+
 export interface FactoryPageOptions extends RequestOptions {
   cursor?: string;
   limit?: number;
@@ -49,6 +54,7 @@ export interface ObjectRange {
 }
 
 export interface FactoryReads {
+  readBootstrap(options?: RequestOptions): Promise<FactoryBootstrap>;
   listAgents(options?: FactoryPageOptions): Promise<DepartmentCapabilitySummary>;
   listRecentSessions(options?: FactoryPageOptions): Promise<RecentSessionPage>;
   readStatus(sessionId: string, options?: RequestOptions): Promise<FactorySessionStatus>;
@@ -97,6 +103,23 @@ export class FactoryRestReads implements FactoryReads {
     this.fetchImpl = options.fetch ?? fetch;
     this.baseUrl = normalizedBase(options.baseUrl);
     this.credentials = options.credentials ?? {};
+  }
+
+  async readBootstrap(options: RequestOptions = {}): Promise<FactoryBootstrap> {
+    const path = "/v1/bootstrap";
+    const response = await this.request(path, { method: "GET", cache: "no-store", signal: options.signal });
+    if (!response.ok) await this.throwResponseError(path, response);
+    const data = await this.parseJSON(path, response);
+    if (typeof data !== "object" || data === null || Array.isArray(data)) {
+      throw new MalformedResponseError(path, response.status);
+    }
+    const keys = Object.keys(data);
+    const tenantId = (data as Record<string, unknown>).tenant_id;
+    if (keys.length !== 1 || keys[0] !== "tenant_id" || typeof tenantId !== "string"
+      || tenantId.length === 0 || new TextEncoder().encode(tenantId).byteLength > 256) {
+      throw new MalformedResponseError(path, response.status);
+    }
+    return { tenant_id: tenantId };
   }
 
   async listAgents(options: FactoryPageOptions = {}): Promise<DepartmentCapabilitySummary> {

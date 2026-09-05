@@ -385,3 +385,36 @@ describe("FactoryRestReads bounded object ranges", () => {
     ]);
   });
 });
+
+describe("FactoryRestReads browser identity bootstrap", () => {
+  it("reads the authenticated caller tenant from the exact bootstrap route", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const reads = new FactoryRestReads({
+      baseUrl: "https://factory.example/",
+      credentials: { restHeaders: () => ({ Authorization: "Bearer browser-token" }) },
+      fetch: async (url, init) => {
+        calls.push({ url, init });
+        return new Response(JSON.stringify({ tenant_id: "tenant-1" }));
+      },
+    });
+
+    await expect(reads.readBootstrap()).resolves.toStrictEqual({ tenant_id: "tenant-1" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe("https://factory.example/v1/bootstrap");
+    expect(calls[0]?.init?.method).toBe("GET");
+    expect(calls[0]?.init?.cache).toBe("no-store");
+    expect(new Headers(calls[0]?.init?.headers).get("Authorization")).toBe("Bearer browser-token");
+  });
+
+  it.each([
+    null,
+    {},
+    { tenant_id: "" },
+    { tenant_id: 7 },
+    { tenant_id: "t".repeat(257) },
+    { tenant_id: "tenant-1", subject: "must-not-cross-the-boundary" },
+  ])("rejects a bootstrap body outside the exact bounded DTO: %o", async (body) => {
+    const reads = new FactoryRestReads({ fetch: async () => new Response(JSON.stringify(body)) });
+    await expect(reads.readBootstrap()).rejects.toBeInstanceOf(MalformedResponseError);
+  });
+});
