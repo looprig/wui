@@ -7,7 +7,7 @@ import {
   DEFAULT_REPAIR_DELAY_MS,
   MAX_REPAIR_BACKOFF_FACTOR,
 } from "@looprig/protocol";
-import type { EnduringPublication, FactoryClient, FactoryClientOptions } from "@looprig/protocol";
+import type { EnduringPublication, FactoryClient, FactoryClientOptions, PublicJournalPage } from "@looprig/protocol";
 import { expect, test } from "vitest";
 import { render, renderHook } from "vitest-browser-react";
 import { FakeClientLink } from "./testing/fake-link.js";
@@ -520,6 +520,73 @@ test("an oversized earlier page is refused without replacing the current view", 
   expect(h.view.current?.error?.message).toContain("earlier history byte budget");
 });
 
+test("an earlier page byte budget counts multibyte UTF-8 rather than UTF-16 code units", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 9, [9]);
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(9);
+  h.reads.queue("readJournal", {
+    journal_tip: 9,
+    covered_through: 1,
+    events: [publicEvent(1, "é".repeat(600_000))],
+    next_cursor: "older",
+  });
+
+  await h.view.current!.browseEarlier();
+
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([9]);
+  expect(h.view.current?.earlierState).toBe("failed");
+  expect(h.view.current?.error?.message).toContain("earlier history byte budget");
+});
+
+test("a current event wins an earlier-history duplicate at the same sequence", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    reads.status = { ...reads.status, journal_tip: 9 };
+    reads.page = {
+      journal_tip: 9, covered_through: 9,
+      events: [publicEvent(9, "current event")],
+    };
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(9);
+  h.reads.queue("readJournal", {
+    journal_tip: 9, covered_through: 9,
+    events: [publicEvent(9, "stale earlier duplicate")],
+  });
+
+  await h.view.current!.browseEarlier();
+
+  expect(h.view.current?.events).toHaveLength(1);
+  expect(h.view.current?.events[0]?.body).toMatchObject({ text: "current event" });
+});
+
+test("a refused earlier page preserves the prior window and cursor across a live rerender", async () => {
+  const h = await mountFactoryView({ setup: (_link, reads) => setPage(reads, 9, [9]) });
+  await liveReady(h, 9);
+  h.reads.queue("readJournal", {
+    journal_tip: 9, covered_through: 1,
+    events: [publicEvent(1)], next_cursor: "older-1",
+  });
+  await h.view.current!.browseEarlier();
+
+  h.reads.queue("readJournal", {
+    journal_tip: 9, covered_through: 2,
+    events: [publicEvent(2, "x".repeat(DEFAULT_MAX_TAIL_BYTES))], next_cursor: "older-2",
+  });
+  await h.view.current!.browseEarlier();
+  h.link.open[0]!.deliver(enduringFor(10));
+  await expect.poll(() => h.view.current?.events.map((event) => event.journal_seq)).toEqual([1, 9, 10]);
+
+  h.reads.queue("readJournal", {
+    journal_tip: 10, covered_through: 3, events: [publicEvent(3)],
+  });
+  await h.view.current!.browseEarlier();
+
+  expect(h.reads.of("readJournal").at(-1)?.options.cursor).toBe("older-1");
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([3, 9, 10]);
+});
+
 test("an earlier page exceeding its requested row limit is refused", async () => {
   const h = await mountFactoryView({ props: { tailLimit: 1 }, setup: (link, reads) => {
     link.holdConnect = true;
@@ -555,6 +622,38 @@ test("a lowered live reset clears the earlier window without retaining truncated
   });
 
   await expect.poll(() => h.view.current?.coveredThrough).toBe(2);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([2]);
+  expect(h.view.current?.earlierState).toBe("idle");
+});
+
+test("a lowered reset aborts pending earlier history and its late success cannot revive the window", async () => {
+  const h = await mountFactoryView({ setup: (_link, reads) => setPage(reads, 9, [9]) });
+  await liveReady(h, 9);
+  const originalRead = h.reads.readJournal.bind(h.reads);
+  let resolveEarlier!: (page: PublicJournalPage) => void;
+  let earlierSignal: AbortSignal | undefined;
+  let intercepted = false;
+  h.reads.readJournal = (sessionId, options) => {
+    if (!intercepted && options?.tail === undefined && options?.cursor === undefined) {
+      intercepted = true;
+      earlierSignal = options?.signal;
+      return new Promise((resolve) => { resolveEarlier = resolve; });
+    }
+    return originalRead(sessionId, options);
+  };
+
+  const pending = h.view.current!.browseEarlier();
+  await expect.poll(() => intercepted).toBe(true);
+  setPage(h.reads, 2, [2]);
+  h.link.open[0]!.reset({
+    type: "session.reset", tenant_id: TENANT, session_id: FSID,
+    journal_tip: 2, last_contiguous: 1,
+  });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(2);
+  expect(earlierSignal?.aborted).toBe(true);
+
+  resolveEarlier({ journal_tip: 9, covered_through: 1, events: [publicEvent(1)], next_cursor: "stale" });
+  await pending;
   expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([2]);
   expect(h.view.current?.earlierState).toBe("idle");
 });
@@ -599,6 +698,27 @@ test("an authoritative earlier-history denial clears the whole scoped view", asy
   expect(h.view.current?.events).toEqual([]);
   expect(h.view.current?.coveredThrough).toBe(0);
   expect(h.view.current?.earlierState).toBe("idle");
+});
+
+test("an authoritative denial resets the earlier cursor before a later explicit browse", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 9, [9]);
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(9);
+  h.reads.queue("readJournal", {
+    journal_tip: 9, covered_through: 1, events: [publicEvent(1)], next_cursor: "older-1",
+  });
+  await h.view.current!.browseEarlier();
+  h.reads.fail("readJournal", new CoreProtocolError({ error: {
+    code: "not_authorized", retryable: false,
+  } }));
+  await h.view.current!.browseEarlier();
+
+  h.reads.queue("readJournal", { journal_tip: 9, covered_through: 2, events: [publicEvent(2)] });
+  await h.view.current!.browseEarlier();
+
+  expect(h.reads.of("readJournal").at(-1)?.options.cursor).toBeUndefined();
 });
 
 test("unmount aborts a pending explicit earlier-history read", async () => {
@@ -776,7 +896,8 @@ test.each([
   ["readStatus", "not_authorized"],
   ["listGates", "not_authorized"],
   ["readJournal", "unauthenticated"],
-] as const)("an authoritative %s %s denial clears cached durable state and cancels the binding", async (method, code) => {
+  ["readStatus", "session_not_found"],
+] as const)("an authoritative %s %s invalidation clears cached durable state and cancels the binding", async (method, code) => {
   const h = await mountFactoryView({ setup: (_link, reads) => setPage(reads, 2, [2]) });
   await liveReady(h, 2);
   h.reads.fail(method, new CoreProtocolError({ error: {

@@ -412,6 +412,7 @@ describe("FactoryRestReads browser identity bootstrap", () => {
     { tenant_id: "" },
     { tenant_id: 7 },
     { tenant_id: "t".repeat(257) },
+    { tenant_id: "é".repeat(200) },
     { tenant_id: "tenant-1", subject: "must-not-cross-the-boundary" },
   ])("rejects a bootstrap body outside the exact bounded DTO: %o", async (body) => {
     const reads = new FactoryRestReads({ fetch: async () => new Response(JSON.stringify(body)) });

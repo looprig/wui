@@ -1193,6 +1193,29 @@ describe("joinFactorySessionView", () => {
     await gen.return();
   });
 
+  it("measures captured-tail budgets in UTF-8 bytes rather than UTF-16 code units", async () => {
+    const multibyte = {
+      event_id: "event-2",
+      journal_seq: 2,
+      body: { type: "session.message", text: "é".repeat(64) },
+    };
+    const utf16Length = JSON.stringify([multibyte]).length;
+    expect(new TextEncoder().encode(JSON.stringify([multibyte])).length).toBeGreaterThan(utf16Length);
+    const reads = new TailPageReads(factoryStatus(2), [
+      { journal_tip: 2, covered_through: 2, events: [multibyte] },
+      { journal_tip: 2, covered_through: 2, events: [publicEvent(2)] },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      maxTailBytes: utf16Length,
+      repairDelayMs: 0,
+    });
+
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 2 });
+    await gen.return();
+  });
+
   it("repairs a continuation that hands back a cursor it has already been given", async () => {
     const reads = new TailPageReads(factoryStatus(9), [
       { journal_tip: 9, covered_through: 2, events: [publicEvent(2)], next_cursor: "cursor-1" },

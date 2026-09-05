@@ -360,9 +360,12 @@ class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
 
   #rejectAccess(cause: unknown, generation: number, signal: AbortSignal): boolean {
     if (!this.#current(generation, signal) || !(cause instanceof CoreProtocolError)
-      || (cause.code !== "unauthenticated" && cause.code !== "not_authorized")) return false;
-    // These are Factory's authoritative authentication/authorization decisions.
-    // A verifier outage uses a different code and does not revoke cached state.
+      || (cause.code !== "unauthenticated" && cause.code !== "not_authorized"
+        && cause.code !== "session_not_found")) return false;
+    // These are Factory's authoritative scope-invalidating decisions. A
+    // verifier outage uses a different code and does not revoke cached state;
+    // deletion does, because retaining its projection would render a session
+    // Factory has authoritatively said no longer exists.
     this.#currentEvents.clear();
     this.#resetEarlier();
     this.publish({
