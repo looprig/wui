@@ -1,7 +1,5 @@
 import { useMemo } from "react";
 import {
-  emptyPublicGateBoard,
-  foldPublicGatePage,
   createFetchLiveFrameSource,
   createHostTransport,
   type LiveFrameSource,
@@ -10,6 +8,7 @@ import {
 import { SessionDetailPage } from "./session-detail-page";
 import { useFactoryClient, useFactoryGate, useFactorySessionView, useFactoryTenantId } from "@looprig/react";
 import { FactorySessionDetailPage } from "./factory-session-detail-page";
+import { useFactoryGateBoard } from "./factory-gate-board";
 
 export interface SessionDetailRouteProps {
   sid: string;
@@ -56,21 +55,35 @@ export function SessionDetailRoute({
   return <SessionDetailPage sid={sid} transport={host} liveSource={liveSource} />;
 }
 
-/** Official Factory route: verified tenant + durable cold projection + shared realtime link. */
+/**
+ * Official Factory route: verified tenant + durable cold projection + shared
+ * realtime link.
+ *
+ * The gate board is folded by `useFactoryGateBoard`, not rebuilt from
+ * `view.gates` per page. The rebuild closed the in-flight page resurrection
+ * race and nothing else: it folded no live `GateResolved`, so a gate answered
+ * in another tab stayed on screen until the next `listGates`, and — because
+ * `listGates` is read with a limit — it read a gate's absence from a BOUNDED
+ * page as resolution. `factory-gate-board.ts` documents the tombstone that
+ * replaces it.
+ *
+ * The cards and the respond path now read ONE list. They used to disagree: the
+ * cards came from `view.gates` (the raw page) while `respond` looked the gate up
+ * in the folded board, so a gate the fold dropped still rendered a button whose
+ * handler found nothing and returned silently.
+ */
 export function FactorySessionDetailRoute({ sid }: { sid: string }): React.JSX.Element {
   const client = useFactoryClient();
   const tenantId = useFactoryTenantId();
   const view = useFactorySessionView(client.reads, { tenantId, sessionId: sid });
-  const gateBoard = useMemo(
-    () => view.gates === null ? emptyPublicGateBoard() : foldPublicGatePage(emptyPublicGateBoard(), view.gates, sid),
-    [sid, view.gates],
-  );
+  const gateBoard = useFactoryGateBoard(sid, view);
   const gateControls = useFactoryGate(sid, gateBoard);
   return (
     <FactorySessionDetailPage
       sid={sid}
       view={view}
       reads={client.reads}
+      gates={gateControls.gates}
       onGateRespond={(gateId, action) => {
         const gate = gateControls.gates.find((entry) => entry.gateId === gateId);
         if (gate !== undefined) void gateControls.respond(gate, action);

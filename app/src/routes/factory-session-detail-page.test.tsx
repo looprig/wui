@@ -3,9 +3,29 @@ import { expect, test, vi } from "vitest";
 import { render } from "vitest-browser-react";
 import type { FactoryReads } from "@looprig/protocol";
 import type { UseFactorySessionViewResult } from "@looprig/react";
-import { FactorySessionDetailPage } from "./factory-session-detail-page";
+import { FactorySessionDetailPage, type FactoryDetailGate } from "./factory-session-detail-page";
 
 const inertReads = {} as FactoryReads;
+
+/**
+ * A folded board entry, as `useFactoryGateBoard` + `useFactoryGate` produce
+ * one. The page renders THIS, not `view.gates`: the raw page keeps a gate that
+ * resolved live and re-lists one whose read crossed the resolve.
+ */
+function gate(overrides: Partial<FactoryDetailGate> = {}): FactoryDetailGate {
+  return {
+    sessionId: "session-1",
+    gateId: "gate-1",
+    kind: "harness.permission",
+    openedEventId: "event-1",
+    openedJournalSeq: 1,
+    deadline: "2026-09-05T13:00:00Z",
+    answerability: "resident",
+    answerable: true,
+    prompt: { title: "Allow shell?", body: "", origin: "", controls: [] },
+    ...overrides,
+  };
+}
 
 function view(overrides: Partial<UseFactorySessionViewResult> = {}): UseFactorySessionViewResult {
   return {
@@ -37,19 +57,19 @@ test.each([
 ] as const)("renders durable residency %s and execution %s as %s", async (residency, state, label) => {
   render(<FactorySessionDetailPage sid="session-1" view={view({
     status: { session_id: "session-1", agent_id: "agent-1", residency, state, journal_tip: 2 },
-  })} reads={inertReads} />);
+  })} reads={inertReads} gates={[]} />);
   await expect.element(page.getByTestId("detail-durable-state")).toHaveTextContent(label);
 });
 
 test("keeps transport repair separate while durable content remains rendered", async () => {
-  render(<FactorySessionDetailPage sid="session-1" view={view({ liveState: "repairing" })} reads={inertReads} />);
+  render(<FactorySessionDetailPage sid="session-1" view={view({ liveState: "repairing" })} reads={inertReads} gates={[]} />);
   await expect.element(page.getByTestId("detail-live-state")).toHaveTextContent("repairing");
   await expect.element(page.getByTestId("factory-event-2")).toHaveTextContent("SessionIdle");
 });
 
 test("loads older history only from the explicit user control", async () => {
   const browseEarlier = vi.fn(() => Promise.resolve());
-  render(<FactorySessionDetailPage sid="session-1" view={view({ browseEarlier })} reads={inertReads} />);
+  render(<FactorySessionDetailPage sid="session-1" view={view({ browseEarlier })} reads={inertReads} gates={[]} />);
   expect(browseEarlier).not.toHaveBeenCalled();
 
   await userEvent.click(page.getByTestId("browse-earlier-history"));
@@ -57,33 +77,53 @@ test("loads older history only from the explicit user control", async () => {
 });
 
 test("renders multiple gates while separating supported resident actions", async () => {
-  const gates = {
-    journal_tip: 4,
-    open_gate_count: 3,
-    gates: [
-      {
-        gate_id: "gate-1", kind: "harness.permission", prompt: { title: "Allow shell?" },
-        opened_event_id: "event-1", opened_journal_seq: 1,
-        deadline: "2026-09-05T13:00:00Z", answerability: "resident" as const,
-      },
-      {
-        gate_id: "gate-2", kind: "harness.permission", prompt: { title: "Allow edit?" },
-        opened_event_id: "event-2", opened_journal_seq: 2,
-        deadline: "2026-09-05T13:00:00Z", answerability: "suspended" as const,
-      },
-      {
-        gate_id: "gate-3", kind: "harness.ask_user", prompt: { title: "Choose one" },
-        opened_event_id: "event-3", opened_journal_seq: 3,
-        deadline: "2026-09-05T13:00:00Z", answerability: "resident" as const,
-      },
-    ],
-  };
-  render(<FactorySessionDetailPage sid="session-1" view={view({ gates })} reads={inertReads} onGateRespond={vi.fn()} />);
+  const gates = [
+    gate(),
+    gate({ gateId: "gate-2", openedJournalSeq: 2, answerability: "suspended", answerable: false,
+      prompt: { title: "Allow edit?", body: "", origin: "", controls: [] } }),
+    gate({ gateId: "gate-3", openedJournalSeq: 3, kind: "harness.ask_user",
+      prompt: { title: "Choose one", body: "", origin: "", controls: [] } }),
+  ];
+  render(<FactorySessionDetailPage sid="session-1" view={view()} reads={inertReads} gates={gates} onGateRespond={vi.fn()} />);
 
   await expect.element(page.getByTestId("factory-gate-stack")).toBeInTheDocument();
   expect(document.querySelectorAll("[data-testid=factory-gate-card]")).toHaveLength(3);
   expect(document.querySelectorAll("[data-testid=factory-gate-actions]")).toHaveLength(1);
   expect(document.querySelectorAll("[data-testid=factory-gate-unavailable]")).toHaveLength(2);
+});
+
+test("answers the gate the card was rendered from, so no card can act on a gate the board dropped", async () => {
+  // The two used to come from different places: cards from `view.gates` (the
+  // raw page) and the respond path from the folded board. A card whose gate the
+  // fold had dropped rendered a button whose handler found nothing and returned
+  // without effect.
+  const onGateRespond = vi.fn();
+  render(
+    <FactorySessionDetailPage
+      sid="session-1"
+      view={view({ gates: { journal_tip: 4, open_gate_count: 1, gates: [] } })}
+      reads={inertReads}
+      gates={[gate({ gateId: "gate-live" })]}
+      onGateRespond={onGateRespond}
+    />,
+  );
+
+  await expect.element(page.getByTestId("factory-gate-actions")).toBeInTheDocument();
+  await userEvent.click(page.getByRole("button", { name: "Deny", exact: true }));
+  expect(onGateRespond.mock.calls[0]).toStrictEqual(["gate-live", "Deny"]);
+});
+
+test("renders no gate stack for a page whose gates the board has closed", async () => {
+  render(<FactorySessionDetailPage sid="session-1" view={view({
+    gates: { journal_tip: 4, open_gate_count: 1, gates: [{
+      gate_id: "gate-1", kind: "harness.permission", prompt: { title: "Allow shell?" },
+      opened_event_id: "event-1", opened_journal_seq: 1,
+      deadline: "2026-09-05T13:00:00Z", answerability: "resident" as const,
+    }] },
+  })} reads={inertReads} gates={[]} />);
+
+  await expect.element(page.getByTestId("detail-session-id")).toBeInTheDocument();
+  expect(document.querySelector("[data-testid=factory-gate-stack]")).toBeNull();
 });
 
 test("renders repeated provider tool-use captures as distinct durable event/index viewers", async () => {
@@ -97,7 +137,7 @@ test("renders repeated provider tool-use captures as distinct durable event/inde
     truncation_reason: "source_limit",
     encoding: "utf-8",
   });
-  render(<FactorySessionDetailPage sid="session-1" reads={inertReads} view={view({ events: [
+  render(<FactorySessionDetailPage sid="session-1" reads={inertReads} gates={[]} view={view({ events: [
     { event_id: "event-1", journal_seq: 1, body: { type: "StepDone", captures: [capture("one"), capture("two")] } },
   ] })} />);
 
@@ -108,7 +148,7 @@ test("renders repeated provider tool-use captures as distinct durable event/inde
 });
 
 test("does not interpret a captures lookalike on a non-StepDone public event", async () => {
-  render(<FactorySessionDetailPage sid="session-1" reads={inertReads} view={view({ events: [{
+  render(<FactorySessionDetailPage sid="session-1" reads={inertReads} gates={[]} view={view({ events: [{
     event_id: "event-1", journal_seq: 1, body: { type: "OtherEvent", captures: [{
       tool_use_id: "tool-1", tool_execution_id: "execution-1", reference: { object_id: "object-1" },
       captured_bytes: 5, original_bytes: 5, truncated: false, encoding: "utf-8",
@@ -139,11 +179,11 @@ test.each(["not_authorized", "session_not_found"])("session %s invalidation unmo
       captured_bytes: source.length, original_bytes: source.length, truncated: false, encoding: "utf-8",
     }] },
   };
-  const screen = await render(<FactorySessionDetailPage sid="session-1" reads={reads} view={view({ events: [event] })} />);
+  const screen = await render(<FactorySessionDetailPage sid="session-1" reads={reads} gates={[]} view={view({ events: [event] })} />);
   await userEvent.click(page.getByTestId("tool-capture-load"));
   await expect.element(page.getByTestId("tool-capture-output")).toHaveTextContent("verified private result");
 
-  await screen.rerender(<FactorySessionDetailPage sid="session-1" reads={reads} view={view({
+  await screen.rerender(<FactorySessionDetailPage sid="session-1" reads={reads} gates={[]} view={view({
     state: "failed", status: null, events: [], gates: null,
     error: Object.assign(new Error(code), { code }),
   })} />);

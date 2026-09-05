@@ -4,6 +4,7 @@ import {
   type FactoryReads,
   type FactorySessionStatus,
   type GateApprovalAction,
+  type PublicGateEntry,
   type ToolResultCaptureSummary,
 } from "@looprig/protocol";
 import type { UseFactorySessionViewResult } from "@looprig/react";
@@ -18,10 +19,28 @@ export function durableStateLabel(status: FactorySessionStatus): string {
   return status.residency;
 }
 
+/**
+ * One open gate, as the board holds it plus whether it can be answered from
+ * here. `useFactoryGate`'s `FactoryOpenGate` satisfies this structurally, which
+ * is the point: the cards a human sees and the gates the respond path can act
+ * on are ONE list, so a card cannot offer a button for a gate the action side
+ * cannot find.
+ */
+export interface FactoryDetailGate extends PublicGateEntry {
+  readonly answerable: boolean;
+}
+
 export interface FactorySessionDetailPageProps {
   sid: string;
   view: UseFactorySessionViewResult;
   reads: FactoryReads;
+  /**
+   * The FOLDED board, not `view.gates`. The raw page is one bounded window of
+   * whatever the last `listGates` returned; it does not lose a gate that
+   * resolved live, and it re-lists one that resolved while the read was in
+   * flight. See `factory-gate-board.ts`.
+   */
+  gates: readonly FactoryDetailGate[];
   onGateRespond?: (gateId: string, action: GateApprovalAction) => void;
 }
 
@@ -47,7 +66,7 @@ function publicCaptures(body: unknown): PublicCapture[] {
 }
 
 /** Durable session projection. Realtime health is metadata, never a render prerequisite. */
-export function FactorySessionDetailPage({ sid, view, reads, onGateRespond }: FactorySessionDetailPageProps): React.JSX.Element {
+export function FactorySessionDetailPage({ sid, view, reads, gates, onGateRespond }: FactorySessionDetailPageProps): React.JSX.Element {
   if (view.status === null && view.state !== "failed") {
     return <main className="p-6"><p role="status">Loading session…</p></main>;
   }
@@ -89,24 +108,24 @@ export function FactorySessionDetailPage({ sid, view, reads, onGateRespond }: Fa
           );
         })}
       </div>
-      {view.gates === null || view.gates.gates.length === 0 ? null : (
+      {gates.length === 0 ? null : (
         <section data-testid="factory-gate-stack" className="mx-4 border-t border-border py-3">
-          {view.gates.gates.map((gate) => (
-            <article key={gate.gate_id} data-testid="factory-gate-card" className="mb-2 rounded-md border border-border bg-card p-3">
-              <p className="font-medium">{gate.prompt.title ?? "Decision required"}</p>
-              <p className="text-sm text-muted">{gate.prompt.body ?? ""}</p>
-              <p className="font-mono text-xs text-muted">{gate.kind} · {gate.answerability}</p>
-              {gate.kind === "harness.permission" && gate.answerability === "resident" && onGateRespond !== undefined ? (
+          {gates.map((gate) => (
+            <article key={gate.gateId} data-testid="factory-gate-card" className="mb-2 rounded-md border border-border bg-card p-3">
+              <p className="font-medium">{gate.prompt.title === "" ? "Decision required" : gate.prompt.title}</p>
+              <p className="text-sm text-muted">{gate.prompt.body}</p>
+              <p className="font-mono text-xs text-muted">{gate.kind} · {gate.answerability === "" ? "unattested" : gate.answerability}</p>
+              {gate.kind === "harness.permission" && gate.answerable && onGateRespond !== undefined ? (
                 <div data-testid="factory-gate-actions" className="mt-2 flex gap-2">
                   {Object.values(GATE_APPROVAL_ACTIONS).map((action) => (
-                    <button key={action} type="button" onClick={() => onGateRespond(gate.gate_id, action)} className="rounded border border-border px-2 py-1 text-xs">
+                    <button key={action} type="button" onClick={() => onGateRespond(gate.gateId, action)} className="rounded border border-border px-2 py-1 text-xs">
                       {action}
                     </button>
                   ))}
                 </div>
               ) : (
                 <p data-testid="factory-gate-unavailable" className="mt-2 text-xs text-muted">
-                  {gate.answerability === "resident" ? "Answer this gate in a supported client" : "No resident action is available"}
+                  {gate.answerable ? "Answer this gate in a supported client" : "No resident action is available"}
                 </p>
               )}
             </article>
