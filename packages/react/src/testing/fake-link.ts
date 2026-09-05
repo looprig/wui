@@ -142,9 +142,9 @@ export class FakeSubscription implements ClientSubscription {
     return this.options.sessionId;
   }
 
-  authorize(): void {
+  authorize(version: number = NEGOTIATED.version): void {
     this.state = "subscribed";
-    this.version = NEGOTIATED.version;
+    this.version = version;
     if (this.#settled) return;
     this.#settled = true;
     this.#resolve();
@@ -185,6 +185,8 @@ export class FakeClientLink implements ClientLink {
   maxLiveConnections = 0;
   /** While true, `connect()` stays pending until `settleConnect()` is called. */
   holdConnect = false;
+  /** Leave subscriptions pending until a test explicitly authorizes them. */
+  holdAuthorization = false;
   /** Sessions whose next authorization attempt fails instead. */
   readonly denied = new Set<string>();
 
@@ -279,6 +281,7 @@ export class FakeClientLink implements ClientLink {
     this.subscriptions.push(subscription);
     queueMicrotask(() => {
       if (subscription.state !== "subscribing") return;
+      if (this.holdAuthorization) return;
       if (this.denied.has(options.sessionId)) {
         subscription.fail(new Error(`not authorized for ${options.sessionId}`));
         return;

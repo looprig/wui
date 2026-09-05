@@ -5,6 +5,42 @@ import { FactoryLinkStore, type SessionBinding, type SessionBindingOptions } fro
 
 const TENANT = "tenant-1";
 
+test("protocol subscription exposes authorization and the actual negotiated version", async () => {
+  const link = new FakeClientLink();
+  link.holdAuthorization = true;
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const subscription = store.bindSubscription(recorder("session-a").options);
+  let ready = false;
+  void subscription.ready.then(() => { ready = true; });
+  await expect.poll(() => link.subscriptions.length).toBe(1);
+  expect(ready).toBe(false);
+  expect(subscription.version).toBeUndefined();
+  link.subscriptions[0]!.authorize(2);
+  await subscription.ready;
+  expect(subscription.version).toBe(2);
+  expect(subscription.state).toBe("subscribed");
+  subscription.unsubscribe();
+  subscription.unsubscribe();
+  expect(link.subscriptions[0]?.unsubscribeCount).toBe(1);
+  store.close();
+});
+
+test("cancelling a pending protocol subscription rejects readiness and ignores late authorization", async () => {
+  const link = new FakeClientLink();
+  link.holdAuthorization = true;
+  const store = new FactoryLinkStore(link);
+  store.open();
+  const subscription = store.bindSubscription(recorder("session-a").options);
+  await expect.poll(() => link.subscriptions.length).toBe(1);
+  subscription.unsubscribe();
+  await expect(subscription.ready).rejects.toThrow("cancelled");
+  link.subscriptions[0]!.authorize();
+  expect(subscription.state).toBe("unsubscribed");
+  expect(link.subscriptions[0]?.unsubscribeCount).toBe(1);
+  store.close();
+});
+
 function enduring(sessionId: string, sequence: number): EnduringPublication {
   return {
     type: "enduring_publication",

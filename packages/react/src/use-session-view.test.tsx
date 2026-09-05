@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import {
   createFactoryClient,
+  CoreProtocolError,
   DEFAULT_MAX_REPAIR_ATTEMPTS,
   DEFAULT_REPAIR_DELAY_MS,
   MAX_REPAIR_BACKOFF_FACTOR,
@@ -155,11 +156,15 @@ interface FactoryHarness {
 }
 
 interface ViewProps {
+  tenantId?: string;
+  scopeKey?: string;
   sessionId?: string;
   tailLimit?: number;
   coveredThrough?: number;
   repairDelayMs?: number;
   maxRepairAttempts?: number;
+  maxTailPages?: number;
+  maxTailBytes?: number;
 }
 
 interface MountOptions {
@@ -186,12 +191,14 @@ async function mountFactoryView(options: MountOptions = {}): Promise<FactoryHarn
   function Probe(inner: ViewProps): null {
     client.current = useFactoryClient();
     const value = useFactorySessionView(reads, {
-      tenantId: TENANT,
+      tenantId: inner.tenantId ?? TENANT,
       sessionId: inner.sessionId ?? FSID,
       ...(inner.tailLimit === undefined ? {} : { tailLimit: inner.tailLimit }),
       ...(inner.coveredThrough === undefined ? {} : { coveredThrough: inner.coveredThrough }),
       ...(inner.repairDelayMs === undefined ? {} : { repairDelayMs: inner.repairDelayMs }),
       ...(inner.maxRepairAttempts === undefined ? {} : { maxRepairAttempts: inner.maxRepairAttempts }),
+      ...(inner.maxTailPages === undefined ? {} : { maxTailPages: inner.maxTailPages }),
+      ...(inner.maxTailBytes === undefined ? {} : { maxTailBytes: inner.maxTailBytes }),
     });
     useEffect(() => {
       view.current = value;
@@ -202,7 +209,7 @@ async function mountFactoryView(options: MountOptions = {}): Promise<FactoryHarn
   const create = (clientOptions: FactoryClientOptions): FactoryClient =>
     createFactoryClient({ ...clientOptions, clientLinkFactory: () => link });
   const tree = (inner: ViewProps): React.ReactElement => (
-    <FactoryLinkProvider create={create}>
+    <FactoryLinkProvider key={inner.scopeKey} create={create}>
       <Probe {...inner} />
     </FactoryLinkProvider>
   );
@@ -229,747 +236,454 @@ async function mountFactoryView(options: MountOptions = {}): Promise<FactoryHarn
   };
 }
 
-test("opening a cold session reads status, gates and a bounded tail, subscribes, and sends no command", async () => {
-  const h = await mountFactoryView();
-
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-
-  // The three cold reads, in order, for this session and no other.
-  expect(h.reads.calls.map((call) => call.method)).toStrictEqual([
-    "readStatus",
-    "listGates",
-    "readJournal",
-  ]);
-  expect(new Set(h.reads.calls.map((call) => call.sessionId))).toStrictEqual(new Set([FSID]));
-  // The tail is BOUNDED. `tail` is the parameter the runbook names; `limit`
-  // bounds the page the same read returns.
-  expect(h.reads.of("readJournal")[0]?.options).toMatchObject({ tail: 256, limit: 256 });
-
-  // The projections the three reads returned are what the view carries. Calling
-  // `listGates` and dropping the answer would leave the gate projection a
-  // declared field nothing fills.
-  expect(h.view.current?.status).toStrictEqual(h.reads.status);
-  expect(h.view.current?.gates).toStrictEqual(h.reads.gates);
-
-  // And it subscribed, once, to this session's channel.
-  expect(h.link.subscriptions.map((subscription) => subscription.sessionId)).toStrictEqual([FSID]);
-
-  // The whole point of the task: NO command. Not a restore, not an admission,
-  // not anything. Every `PendingCommand.submit()` reaches the transport through
-  // `ClientLink.rpc` and nowhere else, so this is a claim about the plane.
-  expect(h.link.rpcCalls).toStrictEqual([]);
-});
-
-test("a command sent over the same link IS recorded, so an empty rpcCalls is a measurement", async () => {
-  // Defect class 9: a negative assertion is worth nothing until the probe is
-  // shown to be able to observe the thing it denies. This is that showing —
-  // and it is also step 3's positive form: a restore happens when, and only
-  // when, a user action asks for one.
-  const h = await mountFactoryView();
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  expect(h.link.rpcCalls).toStrictEqual([]);
-
-  const status = await h.client.current!.commands.restore(FSID).submit();
-
-  expect(h.link.rpcCalls.map((call) => call.method)).toStrictEqual(["session.restore"]);
-  expect(status.status).toBe("accepted");
-});
-
-test("the subscription exists before the first cold read is issued", async () => {
-  // Subscribe-first is what makes the read gapless: an event committed during
-  // the read either lands in the page or arrives on the already-open channel.
-  // Held at the CONNECT, so the ordering is observed rather than inferred from
-  // the source.
-  const h = await mountFactoryView({ setup: (link) => { link.holdConnect = true; } });
-
-  await expect.poll(() => h.link.connectCalls).toBe(1);
-  expect(h.link.subscriptions).toStrictEqual([]);
-  expect(h.reads.calls).toStrictEqual([]);
-
-  h.link.settleConnect();
-
-  await expect.poll(() => h.reads.calls.length).toBe(3);
-  expect(h.link.subscriptions).toHaveLength(1);
-  // And the subscription was opened first, not merely also.
-  expect(h.link.subscriptions[0]?.state).toBe("subscribed");
-});
-
-test("the tail bound is the caller's", async () => {
-  const h = await mountFactoryView({ props: { tailLimit: 8 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  expect(h.reads.of("readJournal")[0]?.options).toMatchObject({ tail: 8, limit: 8 });
-});
-
-test("an event that lands inside the cold-read window is applied exactly once", async () => {
-  const h = await mountFactoryView({ setup: (_link, reads) => { reads.hold("readJournal"); } });
-  await expect.poll(() => h.reads.of("readJournal").length).toBe(1);
-
-  // Committed while the tail read is in flight: it reaches the open channel AND
-  // the page that is about to come back. Dedupe is by `journal_seq`.
-  h.link.open[0]?.deliver({
-    type: "enduring_publication",
-    tenant_id: TENANT,
-    session_id: FSID,
-    event_id: "event-3",
-    journal_seq: 3,
-    covered_through: 3,
-    body: { type: "session.message", text: "event 3" },
-  });
-  h.reads.page = {
-    journal_tip: 3,
-    covered_through: 3,
-    events: [publicEvent(1), publicEvent(2), publicEvent(3)],
-  };
-  h.reads.settle("readJournal");
-
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  expect(h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([1, 2, 3]);
-  expect(h.view.current?.coveredThrough).toBe(3);
-});
-
-test("an event above the page's coverage is kept, in sequence order", async () => {
-  const h = await mountFactoryView({
-    setup: (_link, reads) => {
-      reads.page = { journal_tip: 2, covered_through: 2, events: [publicEvent(1), publicEvent(2)] };
-    },
-  });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-
-  h.link.open[0]?.deliver({
-    type: "enduring_publication",
-    tenant_id: TENANT,
-    session_id: FSID,
-    event_id: "event-4",
-    journal_seq: 4,
-    covered_through: 4,
-    body: { type: "session.message", text: "event 4" },
-  });
-
-  await expect.poll(() => h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([1, 2, 4]);
-  expect(h.view.current?.coveredThrough).toBe(4);
-});
-
-test("rejoining on a new connection re-reads the durable plane, and still sends no command", async () => {
-  const h = await mountFactoryView();
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  expect(h.reads.of("readStatus")).toHaveLength(1);
-
-  h.reads.page = { journal_tip: 7, covered_through: 7, events: [publicEvent(7)] };
-  h.link.drop();
-
-  await expect.poll(() => h.reads.of("readStatus").length).toBe(2);
-  await expect.poll(() => h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([7]);
-  // A repair is still a read. Recovering coverage is never a command.
-  expect(h.link.rpcCalls).toStrictEqual([]);
-});
-
-test("a cold read that fails is reported, and nothing is published as ready", async () => {
-  const h = await mountFactoryView({
-    setup: (_link, reads) => { reads.fail("readStatus", new Error("factory unavailable")); },
-  });
-
-  await expect.poll(() => h.view.current?.state).toBe("failed");
-  expect(h.view.current?.error?.message).toBe("factory unavailable");
-  expect(h.view.current?.status).toBeNull();
-});
-
-test("a read that lands after unmount commits nothing", async () => {
-  const h = await mountFactoryView({ setup: (_link, reads) => { reads.hold("readJournal"); } });
-  await expect.poll(() => h.reads.of("readJournal").length).toBe(1);
-  const before = h.view.current;
-
-  await h.unmount();
-  // The read is CANCELLED, not merely ignored: a real `FactoryRestReads` takes
-  // this signal into its fetch, so an abandoned view stops costing a request.
-  expect(h.reads.of("readJournal")[0]?.options.signal?.aborted).toBe(true);
-  h.reads.page = { journal_tip: 9, covered_through: 9, events: [publicEvent(9)] };
-  h.reads.settle("readJournal");
-  await new Promise((resolve) => setTimeout(resolve, 50));
-
-  // The snapshot the last committed render saw, unchanged: the machine was
-  // stopped before the read landed.
-  expect(h.view.current).toBe(before);
-  expect(h.view.current?.state).toBe("reading");
-});
+function setPage(reads: FakeFactoryReads, tip: number, sequences: number[], sessionId = FSID): void {
+  reads.status = { ...reads.status, session_id: sessionId, journal_tip: tip };
+  reads.page = { journal_tip: tip, covered_through: tip, events: sequences.map((sequence) => publicEvent(sequence)) };
+}
 
 function enduringFor(sequence: number): EnduringPublication {
   return {
-    type: "enduring_publication",
-    tenant_id: TENANT,
-    session_id: FSID,
-    event_id: `event-${sequence}`,
-    journal_seq: sequence,
-    covered_through: sequence,
-    body: { type: "session.message", text: `event ${sequence}` },
+    type: "enduring_publication", tenant_id: TENANT, session_id: FSID,
+    event_id: `event-${sequence}`, journal_seq: sequence, covered_through: sequence,
+    body: publicEvent(sequence).body,
   };
 }
 
-test("a StrictMode double-mount leaves one live subscription and a machine still running", async () => {
-  // The mount / unmount / remount simulation runs over ONE memoized machine, so
-  // a stop that could not be undone would leave the surviving subscription
-  // wired to a machine that ignores it — green in production, dead in dev.
-  const h = await mountFactoryView({
-    strict: true,
-    setup: (_link, reads) => {
-      reads.page = { journal_tip: 1, covered_through: 1, events: [publicEvent(1)] };
-    },
-  });
-
+async function liveReady(h: FactoryHarness, coverage = 0): Promise<void> {
+  await expect.poll(() => h.link.open.length).toBe(1);
+  await expect.poll(() => h.view.current?.liveState).toBe("live");
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(coverage);
   await expect.poll(() => h.view.current?.state).toBe("ready");
-  expect(h.link.open).toHaveLength(1);
-  // The discarded mount is cancelled before its connect resolves, so it never
-  // subscribes and never reads: one subscription, one cold read, no duplicate
-  // page — and no second connection behind them.
-  expect(h.link.subscriptions).toHaveLength(1);
-  expect(h.reads.of("readJournal")).toHaveLength(1);
-  expect(h.link.maxLiveConnections).toBe(1);
-  expect(h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([1]);
-
-  h.link.open[0]?.deliver(enduringFor(2));
-
-  await expect.poll(() => h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([1, 2]);
-  expect(h.link.rpcCalls).toStrictEqual([]);
-});
-
-test("a reset discards what the Factory no longer holds and re-reads", async () => {
-  const h = await mountFactoryView({
-    setup: (_link, reads) => {
-      reads.page = { journal_tip: 3, covered_through: 3, events: [publicEvent(1), publicEvent(2), publicEvent(3)] };
-    },
-  });
-  await expect.poll(() => h.view.current?.events).toHaveLength(3);
-
-  h.reads.page = { journal_tip: 1, covered_through: 1, events: [publicEvent(1)] };
-  h.link.open[0]?.reset({
-    type: "session.reset",
-    tenant_id: TENANT,
-    session_id: FSID,
-    journal_tip: 3,
-    last_contiguous: 1,
-  });
-
-  // Kept would be a transcript no read can reproduce: sequences 2 and 3 are
-  // gone from the Factory, so they go from the view too.
-  await expect.poll(() => h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([1]);
-  expect(h.view.current?.coveredThrough).toBe(1);
-  // The truncation is applied at once; the re-read it forces goes through the
-  // coalesced repair path, so it lands a macrotask later.
-  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
-  expect(h.link.rpcCalls).toStrictEqual([]);
-});
-
-test("a superseded read is cancelled, and only the current one commits", async () => {
-  // The repair case. What this measures is the ABORT: `join()` cancels the read
-  // it supersedes, this double rejects an aborted read exactly as
-  // `FactoryRestReads` does, and so the stale page and stale status never land
-  // at all. An earlier version of this test claimed the release ORDER was what
-  // made a superseded commit observable; it is not, and the ordering is inert.
-  const h = await mountFactoryView({
-    setup: (_link, reads) => {
-      reads.hold("readJournal");
-      reads.hold("readStatus");
-      reads.queue("readJournal", { journal_tip: 2, covered_through: 2, events: [publicEvent(2)] });
-      reads.queue("readStatus", { session_id: FSID, agent_id: "agent-1", state: "idle", residency: "cold", journal_tip: 2 });
-      reads.queue("readJournal", { journal_tip: 9, covered_through: 9, events: [publicEvent(9)] });
-      reads.queue("readStatus", { session_id: FSID, agent_id: "agent-1", state: "idle", residency: "resident", journal_tip: 9 });
-    },
-  });
-  await expect.poll(() => h.reads.of("readJournal").length).toBe(1);
-
-  h.link.drop();
-  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
-  // The read taken on the subscription that just died is CANCELLED, not merely
-  // ignored on arrival: its signal is the one a real `FactoryRestReads` hands
-  // to `fetch`, so a repair loop does not leave a request per lost connection
-  // running to completion.
-  expect(h.reads.of("readJournal")[0]?.options.signal?.aborted).toBe(true);
-  expect(h.reads.of("readJournal")[1]?.options.signal?.aborted).toBe(false);
-  h.reads.settle("readJournal");
-  h.reads.settle("readStatus");
-
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  expect(h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([9]);
-  expect(h.view.current?.status?.journal_tip).toBe(9);
-  expect(h.view.current?.status?.residency).toBe("resident");
-});
-
-test("a publication for another channel is never applied, and forces a re-read", async () => {
-  // A frame naming another session means this subscription is not what it
-  // claims to be. Believing it would splice one session's events into another;
-  // ignoring it silently would leave a view that has stopped being correct with
-  // no way to notice. It is re-read instead.
-  const h = await mountFactoryView({
-    setup: (_link, reads) => {
-      reads.page = { journal_tip: 1, covered_through: 1, events: [publicEvent(1)] };
-    },
-  });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  expect(h.reads.of("readStatus")).toHaveLength(1);
-
-  h.link.open[0]?.deliver({ ...enduringFor(6), session_id: "some-other-session" });
-
-  await expect.poll(() => h.reads.of("readStatus").length).toBe(2);
-  expect(h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([1]);
-  expect(h.view.current?.coveredThrough).toBe(1);
-});
-
-test("a publication carrying no sequence changes nothing", async () => {
-  // `FactoryPublication` is a union of three, and only the enduring member has
-  // a `journal_seq`. A machine keyed by that field which did not check the
-  // member first would write an `undefined` key — a fourth "event" with no
-  // identity, indistinguishable from the next one, in a map whose whole job is
-  // exactly-once. Both other members are dropped, and this is what says so.
-  const h = await mountFactoryView({
-    setup: (_link, reads) => {
-      reads.page = { journal_tip: 1, covered_through: 1, events: [publicEvent(1)] };
-    },
-  });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  const applied = h.view.current;
-
-  h.link.open[0]?.deliver({
-    type: "journal_tip",
-    tenant_id: TENANT,
-    session_id: FSID,
-    journal_tip: 12,
-  });
-  h.link.open[0]?.deliver({
-    type: "ephemeral_publication",
-    tenant_id: TENANT,
-    session_id: FSID,
-    kind: "turn.delta",
-    body: { text: "thinking" },
-  });
-  await new Promise((resolve) => setTimeout(resolve, 30));
-
-  expect(h.view.current).toBe(applied);
-  expect(h.view.current?.events.map((event) => event.journal_seq)).toStrictEqual([1]);
-  expect(h.view.current?.coveredThrough).toBe(1);
-  // And neither is a repair: they are for this channel, so nothing is re-read.
-  expect(h.reads.of("readStatus")).toHaveLength(1);
-});
-
-test("a burst of foreign frames causes one re-read, not one per frame", async () => {
-  // M2. Both repair triggers are PERSISTENT states, not one-shots: a
-  // subscription that is not what it claims to be keeps producing frames, and a
-  // Factory that keeps resetting keeps resetting. Re-reading per frame is the
-  // unthrottled subscribe/REST storm `joinFactorySessionView` names — one full
-  // three-request cycle per round trip, from the client, at the server.
-  const h = await mountFactoryView({ props: { repairDelayMs: 5 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  expect(h.reads.calls).toHaveLength(3);
-
-  for (let index = 0; index < 20; index += 1) {
-    h.link.open[0]?.deliver({ ...enduringFor(index + 1), session_id: "some-other-session" });
-  }
-  await expect.poll(() => h.reads.of("readStatus").length).toBe(2);
-  await new Promise((resolve) => setTimeout(resolve, 60));
-
-  // Twenty frames, one repair: six requests in total, not sixty.
-  expect(h.reads.of("readStatus")).toHaveLength(2);
-  expect(h.reads.calls).toHaveLength(6);
-});
-
-test("a burst of foreign resets causes one re-read, not one per reset", async () => {
-  const h = await mountFactoryView({ props: { repairDelayMs: 5 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-
-  for (let index = 0; index < 20; index += 1) {
-    h.link.open[0]?.reset({
-      type: "session.reset",
-      tenant_id: TENANT,
-      session_id: "some-other-session",
-      journal_tip: 3,
-      last_contiguous: 1,
-    });
-  }
-  await expect.poll(() => h.reads.of("readStatus").length).toBe(2);
-  await new Promise((resolve) => setTimeout(resolve, 60));
-
-  expect(h.reads.calls).toHaveLength(6);
-});
-
-test("repairs that never make progress give up instead of retrying forever", async () => {
-  // The second bound. Coalescing collapses a burst; it does not bound a
-  // condition that keeps re-arming after every read, which is what a Factory
-  // stuck on the wrong channel is. Without a counter the loop is infinite.
-  const h = await mountFactoryView({ props: { repairDelayMs: 1, maxRepairAttempts: 3 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-
-  for (let index = 0; index < 12; index += 1) {
-    h.link.open[0]?.deliver({ ...enduringFor(index + 1), session_id: "some-other-session" });
-    await new Promise((resolve) => setTimeout(resolve, 12));
-  }
-
-  await expect.poll(() => h.view.current?.state).toBe("failed");
-  expect(h.view.current?.error?.message).toMatch(/consecutive repairs without coverage progress/);
-  // Bounded by the counter, not by the burst: four cold reads at most (the
-  // first join plus three repairs), so twelve requests.
-  expect(h.reads.of("readStatus").length).toBeLessThanOrEqual(4);
-});
-
-test("a repair that recovers coverage clears the give-up counter", async () => {
-  // A slow-but-progressing recovery must never be cut off; only a stuck loop
-  // terminates. Coverage moving past the cycle's base is the progress test.
-  const h = await mountFactoryView({ props: { repairDelayMs: 1, maxRepairAttempts: 2 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-
-  for (let index = 1; index <= 8; index += 1) {
-    h.reads.page = { journal_tip: index, covered_through: index, events: [publicEvent(index)] };
-    h.link.open[0]?.deliver({ ...enduringFor(index), session_id: "some-other-session" });
-    await expect.poll(() => h.view.current?.coveredThrough).toBe(index);
-  }
-
-  expect(h.view.current?.state).toBe("ready");
-  expect(h.view.current?.error).toBeNull();
-});
-
-test("the caller's coveredThrough is the accumulation's starting coverage", async () => {
-  // The option was documented, exported and plumbed through, and no test passed
-  // it: replacing it with a literal 0 left the whole suite green.
-  //
-  // ONE reader, stated as one. The value is also handed to the binding as its
-  // `cursor`, and that is NOT a second reader through this hook: the machine
-  // starts at the same number and the `advance` effect writes it to the binding
-  // in the same commit, and `advance` only raises — so `cursor: 0` and
-  // `cursor: coveredThrough` reach the same cursor by either route, and no
-  // authorization can fire in between because `#join` opens with an `await`.
-  // The earlier version of this comment claimed the second reader and asserted
-  // a reconnect instead, which is why that mutant survived.
-  const h = await mountFactoryView({
-    props: { coveredThrough: 40 },
-    setup: (_link, reads) => {
-      reads.hold("readJournal");
-    },
-  });
-
-  await expect.poll(() => h.reads.of("readJournal").length).toBe(1);
-  // Before any page has landed, the view already claims the caller's coverage
-  // rather than zero.
-  expect(h.view.current?.coveredThrough).toBe(40);
-
-  // And a page that covers LESS than the caller already had does not lower it.
-  h.reads.page = { journal_tip: 3, covered_through: 3, events: [publicEvent(3)] };
-  h.reads.settle("readJournal");
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  expect(h.view.current?.coveredThrough).toBe(40);
-});
-
-test("changing the session in place starts the new one on its own cursor", async () => {
-  // The bug the missing test hid: reading `coveredThrough` from a ref taken on
-  // the FIRST render, while the machine's memo is keyed on `sessionId`, builds
-  // cold session B's machine and binding on session A's cursor — and subscribes
-  // B at a sequence measured on another journal. `sessionId` is a memo
-  // dependency, so an in-place change is supported and this is reachable.
-  const OTHER = "session-2";
-  const h = await mountFactoryView({ props: { coveredThrough: 40 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  expect(h.view.current?.coveredThrough).toBe(40);
-
-  await h.rerender({ sessionId: OTHER, coveredThrough: 0 });
-
-  await expect.poll(() => h.link.forSession(OTHER).length).toBe(1);
-  await expect.poll(() => h.view.current?.coveredThrough).toBe(0);
-  // The old session's binding is gone, and the new one is a JOIN, not a repair
-  // of a span it never covered.
-  expect(h.link.open.map((subscription) => subscription.sessionId)).toStrictEqual([OTHER]);
-  expect(h.reads.of("readStatus").map((call) => call.sessionId)).toStrictEqual([FSID, OTHER]);
-});
-
-test("the gate projection page is bounded by the same limit as the tail", async () => {
-  // M5(a). The bound the Factory reads to size its gate page. Losing it turned
-  // a bounded projection into an unbounded one with nothing failing.
-  const h = await mountFactoryView({ props: { tailLimit: 8 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  expect(h.reads.of("listGates")[0]?.options).toMatchObject({ limit: 8 });
-});
-
-test("a repair never flashes failed between the abort and the replacement read", async () => {
-  // M5(b). The catch path's generation guard has a live reader: `join()` aborts
-  // the read it supersedes, and the fake and the real client both REJECT an
-  // aborted read. Without the guard that rejection publishes
-  // `{state:"failed"}` — a "The live connection failed" banner on every single
-  // reconnect, cleared a moment later by the replacement read.
-  const h = await mountFactoryView({
-    setup: (_link, reads) => {
-      reads.hold("readJournal");
-    },
-  });
-  await expect.poll(() => h.reads.of("readJournal").length).toBe(1);
-  const states: (string | undefined)[] = [];
-  const watch = setInterval(() => states.push(h.view.current?.state), 1);
-
-  h.link.drop();
-  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
-  h.reads.settle("readJournal");
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  clearInterval(watch);
-
-  expect(states).not.toContain("failed");
-  expect(h.view.current?.error).toBeNull();
-});
-
-test("changing coveredThrough alone leaves the working view alone", async () => {
-  // The documented no-op, pinned so that nobody turns it into a dependency.
-  // `useSessionBinding` is keyed on the session, so a machine rebuilt without a
-  // rebind is never authorized, never fires `onJoin` and never reads —
-  // measured: adding `coveredThrough` to the memo's dependencies replaces a
-  // working view with a permanently "joining" one. It takes effect at the next
-  // session change, which is the only moment a fresh cursor means anything.
-  const h = await mountFactoryView({ props: { coveredThrough: 40 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-
-  await h.rerender({ coveredThrough: 80 });
-  await new Promise((resolve) => setTimeout(resolve, 30));
-
-  expect(h.view.current?.state).toBe("ready");
-  expect(h.view.current?.coveredThrough).toBe(40);
-  expect(h.reads.of("readStatus")).toHaveLength(1);
-  expect(h.link.open).toHaveLength(1);
-});
-
-/** Drives repair triggers at `everyMs` until `stop()`, so the backoff alone paces the reads. */
-function driveForeignFrames(h: FactoryHarness, everyMs = 1): () => void {
-  let sequence = 0;
-  const handle = setInterval(() => {
-    sequence += 1;
-    h.link.open[0]?.deliver({ ...enduringFor(sequence), session_id: "some-other-session" });
-  }, everyMs);
-  return () => clearInterval(handle);
 }
 
-test("a repair loop that once made progress still gives up", async () => {
-  // M1. `#repairBase` is re-based on every cycle. Frozen at the constructor's
-  // cursor instead, `#coveredThrough > #repairBase` is true forever after the
-  // first byte of progress, the counter resets every cycle, and the give-up
-  // bound never fires again — the unbounded loop this class exists to close,
-  // re-opened by any session that ever advanced. Both other bound tests miss
-  // it: one never progresses, so `0 > 0` is false either way, and the other
-  // only asks for the reset.
-  const h = await mountFactoryView({ props: { repairDelayMs: 0, maxRepairAttempts: 3 } });
+test("opening a cold session reads bounded REST state and never sends a restore", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 3, [2, 3]);
+  } });
   await expect.poll(() => h.view.current?.state).toBe("ready");
+  expect(h.view.current?.status?.residency).toBe("cold");
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([2, 3]);
+  expect(h.reads.calls.map((call) => call.method)).toEqual(["readStatus", "listGates", "readJournal"]);
+  expect(h.reads.of("readJournal")[0]?.options).toMatchObject({ tail: 256, limit: 256 });
+  expect(h.link.rpcCalls).toEqual([]);
+  expect(h.link.subscriptions).toEqual([]);
+});
 
-  // Progress, once.
-  h.reads.page = { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] };
-  h.link.open[0]?.deliver(enduringFor(5));
+test("cold REST rendering completes while realtime authorization is unavailable", async () => {
+  const h = await mountFactoryView({ setup: (link) => { link.holdConnect = true; } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  expect(h.reads.of("readJournal")).toHaveLength(1);
+  h.link.settleConnect();
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
+  expect(h.link.open).toHaveLength(1);
+});
+
+test("refresh reconciles three events committed between cold capture and authorization", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 1, [1]);
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(1);
+  setPage(h.reads, 4, [2, 3, 4]);
+  h.link.settleConnect();
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(4);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([1, 2, 3, 4]);
+  expect(h.reads.of("readJournal").every((call) => call.options.tail === 256)).toBe(true);
+});
+
+test("authorized catchup buffers duplicates and publications above the captured tip", async () => {
+  const h = await mountFactoryView({ setup: (link) => { link.holdConnect = true; } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  setPage(h.reads, 3, [1, 2, 3]);
+  h.reads.hold("readJournal");
+  h.link.settleConnect();
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
+  h.link.open[0]!.deliver(enduringFor(3));
+  h.link.open[0]!.deliver(enduringFor(4));
+  h.link.open[0]!.deliver(enduringFor(4));
+  expect(h.view.current?.events).toEqual([]);
+  expect(h.view.current?.coveredThrough).toBe(0);
+  h.reads.settle("readJournal");
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(4);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([1, 2, 3, 4]);
+});
+
+test("replica reconnect repairs from the shared engine's committed coverage", async () => {
+  const h = await mountFactoryView({ setup: (_link, reads) => setPage(reads, 2, [1, 2]) });
+  await liveReady(h, 2);
+  const old = h.link.open[0]!;
+  setPage(h.reads, 5, [3, 4, 5]);
+  h.link.drop();
   await expect.poll(() => h.view.current?.coveredThrough).toBe(5);
-
-  // Then stuck: nothing that follows advances coverage.
-  const stop = driveForeignFrames(h);
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  stop();
-
-  // Asserted at a fixed time, not polled: without the re-base this is "ready"
-  // forever and a poll would report a timeout rather than a failed assertion.
-  expect(h.view.current?.state).toBe("failed");
-  expect(h.view.current?.error?.message).toMatch(/consecutive repairs without coverage progress/);
+  old.deliver(enduringFor(99));
+  await h.rerender();
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([1, 2, 3, 4, 5]);
+  expect(h.link.maxLiveConnections).toBe(1);
+  expect(h.link.rpcCalls).toEqual([]);
 });
 
-test("the give-up boundary is the caller's number exactly, from both sides", async () => {
-  // M3. `>` was pinned only in the loosening direction: any TIGHTENING was
-  // invisible, including `>= 1`, which gives up on the first repair and ignores
-  // `maxRepairAttempts` entirely. The read count at the boundary is an equality.
-  const h = await mountFactoryView({ props: { repairDelayMs: 0, maxRepairAttempts: 4 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
+test("a validated reset lowers coverage and removes truncated events before replacement history", async () => {
+  const h = await mountFactoryView({ setup: (_link, reads) => setPage(reads, 3, [1, 2, 3]) });
+  await liveReady(h, 3);
+  setPage(h.reads, 2, [1, 2]);
+  h.link.open[0]!.reset({
+    type: "session.reset", tenant_id: TENANT, session_id: FSID,
+    journal_tip: 2, last_contiguous: 1,
+  });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(2);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([1, 2]);
+});
 
-  const stop = driveForeignFrames(h);
+test("live repair is observable while the durable snapshot remains ready", async () => {
+  const h = await mountFactoryView({ setup: (_link, reads) => setPage(reads, 2, [2]) });
+  await liveReady(h, 2);
+  await expect.poll(() => h.view.current?.liveState).toBe("live");
+  h.reads.hold("readJournal");
+  h.link.open[0]!.reset({
+    type: "session.reset", tenant_id: TENANT, session_id: FSID,
+    journal_tip: 2, last_contiguous: 2,
+  });
+  await expect.poll(() => h.view.current?.liveState).toBe("repairing");
+  expect(h.view.current?.state).toBe("ready");
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([2]);
+  h.reads.settle("readJournal");
+  await expect.poll(() => h.view.current?.liveState).toBe("live");
+});
+
+test("an overflowing prejoin buffer discards uncommitted frames and repairs", async () => {
+  const h = await mountFactoryView({ props: { repairDelayMs: 0 }, setup: (link) => { link.holdConnect = true; } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  h.reads.hold("readJournal");
+  h.link.settleConnect();
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
+  const first = h.link.open[0]!;
+  for (let sequence = 1; sequence <= 257; sequence++) first.deliver(enduringFor(sequence));
+  await expect.poll(() => h.reads.of("readJournal")[1]?.options.signal?.aborted).toBe(true);
+  expect(h.view.current?.coveredThrough).toBe(0);
+  expect(h.view.current?.events).toEqual([]);
+  setPage(h.reads, 257, [255, 256, 257]);
+  h.reads.settle("readJournal");
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(257);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([255, 256, 257]);
+});
+
+test("a forged channel publication never moves coverage and triggers repair", async () => {
+  const h = await mountFactoryView({ props: { repairDelayMs: 0 }, setup: (_link, reads) => setPage(reads, 2, [2]) });
+  await liveReady(h, 2);
+  const before = h.reads.of("readJournal").length;
+  h.link.open[0]!.deliver({ ...enduringFor(999), tenant_id: "another-tenant" });
+  await expect.poll(() => h.reads.of("readJournal").length).toBeGreaterThan(before);
+  expect(h.view.current?.coveredThrough).toBe(2);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([2]);
+});
+
+test("committed publication coverage attests withheld private positions", async () => {
+  const h = await mountFactoryView({ setup: (_link, reads) => setPage(reads, 2, [2]) });
+  await liveReady(h, 2);
+  h.link.open[0]!.deliver(enduringFor(5));
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(5);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([2, 5]);
+});
+
+test("ephemeral publications do not enter durable history", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  h.link.open[0]!.deliver({
+    type: "ephemeral_publication", tenant_id: TENANT, session_id: FSID,
+    body: { type: "token_delta", text: "working" },
+  });
+  await h.rerender();
+  expect(h.view.current?.events).toEqual([]);
+  expect(h.view.current?.coveredThrough).toBe(0);
+});
+
+test("cold capture follows an opaque continuation without a new tail or sequence-zero read", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    reads.status = { ...reads.status, journal_tip: 5 };
+    reads.queue("readJournal", { journal_tip: 5, covered_through: 2, events: [publicEvent(2)], next_cursor: "cursor-1" });
+    reads.queue("readJournal", { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] });
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(5);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([2, 5]);
+  expect(h.reads.of("readJournal").map((call) => call.options)).toMatchObject([
+    { tail: 256, limit: 256 }, { cursor: "cursor-1", limit: 256 },
+  ]);
+  expect(h.reads.of("readJournal")[1]?.options.tail).toBeUndefined();
+  expect(h.reads.of("readStatus")).toHaveLength(1);
+});
+
+test("empty continuation coverage reaches the immutable captured tip", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    reads.status = { ...reads.status, journal_tip: 6 };
+    reads.queue("readJournal", { journal_tip: 6, covered_through: 1, events: [], next_cursor: "cursor-1" });
+    reads.queue("readJournal", { journal_tip: 6, covered_through: 3, events: [], next_cursor: "cursor-2" });
+    reads.queue("readJournal", { journal_tip: 6, covered_through: 6, events: [publicEvent(6)] });
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(6);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([6]);
+  expect(h.reads.of("readJournal")).toHaveLength(3);
+});
+
+test("authorized join also follows captured-tail continuations", async () => {
+  const h = await mountFactoryView({ setup: (link) => { link.holdConnect = true; } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  h.reads.status = { ...h.reads.status, journal_tip: 6 };
+  h.reads.queue("readJournal", { journal_tip: 6, covered_through: 2, events: [], next_cursor: "live-cursor" });
+  h.reads.queue("readJournal", { journal_tip: 6, covered_through: 6, events: [publicEvent(6)] });
+  h.link.settleConnect();
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(6);
+  expect(h.reads.of("readJournal")[2]?.options).toMatchObject({ cursor: "live-cursor", limit: 256 });
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([6]);
+});
+
+test("cold page budget exhaustion refuses the whole capture", async () => {
+  const h = await mountFactoryView({ props: { maxTailPages: 1 }, setup: (link, reads) => {
+    link.holdConnect = true;
+    reads.status = { ...reads.status, journal_tip: 9 };
+    reads.page = { journal_tip: 9, covered_through: 2, events: [publicEvent(2)], next_cursor: "more" };
+  } });
   await expect.poll(() => h.view.current?.state).toBe("failed");
-  stop();
-
-  // One cold read for the join, then exactly `maxRepairAttempts` repairs, then
-  // the give-up — which reads nothing.
-  expect(h.reads.of("readStatus")).toHaveLength(5);
-  expect(h.view.current?.error?.message).toContain("5 consecutive repairs");
+  expect(h.view.current?.coveredThrough).toBe(0);
+  expect(h.view.current?.events).toEqual([]);
+  expect(h.view.current?.error?.message).toContain("captured tail");
+  expect(h.reads.of("readJournal")).toHaveLength(1);
 });
 
-test("the default give-up bound is protocol's, not one and not unbounded", async () => {
-  const h = await mountFactoryView({ props: { repairDelayMs: 0 } });
+test("cold byte budget exhaustion refuses the whole capture", async () => {
+  const h = await mountFactoryView({ props: { maxTailBytes: 100 }, setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 2, []);
+    reads.page.events = [publicEvent(2, "x".repeat(512))];
+  } });
+  await expect.poll(() => h.view.current?.state).toBe("failed");
+  expect(h.view.current?.coveredThrough).toBe(0);
+  expect(h.view.current?.events).toEqual([]);
+});
+
+test("cold capture rejects events above the authenticated page coverage", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 2, [5]);
+  } });
+  await expect.poll(() => h.view.current?.state).toBe("failed");
+  expect(h.view.current?.events).toEqual([]);
+  expect(h.view.current?.coveredThrough).toBe(0);
+});
+
+test("authorization cancels an unfinished initial cold capture", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    reads.hold("readJournal");
+  } });
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(1);
+  h.link.settleConnect();
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
+  expect(h.reads.of("readJournal")[0]?.options.signal?.aborted).toBe(true);
+  h.reads.settle("readJournal");
+  await liveReady(h);
+});
+
+test("session change cancels an in-flight cold continuation and rejects old callbacks", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    reads.status = { ...reads.status, journal_tip: 5 };
+    reads.hold("readJournal");
+    reads.queue("readJournal", { journal_tip: 5, covered_through: 2, events: [], next_cursor: "more" });
+  } });
+  h.reads.settle("readJournal");
+  h.reads.hold("readJournal");
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
+  setPage(h.reads, 7, [7], "session-2");
+  await h.rerender({ sessionId: "session-2" });
+  expect(h.reads.of("readJournal")[1]?.options.signal?.aborted).toBe(true);
+  h.reads.settle("readJournal");
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(7);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([7]);
+});
+
+test("tenant change with the same session id creates an isolated journal view", async () => {
+  const h = await mountFactoryView({ setup: (_link, reads) => setPage(reads, 2, [2]) });
+  await liveReady(h, 2);
+  const stale = h.link.open[0]!;
+  setPage(h.reads, 4, [4]);
+  await h.rerender({ tenantId: "tenant-2" });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(4);
+  stale.deliver(enduringFor(99));
+  await h.rerender({ tenantId: "tenant-2" });
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([4]);
+  expect(h.link.open[0]?.options.tenantId).toBe("tenant-2");
+});
+
+test("unmount aborts pending reads and makes late completions inert", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    reads.hold("readJournal");
+  } });
+  await expect.poll(() => h.reads.of("readJournal").length).toBe(1);
+  const before = h.view.current;
+  await h.unmount();
+  expect(h.reads.of("readJournal")[0]?.options.signal?.aborted).toBe(true);
+  h.reads.settle("readJournal");
+  await Promise.resolve();
+  expect(h.view.current).toBe(before);
+});
+
+test("StrictMode leaves one active subscription and ignores the discarded mount", async () => {
+  const h = await mountFactoryView({ strict: true, setup: (_link, reads) => setPage(reads, 1, [1]) });
+  await liveReady(h, 1);
+  expect(h.link.open).toHaveLength(1);
+  expect(h.link.maxLiveConnections).toBe(1);
+  h.link.open[0]!.deliver(enduringFor(2));
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(2);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([1, 2]);
+  expect(h.link.rpcCalls).toEqual([]);
+});
+
+test("REST authorization denial is reported without a restore", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    reads.fail("readStatus", new Error("not authorized"));
+  } });
+  await expect.poll(() => h.view.current?.state).toBe("failed");
+  expect(h.view.current?.error?.message).toBe("not authorized");
+  expect(h.view.current?.status).toBeNull();
+  expect(h.link.rpcCalls).toEqual([]);
+});
+
+test("a missing session is reported by its durable read", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    reads.fail("readStatus", new Error("session not found"));
+  } });
+  await expect.poll(() => h.view.current?.state).toBe("failed");
+  expect(h.view.current?.error?.message).toBe("session not found");
+});
+
+test("a failed cold projection aborts sibling REST requests while realtime is unavailable", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    reads.hold("readJournal");
+    reads.fail("readStatus", new Error("projection unavailable"));
+  } });
+  await expect.poll(() => h.view.current?.state).toBe("failed");
+  expect(h.reads.of("readJournal")[0]?.options.signal?.aborted).toBe(true);
+});
+
+test("a durable cold snapshot remains visible after bounded realtime failure", async () => {
+  const h = await mountFactoryView({ props: { maxRepairAttempts: 1, repairDelayMs: 0 }, setup: (link, reads) => {
+    link.denied.add(FSID);
+    setPage(reads, 1, [1]);
+  } });
+  await expect.poll(() => h.view.current?.error?.message).toContain("gave up");
+  expect(h.view.current?.state).toBe("ready");
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([1]);
+  expect(h.link.subscriptions.length).toBeLessThanOrEqual(2);
+});
+
+test.each([
+  ["readStatus", "not_authorized"],
+  ["listGates", "not_authorized"],
+  ["readJournal", "unauthenticated"],
+] as const)("an authoritative %s %s denial clears cached durable state and cancels the binding", async (method, code) => {
+  const h = await mountFactoryView({ setup: (_link, reads) => setPage(reads, 2, [2]) });
+  await liveReady(h, 2);
+  h.reads.fail(method, new CoreProtocolError({ error: {
+    code, message: "not authorized", retryable: false,
+  } }));
+  h.link.drop();
+  await expect.poll(() => h.view.current?.state).toBe("failed");
+  expect(h.view.current?.status).toBeNull();
+  expect(h.view.current?.gates).toBeNull();
+  expect(h.view.current?.events).toEqual([]);
+  expect(h.view.current?.coveredThrough).toBe(0);
+  expect(h.view.current?.error).toMatchObject({ code });
+  await expect.poll(() => h.link.open.length).toBe(0);
+});
+
+test("rekeying the provider for a new authentication generation clears the old view", async () => {
+  const h = await mountFactoryView({ setup: (_link, reads) => setPage(reads, 2, [2]) });
+  await liveReady(h, 2);
+  const old = h.link.open[0]!;
+  setPage(h.reads, 4, [4]);
+  await h.rerender({ scopeKey: "new-auth-generation" });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(4);
+  old.deliver(enduringFor(99));
+  await h.rerender({ scopeKey: "new-auth-generation" });
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([4]);
+  expect(old.unsubscribeCount).toBe(1);
+});
+
+test("a transient verifier outage repairs without erasing cached durable state", async () => {
+  const h = await mountFactoryView({ setup: (_link, reads) => setPage(reads, 2, [2]) });
+  await liveReady(h, 2);
+  h.reads.fail("readStatus", new CoreProtocolError({ error: { code: "unavailable", retryable: true } }));
+  const before = h.reads.of("readStatus").length;
+  h.link.drop();
+  await expect.poll(() => h.reads.of("readStatus").length).toBeGreaterThan(before + 1);
+  await expect.poll(() => h.view.current?.liveState).toBe("live");
+  expect(h.view.current?.state).toBe("ready");
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([2]);
+});
+
+test("a stale aborted generation's denial cannot clear a newer authorized view", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  const originalStatus = h.reads.readStatus.bind(h.reads);
+  let rejectOld!: (cause: Error) => void;
+  let statusCalls = 0;
+  h.reads.readStatus = (sessionId, options) => {
+    if (++statusCalls === 1) return new Promise((_resolve, reject) => { rejectOld = reject; });
+    return originalStatus(sessionId, options);
+  };
+  const reset = { type: "session.reset" as const, tenant_id: TENANT, session_id: FSID, journal_tip: 0, last_contiguous: 0 };
+  h.link.open[0]!.reset(reset);
+  await expect.poll(() => statusCalls).toBe(1);
+  h.link.open[0]!.reset(reset);
+  await expect.poll(() => statusCalls).toBe(2);
+  await expect.poll(() => h.view.current?.liveState).toBe("live");
+  rejectOld(new CoreProtocolError({ error: { code: "not_authorized", retryable: false } }));
+  await h.rerender();
+  expect(h.view.current?.state).toBe("ready");
+  expect(h.view.current?.error).toBeNull();
+});
+
+test("the caller's cursor is retained until an authorized capture can reach it", async () => {
+  const h = await mountFactoryView({ props: { coveredThrough: 40 }, setup: (link) => { link.holdConnect = true; } });
   await expect.poll(() => h.view.current?.state).toBe("ready");
-
-  const stop = driveForeignFrames(h);
-  await expect.poll(() => h.view.current?.state, { timeout: 4000 }).toBe("failed");
-  stop();
-
-  // The LITERAL, deliberately not the imported constant. An expectation that
-  // reads the value under test moves with it, so a mutant that changes the
-  // default to 1 would change this assertion to match and survive.
-  expect(h.reads.of("readStatus")).toHaveLength(1 + 32);
+  expect(h.view.current?.coveredThrough).toBe(40);
+  setPage(h.reads, 0, [], "session-2");
+  await h.rerender({ sessionId: "session-2", coveredThrough: 0 });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(0);
 });
 
-test("the shared repair bounds are protocol's, by value", () => {
-  // The constants are IMPORTED rather than retyped, so drift between this file
-  // and `joinFactorySessionView` is impossible by construction. What that
-  // cannot catch is the pair moving together, so their values are pinned here —
-  // the one place in either package that reads them as numbers.
+test("changing construction-only options alone does not restart a working view", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  const count = h.reads.calls.length;
+  const subscriptions = h.link.subscriptions.length;
+  await h.rerender({ coveredThrough: 999, maxRepairAttempts: 1 });
+  expect(h.reads.calls).toHaveLength(count);
+  expect(h.link.subscriptions).toHaveLength(subscriptions);
+  expect(h.view.current?.coveredThrough).toBe(0);
+});
+
+test("status and public gates use the caller's bounded page size", async () => {
+  const h = await mountFactoryView({ props: { tailLimit: 8 }, setup: (link) => { link.holdConnect = true; } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  expect(h.reads.of("readJournal")[0]?.options).toMatchObject({ tail: 8, limit: 8 });
+  expect(h.reads.of("listGates")[0]?.options.limit).toBe(8);
+});
+
+test("shared repair defaults remain the protocol defaults", () => {
   expect(DEFAULT_MAX_REPAIR_ATTEMPTS).toBe(32);
   expect(DEFAULT_REPAIR_DELAY_MS).toBe(250);
   expect(MAX_REPAIR_BACKOFF_FACTOR).toBe(8);
 });
 
-test("consecutive repairs back off, doubling, and stop doubling at the cap", async () => {
-  // M2. The whole schedule had no reader: replacing it with `const delay = 0`
-  // left the suite green, and so did 8 -> 1, 8 -> 1000, 250 -> 0 and
-  // 250 -> 999999. A count of reads cannot see a schedule; the times can.
-  const base = 20;
-  const h = await mountFactoryView({ props: { repairDelayMs: base, maxRepairAttempts: 8 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  const firstRepairIndex = h.reads.of("readStatus").length;
-
-  const stop = driveForeignFrames(h);
-  await expect.poll(() => h.view.current?.state, { timeout: 4000 }).toBe("failed");
-  stop();
-
-  const times = h.reads.of("readStatus").slice(firstRepairIndex - 1).map((call) => call.at);
-  const gaps: number[] = [];
-  for (let index = 1; index < times.length; index += 1) gaps.push(times[index]! - times[index - 1]!);
-
-  // The first repair after a join is immediate; the second is one base delay.
-  expect(gaps[0]).toBeLessThan(base / 2);
-  expect(gaps[1]).toBeGreaterThanOrEqual(base / 2);
-  expect(gaps[1]).toBeLessThan(base * 1.6);
-  // It doubles, and it stops: the largest wait is the capped one, not the last
-  // term of an unbounded series. Bounded by LITERALS around the cap this suite
-  // pins separately, never by the constant under test — an oracle that reads
-  // the mutated value moves with it and kills nothing.
-  const longest = Math.max(...gaps);
-  expect(longest).toBeGreaterThanOrEqual(base * 8 * 0.6);
-  expect(longest).toBeLessThan(base * 8 * 2);
-  // And the whole run is paced by the curve rather than by the macrotask queue.
-  expect(times[times.length - 1]! - times[0]!).toBeGreaterThan(base * 12);
-});
-
-test("the default repair delay is protocol's quarter second, not zero and not unbounded", async () => {
-  // The DEFAULT is a separate reader from the curve: a test that always passes
-  // `repairDelayMs` cannot see `DEFAULT_REPAIR_DELAY_MS` at all. Both bounds
-  // are asserted at FIXED times, so neither direction reports a poll timeout.
-  const h = await mountFactoryView({ props: { maxRepairAttempts: 2 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  const before = h.reads.of("readStatus").length;
-
-  const stop = driveForeignFrames(h);
-  await new Promise((resolve) => setTimeout(resolve, 60));
-  // The first repair is immediate; the second waits a base delay that has not
-  // elapsed. A zero default would already have spent the whole budget.
-  expect(h.reads.of("readStatus")).toHaveLength(before + 1);
-
-  await new Promise((resolve) => setTimeout(resolve, 500));
-  stop();
-  // And it is a quarter second, not a forever: the second repair has landed and
-  // the run has given up.
-  expect(h.reads.of("readStatus")).toHaveLength(before + 2);
-  expect(h.view.current?.state).toBe("failed");
-});
-
-test("a view that has given up stops paying for further triggers", async () => {
-  // M4. `#repair` returned after publishing WITHOUT scheduling anything, so
-  // every later trigger re-entered, counted again, allocated an `Error` with a
-  // stack and published — and `Publisher.publish` compares nothing, so each was
-  // a React commit. Bounded in requests, unbounded in renders.
-  const h = await mountFactoryView({ props: { repairDelayMs: 0, maxRepairAttempts: 2 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  const stop = driveForeignFrames(h);
-  await expect.poll(() => h.view.current?.state).toBe("failed");
-  stop();
-
-  const settled = h.view.current;
-  const reads = h.reads.calls.length;
-  for (let index = 0; index < 20; index += 1) {
-    h.link.open[0]?.deliver({ ...enduringFor(index + 1), session_id: "some-other-session" });
-  }
-  await new Promise((resolve) => setTimeout(resolve, 40));
-
-  // The identical snapshot reference: not one further publish, so not one
-  // further render and not one further Error allocated.
-  expect(h.view.current).toBe(settled);
-  expect(h.reads.calls).toHaveLength(reads);
-});
-
-test("a rejoin drops a repair that was still pending, and re-arms the view", async () => {
-  // A foreign frame schedules a repair; the link reconnects first and the
-  // rejoin's read does that work. Left armed, the stale timer fired a second
-  // full three-request cold read a moment later, bumping the generation and
-  // aborting the fresh read it had just superseded.
-  const h = await mountFactoryView({ props: { repairDelayMs: 60 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  // Two frames: the first repair is immediate, the second is the one that waits.
-  h.link.open[0]?.deliver({ ...enduringFor(1), session_id: "some-other-session" });
-  await expect.poll(() => h.reads.of("readStatus").length).toBe(2);
-  h.link.open[0]?.deliver({ ...enduringFor(2), session_id: "some-other-session" });
-
-  h.link.drop();
-  await expect.poll(() => h.reads.of("readStatus").length).toBe(3);
-  await new Promise((resolve) => setTimeout(resolve, 150));
-
-  expect(h.reads.of("readStatus")).toHaveLength(3);
-  expect(h.view.current?.state).toBe("ready");
-});
-
-test("a rejoin after a give-up reads again", async () => {
-  // Giving up is a statement about one subscription's stream of triggers, not
-  // about the session: the next connection gets its chance, exactly as a
-  // binding does.
-  const h = await mountFactoryView({ props: { repairDelayMs: 0, maxRepairAttempts: 1 } });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  const stop = driveForeignFrames(h);
-  await expect.poll(() => h.view.current?.state).toBe("failed");
-  stop();
-  const reads = h.reads.of("readStatus").length;
-
-  h.link.drop();
-
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  expect(h.reads.of("readStatus").length).toBe(reads + 1);
-
-  // And the view is RE-ARMED, not merely re-read: a fresh trigger on the new
-  // subscription schedules a repair again. Leaving `#gaveUp` set would give a
-  // view that reads once on reconnect and then ignores every signal that it is
-  // out of date, for the rest of the connection.
-  h.link.open[0]?.deliver({ ...enduringFor(9), session_id: "some-other-session" });
-  // A fixed wait and a plain assertion: a poll would report a timeout for a
-  // view that never re-arms, and a timeout is not evidence of an assertion.
-  await new Promise((resolve) => setTimeout(resolve, 60));
-  expect(h.reads.of("readStatus")).toHaveLength(reads + 2);
-});
-
-test("only tailLimit is live; the other three take effect at the next session", async () => {
-  // Three option lifetimes, and this is the only thing in the repository that
-  // would catch someone widening the memo's dependencies: there is no eslint
-  // config and no eslint dependency here, so the disable comment beside those
-  // dependencies enforces nothing at all.
-  const h = await mountFactoryView({
-    props: { tailLimit: 8, repairDelayMs: 0, maxRepairAttempts: 4, coveredThrough: 2 },
-  });
-  await expect.poll(() => h.view.current?.state).toBe("ready");
-  expect(h.reads.of("readJournal")[0]?.options).toMatchObject({ tail: 8, limit: 8 });
-
-  await h.rerender({ tailLimit: 32, repairDelayMs: 999, maxRepairAttempts: 1, coveredThrough: 90 });
-  await new Promise((resolve) => setTimeout(resolve, 30));
-
-  // The view is still the same working one: no rebuild, so no rebind, so no
-  // permanently "joining" view.
-  expect(h.view.current?.state).toBe("ready");
-  expect(h.view.current?.coveredThrough).toBe(2);
-  expect(h.reads.of("readStatus")).toHaveLength(1);
-
-  // But `tailLimit` is read afresh by the next cold read, and the bounds the
-  // rerender passed are ignored — the repair still runs on the delay and the
-  // attempt count this view was built with.
-  h.link.drop();
-  await expect.poll(() => h.reads.of("readJournal").length).toBe(2);
-  expect(h.reads.of("readJournal")[1]?.options).toMatchObject({ tail: 32, limit: 32 });
-  const stop = driveForeignFrames(h);
-  await expect.poll(() => h.view.current?.state).toBe("failed");
-  stop();
-  expect(h.view.current?.error?.message).toContain("5 consecutive repairs");
-});
-
-test("a bound that is not a bound is rejected, with protocol's own messages", async () => {
-  // `joinFactorySessionView` validates all four and throws `RangeError`; this
-  // ran none, so `maxRepairAttempts: 0` silently meant "give up on the first
-  // repair and never read again", `repairDelayMs: NaN` became a zero delay, and
-  // `tailLimit: 0` issued `limit=0` reads.
+test("invalid bounds fail before I/O", async () => {
   const cases: [ViewProps, string][] = [
     [{ tailLimit: 0 }, "tailLimit must be a positive safe integer"],
     [{ tailLimit: 1.5 }, "tailLimit must be a positive safe integer"],
@@ -978,7 +692,5 @@ test("a bound that is not a bound is rejected, with protocol's own messages", as
     [{ repairDelayMs: Number.NaN }, "repairDelayMs must be a non-negative safe integer"],
     [{ coveredThrough: -1 }, "coveredThrough must be a non-negative safe integer"],
   ];
-  for (const [props, message] of cases) {
-    await expect(mountFactoryView({ props })).rejects.toThrow(message);
-  }
+  for (const [props, message] of cases) await expect(mountFactoryView({ props })).rejects.toThrow(message);
 });

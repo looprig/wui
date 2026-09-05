@@ -1,5 +1,5 @@
 import { FoldError, type SessionViewStore } from "@looprig/protocol";
-import type { ClientLink, ClientSubscription, FactoryPublication, SessionReset } from "@looprig/protocol";
+import type { ClientLink, ClientSubscription, FactoryPublication, SessionReset, SubscribeOptions } from "@looprig/protocol";
 import { asError, cancelOnce, Publisher, RefreshGuard } from "./publisher.js";
 
 export type ConnectionState = "idle" | "live" | "closed" | "failed";
@@ -202,6 +202,9 @@ interface BindingRecord {
   attemptedGeneration: number;
   /** True once this binding has subscribed at least once; a later one rejoins. */
   joined: boolean;
+  subscription: ClientSubscription | undefined;
+  authorize(): void;
+  reject(error: Error): void;
   cancel(): void;
 }
 
@@ -305,7 +308,20 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     this.publish({ state: "idle", connected: false, failure: null, bindingCount: 0 });
   }
 
-  bind(options: SessionBindingOptions): SessionBinding {
+  /** Protocol owns repair generations; this store owns the shared connection. */
+  bindSubscription(options: SubscribeOptions): ClientSubscription {
+    return this.bind({
+      ...options,
+      onRejoin: () => options.onError?.(new Error("factory subscription reauthorized; durable repair required")),
+    });
+  }
+
+  bind(options: SessionBindingOptions): SessionBinding & ClientSubscription {
+    let authorize!: () => void;
+    let reject!: (error: Error) => void;
+    const ready = new Promise<void>((resolve, fail) => { authorize = resolve; reject = fail; });
+    // Legacy bindings do not consume readiness; their callbacks still report errors.
+    void ready.catch(() => {});
     const record: BindingRecord = {
       options,
       cursor: options.cursor ?? 0,
@@ -313,10 +329,14 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
       release: undefined,
       attemptedGeneration: 0,
       joined: false,
+      subscription: undefined,
+      authorize,
+      reject,
       cancel: () => {},
     };
     record.cancel = cancelOnce(() => {
       record.cancelled = true;
+      record.reject(new Error("factory binding cancelled"));
       this.#bindings.delete(record);
       // Only a record that actually HELD the channel frees one, so only that
       // record may drive a peer at it. A cancelling loser frees nothing, and
@@ -329,6 +349,10 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     this.publish({ bindingCount: this.#bindings.size });
     void this.#join(record);
     return {
+      ready,
+      get state() { return record.cancelled ? "unsubscribed" : record.subscription?.state ?? "subscribing"; },
+      get version() { return record.subscription?.version; },
+      unsubscribe: record.cancel,
       get sessionId(): string {
         return options.sessionId;
       },
@@ -491,7 +515,9 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     const connected = await this.#ensureConnected();
     if (record.cancelled) return;
     if (!connected) {
-      record.options.onError?.(this.snapshot().failure ?? new Error("factory link unavailable"));
+      const error = this.snapshot().failure ?? new Error("factory link unavailable");
+      record.reject(error);
+      record.options.onError?.(error);
       return;
     }
     const generation = this.#generation;
@@ -518,10 +544,10 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
         tenantId: record.options.tenantId,
         sessionId: record.options.sessionId,
         onPublication: (publication) => {
-          if (!record.cancelled) record.options.onPublication(publication);
+          if (!record.cancelled && record.attemptedGeneration === generation) record.options.onPublication(publication);
         },
         onReset: (reset) => {
-          if (!record.cancelled) record.options.onReset(reset);
+          if (!record.cancelled && record.attemptedGeneration === generation) record.options.onReset(reset);
         },
         onError: (error) => {
           this.#onBindingError(record, generation, error);
@@ -541,12 +567,14 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
       // a join and not as a rejoin. `attemptedGeneration` IS left set, because
       // retrying on this same connection would find the channel still held and
       // throw again; the next connection is what gives this record its chance.
+      record.reject(asError(reason));
       record.options.onError?.(asError(reason));
       return;
     }
     // Set only once a subscription actually exists, so the throw above cannot
     // make this record's first real join look like a rejoin.
     record.joined = true;
+    record.subscription = subscription;
     // No second CANCELLATION check between `subscribe` and here: `subscribe`
     // returns without yielding, so the only thing that could reach `cancel` in
     // this window is a callback `subscribe` itself invoked. The check that
@@ -563,13 +591,14 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     };
     void subscription.ready.then(
       () => {
-        if (record.cancelled) return;
+        if (record.cancelled || record.attemptedGeneration !== generation) return;
+        record.authorize();
         if (rejoin) record.options.onRejoin?.(record.cursor);
         else record.options.onJoin?.(record.cursor);
       },
       // The rejection is already delivered through `onError`; observing it here
       // only keeps it from surfacing as an unhandled rejection.
-      () => {},
+      (error: unknown) => record.reject(asError(error)),
     );
   }
 
@@ -577,6 +606,7 @@ export class FactoryLinkStore extends Publisher<FactoryLinkStatus> {
     if (record.cancelled) return;
     // A superseded subscription's late error is not this binding's state.
     if (record.attemptedGeneration !== generation) return;
+    record.reject(error);
     record.options.onError?.(error);
     if (this.#release(record)) this.#redriveChannelPeers(record);
     // Recovers only across a NEW connection: `#join` finds the same generation
