@@ -230,6 +230,19 @@ type FactorySessionViewSnapshot = Omit<UseFactorySessionViewResult, "browseEarli
 // independently capped at the same conservative encoded-event ceiling used by
 // a default captured tail. This does not claim to bound the separate current
 // cold/live event map.
+//
+// `#currentEvents` really is unbounded, and the reason it is not simply capped
+// here is a missing WIRE capability rather than an oversight. Evicting its
+// lowest sequences would bound memory and create a reachability hole: the only
+// history walk this view has is `browseEarlier`, which starts with no cursor
+// and no `tail` and follows `next_cursor` FORWARD from the beginning of the
+// journal, and `FactoryJournalOptions` offers no backward page — `tail` is a
+// tail-first read and is mutually exclusive with `cursor`. So an evicted middle
+// could be reached only by walking every page from sequence zero, which is the
+// full replay the join exists to avoid. A bound belongs here once a bounded
+// BACKWARD page exists (runbook 06 U2.1 step 7 names one); until then, capping
+// this map would trade a known memory ceiling for silent, unrecoverable
+// history loss. Do not add an eviction policy without that page.
 const MAX_EARLIER_PAGE_BYTES = DEFAULT_MAX_TAIL_BYTES;
 const earlierPageEncoder = new TextEncoder();
 

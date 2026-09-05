@@ -68,6 +68,16 @@ export function ToolCaptureViewer({ reads, sessionId, toolUseId, capture }: Tool
     ? state : { kind: "idle" as const };
 
   useEffect(() => {
+    // REDUNDANT, and deliberately so — measured, not assumed. React runs the
+    // cleanup below before re-running this body on a dependency change, and on
+    // the first mount `controller.current` is `undefined`, so these three lines
+    // cover no case the cleanup does not: removing them survives the whole app
+    // suite, which is what the checkpoint-5 gate measured (mutant M3). They stay
+    // as belt-and-braces against a future edit that moves the cleanup, and the
+    // `setState` is NOT redundant — it is what returns a superseded viewer to
+    // `idle` once the replacement has committed. Do not read the two aborts as a
+    // live guard; the cleanup abort (killed by "unmount aborts a pending capture
+    // read") and the render-time fence above are the guards.
     ++request.current;
     controller.current?.abort();
     controller.current = undefined;
