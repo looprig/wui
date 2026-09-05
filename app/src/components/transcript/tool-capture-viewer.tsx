@@ -54,7 +54,14 @@ export function ToolCaptureViewer({ reads, sessionId, toolUseId, capture }: Tool
   const [state, setState] = useState<LoadState>({ kind: "idle" });
   const controller = useRef<AbortController | undefined>(undefined);
   const request = useRef(0);
-  const scope = `${sessionId}\u0000${toolUseId}\u0000${capture.toolExecutionId}\u0000${capture.objectId ?? ""}\u0000${capture.capturedBytes}\u0000${capture.encoding}`;
+  const scope = JSON.stringify([
+    sessionId,
+    toolUseId,
+    capture.toolExecutionId,
+    capture.objectId ?? null,
+    capture.capturedBytes,
+    capture.encoding,
+  ]);
   // Passive cleanup runs after a replacement render commits. Fence the data
   // during render too, so old verified bytes can never appear under new labels.
   const visibleState = state.kind === "idle" || (state.scope === scope && state.reads === reads)
@@ -69,7 +76,7 @@ export function ToolCaptureViewer({ reads, sessionId, toolUseId, capture }: Tool
       ++request.current;
       controller.current?.abort();
     };
-  }, [reads, sessionId, toolUseId, capture.objectId, capture.capturedBytes, capture.encoding]);
+  }, [reads, scope]);
 
   const load = useCallback(() => {
     controller.current?.abort();

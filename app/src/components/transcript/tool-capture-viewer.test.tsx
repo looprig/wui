@@ -95,6 +95,23 @@ test("replacement aborts the old read and removes its verified display", async (
   expect(document.querySelector("[data-testid=tool-capture-output]")).toBeNull();
 });
 
+test("changing only durable execution identity aborts the superseded read", async () => {
+  const { capture, reads } = await fixture("pending result");
+  let signal: AbortSignal | undefined;
+  reads.readObjectMetadata = vi.fn((_sid: string, _oid: string, options?: RequestOptions): Promise<never> => {
+    signal = options?.signal;
+    return new Promise<never>(() => undefined);
+  });
+  const screen = await render(<ToolCaptureViewer reads={reads} sessionId="session-1" toolUseId="tool-1" capture={capture} />);
+  await userEvent.click(page.getByTestId("tool-capture-load"));
+  await expect.poll(() => signal).toBeDefined();
+
+  await screen.rerender(<ToolCaptureViewer reads={reads} sessionId="session-1" toolUseId="tool-1" capture={{
+    ...capture, toolExecutionId: "execution-2",
+  }} />);
+  expect(signal?.aborted).toBe(true);
+});
+
 test("never commits old verified bytes under replacement session metadata", async () => {
   const first = await fixture("first session private result");
   const second = await fixture("second session result");
@@ -120,6 +137,34 @@ test("never commits old verified bytes under replacement session metadata", asyn
   const screen = await render(<Subject replacement={false} />);
   await userEvent.click(page.getByTestId("tool-capture-load"));
   await expect.element(page.getByTestId("tool-capture-output")).toHaveTextContent("first session private result");
+
+  await screen.rerender(<Subject replacement />);
+  expect(replacementCommits).toEqual([null]);
+});
+
+test("opaque identifiers containing NUL cannot collide across capture scopes", async () => {
+  const loaded = await fixture("first scope private result");
+  const replacementCommits: Array<string | null> = [];
+  function CommitObserver({ replacement }: { replacement: boolean }) {
+    useLayoutEffect(() => {
+      if (replacement) replacementCommits.push(document.querySelector("[data-testid=tool-capture-output]")?.textContent ?? null);
+    });
+    return null;
+  }
+  function Subject({ replacement }: { replacement: boolean }) {
+    return <>
+      <ToolCaptureViewer
+        reads={loaded.reads}
+        sessionId={replacement ? "a" : "a\u0000b"}
+        toolUseId={replacement ? "b\u0000c" : "c"}
+        capture={loaded.capture}
+      />
+      <CommitObserver replacement={replacement} />
+    </>;
+  }
+  const screen = await render(<Subject replacement={false} />);
+  await userEvent.click(page.getByTestId("tool-capture-load"));
+  await expect.element(page.getByTestId("tool-capture-output")).toHaveTextContent("first scope private result");
 
   await screen.rerender(<Subject replacement />);
   expect(replacementCommits).toEqual([null]);
