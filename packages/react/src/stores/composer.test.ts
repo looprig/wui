@@ -523,6 +523,9 @@ test("each view of a retained envelope gets its own request, not a shared one", 
   const two = new FactoryComposerStore(commands, SID);
 
   const view = retained(one)!;
+  // Per READ, not per view: `request` is a getter, so two readers of the SAME
+  // view cannot share an object either.
+  expect(view.request).not.toBe(view.request);
   (view.request as unknown as { blocks: Record<string, unknown>[] }).blocks[0]!["Text"] = "tampered";
 
   // Nothing freezes the parsed request, so a shared parse would let one card's
@@ -531,4 +534,122 @@ test("each view of a retained envelope gets its own request, not a shared one", 
   expect(retainedComposerText(retained(two)!.request)).toBe("one");
   link.rpcCalls[0]!.settle();
   await sending;
+});
+
+test("cancel takes the failure with the envelope", async () => {
+  const { link, store } = composer();
+  link.holdRpc = true;
+  const lost = store.submit("one");
+  link.drop();
+  await lost;
+  expect(store.snapshot().errors.get(COMPOSER_COMMAND_KEY)).toBeInstanceOf(Error);
+
+  store.cancel();
+
+  // Otherwise the notice sits beside a control with nothing pending, and only
+  // `clearError` removes it — which `FactoryGateStore` does not even expose.
+  expect(store.snapshot().errors.size).toBe(0);
+  expect(store.snapshot().pending.size).toBe(0);
+});
+
+test("cancel with nothing to withdraw publishes nothing", async () => {
+  const { link, store } = composer();
+  let notifies = 0;
+  store.subscribe(() => {
+    notifies += 1;
+  });
+  const before = store.snapshot();
+
+  store.cancel();
+  store.cancel();
+
+  // A cancel that changed nothing must not wake React, for the same reason
+  // `prune` and `clearError` must not: these run from user handlers and from
+  // effects that fire on every projection.
+  expect(notifies).toBe(0);
+  expect(store.snapshot()).toBe(before);
+  expect(link.rpcCalls).toStrictEqual([]);
+});
+
+test("a retry is not blocked by another session's command in flight", async () => {
+  const { link, commands } = plane();
+  link.holdRpc = true;
+  const here = new FactoryComposerStore(commands, "session-one");
+  const elsewhere = new FactoryComposerStore(commands, "session-two");
+  const lost = here.submit("one");
+  link.drop();
+  await expect(lost).resolves.toMatchObject({ outcome: "unknown", commandId: "cmd-1" });
+  const blocking = elsewhere.submit("two");
+  expect(link.rpcCalls).toHaveLength(2);
+
+  // `replay`'s refusal is about THIS slot's own attempt. A refusal keyed any
+  // wider would let one slow session freeze another's retry button, which is
+  // the serialization the send path is already held to.
+  const retrying = here.retry();
+
+  expect(link.rpcCalls).toHaveLength(3);
+  link.rpcCalls[2]!.settle();
+  await expect(retrying).resolves.toMatchObject({ outcome: "accepted", commandId: "cmd-1" });
+  link.rpcCalls[1]!.settle();
+  await blocking;
+});
+
+test("attaching adopts what landed while the store was not watching", async () => {
+  const { link, commands } = plane();
+  link.holdRpc = true;
+  const watching = new FactoryComposerStore(commands, SID);
+  const detach = watching.attach();
+  // Built during a render that has not committed yet: its effect has not run,
+  // so it holds no listener and the scope cannot reach it.
+  const arriving = new FactoryComposerStore(commands, SID);
+  expect(arriving.snapshot().pending.size).toBe(0);
+
+  const sending = watching.submit("one");
+  expect(arriving.snapshot().pending.size).toBe(0);
+  const detachArriving = arriving.attach();
+
+  // Constructing is not enough: a change that lands between the render and the
+  // effect would otherwise leave the view stale until the NEXT transition, and
+  // a control that does not know an envelope is retained will offer to send a
+  // second one.
+  expect(arriving.snapshot().pending.get(COMPOSER_COMMAND_KEY)).toMatchObject({
+    commandId: "cmd-1",
+    sending: true,
+  });
+  link.rpcCalls[0]!.settle();
+  await sending;
+  detach();
+  detachArriving();
+});
+
+test("a view that attaches from inside a notify is not synced for that same change", async () => {
+  const { link, commands } = plane();
+  link.holdRpc = true;
+  const watching = new FactoryComposerStore(commands, SID);
+  const detach = watching.attach();
+  let latecomer: FactoryComposerStore | null = null;
+  let detachLatecomer = (): void => {};
+  let latecomerNotifies = 0;
+  watching.subscribe(() => {
+    if (latecomer !== null) return;
+    latecomer = new FactoryComposerStore(commands, SID);
+    detachLatecomer = latecomer.attach();
+    latecomer.subscribe(() => {
+      latecomerNotifies += 1;
+    });
+  });
+
+  const sending = watching.submit("one");
+
+  // The scope's listener set is copied before it is iterated, for the reason
+  // `Publisher.publish` gives and `publisher.test.ts` pins: a Set added to
+  // during iteration yields the new entry in the SAME loop, so a view attaching
+  // from inside a notify would be synced re-entrantly for a change that
+  // predates it.
+  expect(latecomerNotifies).toBe(0);
+  link.rpcCalls[0]!.settle();
+  await sending;
+  expect(latecomerNotifies).toBe(1);
+  detach();
+  detachLatecomer();
 });

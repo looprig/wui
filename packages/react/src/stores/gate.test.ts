@@ -321,3 +321,37 @@ test("an envelope Core's identity rules refuse is reported, never thrown", async
   expect(store.snapshot().errors.get(gateCommandKey(""))).toBeInstanceOf(CommandIdentityError);
   expect(link.rpcCalls).toStrictEqual([]);
 });
+
+test("a retry is not blocked by another gate's answer in flight", async () => {
+  const { link, store } = gatePlane();
+  link.holdRpc = true;
+  const lost = store.respond(entry(GATE_A), "Approve");
+  link.drop();
+  await expect(lost).resolves.toMatchObject({ outcome: "unknown", commandId: "cmd-1" });
+  const blocking = store.respond(entry(GATE_B), "Deny");
+  expect(link.rpcCalls).toHaveLength(2);
+
+  // Same session, different control. Widening `replay`'s refusal to "any slot
+  // here is busy" would make one gate's slow answer disable another's retry.
+  const retrying = store.retry(GATE_A);
+
+  expect(link.rpcCalls).toHaveLength(3);
+  link.rpcCalls[2]!.settle();
+  await expect(retrying).resolves.toMatchObject({ outcome: "accepted", commandId: "cmd-1" });
+  link.rpcCalls[1]!.settle();
+  await blocking;
+});
+
+test("cancel takes the gate's failure with its envelope", async () => {
+  const { link, store } = gatePlane();
+  link.holdRpc = true;
+  const lost = store.respond(entry(GATE_A), "Approve");
+  link.drop();
+  await lost;
+  expect(store.snapshot().errors.get(gateCommandKey(GATE_A))).toBeInstanceOf(Error);
+
+  store.cancel(GATE_A);
+
+  expect(store.snapshot().errors.size).toBe(0);
+  expect(store.snapshot().pending.size).toBe(0);
+});

@@ -58,14 +58,14 @@ import { Publisher, asError } from "./publisher.js";
  * What a renderer needs about one retained envelope: which command it is,
  * whether an attempt is in flight, and the request it will replay.
  *
- * `request` is a FRESH parse per view, which is `PendingCommand.request`'s own
- * contract and is kept rather than cached deliberately. Caching one parse and
- * handing it to every view would be cheaper and would quietly remove the
- * property that makes it safe: the object is not frozen, so one consumer
- * writing to `request.blocks[0]` would be seen by every other view of the same
- * slot. The retry itself is unaffected either way — `PendingCommand.submit`
- * re-reads its own snapshot — so this is about what a renderer may believe
- * about the value it was handed.
+ * `request` is a FRESH parse per READ — it is a getter over
+ * `PendingCommand.request`, which is that class's own contract, and it is
+ * deliberately not cached. Caching one parse and handing it to every view
+ * would be cheaper and would quietly remove the property that makes it safe:
+ * the object is not frozen, so one consumer writing to `request.blocks[0]`
+ * would be seen by every other view of the same slot. The retry itself is
+ * unaffected either way — `PendingCommand.submit` re-reads its own snapshot —
+ * so this is about what a renderer may believe about the value it was handed.
  */
 export interface PendingCommandView {
   readonly commandId: string;
@@ -393,7 +393,15 @@ export abstract class SessionCommandStore extends Publisher<SessionCommandSnapsh
         pending.set(key, {
           commandId: slot.command.commandId,
           sending: slot.sending,
-          request: slot.command.request,
+          // A GETTER, so the parse happens only for a view something actually
+          // reads. `#sync` runs for every attached store on every transition,
+          // and most of those stores render no draft at all; eagerly parsing
+          // one request per slot per store was work nobody asked for. It also
+          // strengthens the property: every read is its own parse, so no two
+          // readers can share an object even by accident.
+          get request(): FactoryCommandRequest {
+            return slot.command.request;
+          },
         });
       }
       for (const [key, error] of scope.errors) errors.set(key, error);
