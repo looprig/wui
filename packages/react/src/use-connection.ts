@@ -1,7 +1,8 @@
-import { createContext, createElement, useContext, useEffect, useMemo, useRef } from "react";
+import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
-import { createFactoryClient } from "@looprig/protocol";
+import { createFactoryClient, FactoryRestReads } from "@looprig/protocol";
 import type {
+  FactoryBootstrap,
   FactoryClient,
   FactoryClientOptions,
   FactoryCredentials,
@@ -15,6 +16,7 @@ import {
   type SessionBinding,
   type SessionBindingOptions,
 } from "./stores/connection.js";
+import { asError } from "./stores/publisher.js";
 import { useStore } from "./use-store.js";
 
 export type { ConnectionState, ConnectionStatus } from "./stores/connection.js";
@@ -91,6 +93,109 @@ export function useSessionViewErrors(
 export interface FactoryScope {
   readonly client: FactoryClient;
   readonly link: FactoryLinkStore;
+}
+
+const FactoryTenantContext = createContext<string | null>(null);
+
+export interface FactoryIdentityProviderProps extends FactoryLinkProviderProps {
+  /**
+   * Identity-owner supplied generation. Changing it tears down the old client
+   * and every descendant view before asking Factory who the new caller is.
+   * Ambient cookies have no browser change notification; an application with
+   * login/logout controls must increment this value at that transition.
+   */
+  authGeneration?: string | number;
+  /** Rendered while the authenticated tenant is being verified. */
+  pending?: ReactNode;
+  /** Rendered after bootstrap fails. The callback's retry uses current credentials. */
+  renderBootstrapError?: (error: Error, retry: () => void) => ReactNode;
+  /** Narrow test seam; production uses FactoryRestReads.readBootstrap. */
+  readBootstrap?: (
+    signal: AbortSignal,
+    credentials: FactoryCredentials,
+  ) => Promise<FactoryBootstrap>;
+}
+
+/**
+ * Verifies the browser principal before constructing or exposing a Factory
+ * client. A generation change replaces this whole keyed subtree, so a cached
+ * session view from the previous principal cannot render during bootstrap.
+ */
+export function FactoryIdentityProvider(props: FactoryIdentityProviderProps): ReactElement {
+  const generation = props.authGeneration ?? 0;
+  return createElement(FactoryIdentityGeneration, { ...props, key: `${typeof generation}:${generation}` });
+}
+
+function FactoryIdentityGeneration(props: FactoryIdentityProviderProps): ReactElement {
+  const credentialsRef = useRef(props.credentials);
+  useEffect(() => {
+    credentialsRef.current = props.credentials;
+  });
+  const restCredentials = useMemo<FactoryCredentials>(() => ({
+    restHeaders: () => credentialsRef.current?.restHeaders?.() ?? {},
+  }), []);
+  const bootstrapRef = useRef(props.readBootstrap);
+  useEffect(() => {
+    bootstrapRef.current = props.readBootstrap;
+  });
+  const [attempt, setAttempt] = useState(0);
+  const retry = useCallback(() => setAttempt((value) => value + 1), []);
+  const [result, setResult] = useState<
+    { state: "reading" } | { state: "ready"; tenantId: string } | { state: "failed"; error: Error }
+  >({ state: "reading" });
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let current = true;
+    setResult({ state: "reading" });
+    const load = bootstrapRef.current ?? ((signal: AbortSignal, credentials: FactoryCredentials) => {
+      const reads = new FactoryRestReads({
+        fetch: props.options?.fetch,
+        baseUrl: props.options?.baseUrl,
+        credentials,
+      });
+      return reads.readBootstrap({ signal });
+    });
+    void load(controller.signal, restCredentials).then(
+      (bootstrap) => {
+        if (current && !controller.signal.aborted) {
+          setResult({ state: "ready", tenantId: bootstrap.tenant_id });
+        }
+      },
+      (cause: unknown) => {
+        if (current && !controller.signal.aborted) setResult({ state: "failed", error: asError(cause) });
+      },
+    );
+    return () => {
+      current = false;
+      controller.abort();
+    };
+    // `options` and the bootstrap seam are construction inputs, matching
+    // FactoryLinkProvider. Current credentials are forwarded through a ref.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attempt, restCredentials]);
+
+  if (result.state === "reading") return createElement("div", null, props.pending ?? null);
+  if (result.state === "failed") {
+    return createElement(
+      "div",
+      null,
+      props.renderBootstrapError?.(result.error, retry)
+        ?? createElement("div", { role: "alert" }, result.error.message),
+    );
+  }
+  return createElement(
+    FactoryLinkProvider,
+    { credentials: props.credentials, options: props.options, create: props.create },
+    createElement(FactoryTenantContext.Provider, { value: result.tenantId }, props.children),
+  );
+}
+
+/** The tenant returned by Factory for this authenticated provider generation. */
+export function useFactoryTenantId(): string {
+  const tenantId = useContext(FactoryTenantContext);
+  if (tenantId === null) throw new Error("useFactoryTenantId requires a verified <FactoryIdentityProvider>");
+  return tenantId;
 }
 
 const FactoryScopeContext = createContext<FactoryScope | null>(null);

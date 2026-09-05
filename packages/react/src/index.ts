@@ -62,11 +62,14 @@ export {
 // binding and a cursor from useSessionBinding and owns nothing else. See
 // use-connection.ts for why the link cannot belong to a route.
 export {
+  FactoryIdentityProvider,
   FactoryLinkProvider,
   useFactoryClient,
   useFactoryLink,
   useFactoryLinkStatus,
+  useFactoryTenantId,
   useSessionBinding,
+  type FactoryIdentityProviderProps,
   type FactoryLinkProviderProps,
   type FactoryLinkState,
   type FactoryLinkStatus,
