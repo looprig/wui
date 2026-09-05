@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import {
   createFactoryClient,
   CoreProtocolError,
+  DEFAULT_MAX_TAIL_BYTES,
   DEFAULT_MAX_REPAIR_ATTEMPTS,
   DEFAULT_REPAIR_DELAY_MS,
   MAX_REPAIR_BACKOFF_FACTOR,
@@ -472,6 +473,147 @@ test("each earlier-history action follows one opaque cursor, including across an
   expect(h.reads.of("readJournal")[2]?.options).toMatchObject({ cursor: "older-cursor-2", limit: 256 });
   expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([5, 9]);
   expect(h.view.current?.earlierState).toBe("complete");
+});
+
+test("many explicit earlier-history pages retain only the current older window", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 9, [9]);
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(9);
+
+  for (let sequence = 1; sequence <= 4; sequence++) {
+    h.reads.queue("readJournal", {
+      journal_tip: 9,
+      covered_through: sequence,
+      events: [publicEvent(sequence)],
+      ...(sequence < 4 ? { next_cursor: `older-cursor-${sequence}` } : {}),
+    });
+    await h.view.current!.browseEarlier();
+  }
+
+  expect(h.reads.of("readJournal")).toHaveLength(5);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([4, 9]);
+  expect(h.view.current?.coveredThrough).toBe(9);
+  expect(h.view.current?.liveState).toBe("joining");
+  expect(h.view.current?.earlierState).toBe("complete");
+});
+
+test("an oversized earlier page is refused without replacing the current view", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 9, [9]);
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(9);
+  h.reads.queue("readJournal", {
+    journal_tip: 9,
+    covered_through: 1,
+    events: [publicEvent(1, "x".repeat(DEFAULT_MAX_TAIL_BYTES))],
+    next_cursor: "older",
+  });
+
+  await h.view.current!.browseEarlier();
+
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([9]);
+  expect(h.view.current?.coveredThrough).toBe(9);
+  expect(h.view.current?.earlierState).toBe("failed");
+  expect(h.view.current?.error?.message).toContain("earlier history byte budget");
+});
+
+test("an earlier page exceeding its requested row limit is refused", async () => {
+  const h = await mountFactoryView({ props: { tailLimit: 1 }, setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 9, [9]);
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(9);
+  h.reads.queue("readJournal", {
+    journal_tip: 9,
+    covered_through: 2,
+    events: [publicEvent(1), publicEvent(2)],
+  });
+
+  await h.view.current!.browseEarlier();
+
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([9]);
+  expect(h.view.current?.earlierState).toBe("failed");
+  expect(h.view.current?.error?.message).toContain("earlier history event budget");
+});
+
+test("a lowered live reset clears the earlier window without retaining truncated history", async () => {
+  const h = await mountFactoryView({ setup: (_link, reads) => setPage(reads, 9, [9]) });
+  await liveReady(h, 9);
+  h.reads.queue("readJournal", {
+    journal_tip: 9, covered_through: 1, events: [publicEvent(1)], next_cursor: "older",
+  });
+  await h.view.current!.browseEarlier();
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([1, 9]);
+
+  setPage(h.reads, 2, [2]);
+  h.link.open[0]!.reset({
+    type: "session.reset", tenant_id: TENANT, session_id: FSID,
+    journal_tip: 2, last_contiguous: 1,
+  });
+
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(2);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([2]);
+  expect(h.view.current?.earlierState).toBe("idle");
+});
+
+test("a lower first authorized projection clears history browsed from the cold view", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 9, [9]);
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(9);
+  h.reads.queue("readJournal", {
+    journal_tip: 9, covered_through: 1, events: [publicEvent(1)], next_cursor: "older",
+  });
+  await h.view.current!.browseEarlier();
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([1, 9]);
+
+  setPage(h.reads, 2, [2]);
+  h.link.settleConnect();
+
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(2);
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([2]);
+  expect(h.view.current?.earlierState).toBe("idle");
+});
+
+test("an authoritative earlier-history denial clears the whole scoped view", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 9, [9]);
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(9);
+  h.reads.queue("readJournal", {
+    journal_tip: 9, covered_through: 1, events: [publicEvent(1)], next_cursor: "older",
+  });
+  await h.view.current!.browseEarlier();
+  h.reads.fail("readJournal", new CoreProtocolError({ error: {
+    code: "not_authorized", retryable: false,
+  } }));
+
+  await h.view.current!.browseEarlier();
+
+  expect(h.view.current?.state).toBe("failed");
+  expect(h.view.current?.events).toEqual([]);
+  expect(h.view.current?.coveredThrough).toBe(0);
+  expect(h.view.current?.earlierState).toBe("idle");
+});
+
+test("unmount aborts a pending explicit earlier-history read", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 9, [9]);
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(9);
+  h.reads.hold("readJournal");
+
+  void h.view.current!.browseEarlier();
+  await expect.poll(() => h.reads.of("readJournal")).toHaveLength(2);
+  await h.unmount();
+
+  expect(h.reads.of("readJournal")[1]?.options.signal?.aborted).toBe(true);
 });
 
 test("authorized join also follows captured-tail continuations", async () => {

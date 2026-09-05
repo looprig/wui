@@ -204,13 +204,13 @@ export interface UseFactorySessionViewResult {
   readonly status: FactorySessionStatus | null;
   /** The bounded public gate projection, or null before the first read. */
   readonly gates: PublicGatePage | null;
-  /** Every public event this view holds, ascending by `journal_seq`. */
+  /** Current cold/live events plus one replaceable earlier page, ascending by `journal_seq`. */
   readonly events: readonly PublicJournalEvent[];
   /** Greatest sequence this view has covered, from a page or a publication. */
   readonly coveredThrough: number;
   /** The last error seen, from a cold read or from the binding. */
   readonly error: Error | null;
-  /** State of the explicit, one-page-per-action beginning-first history walk. */
+  /** State of the explicit, one-request-per-action beginning-first history walk. */
   readonly earlierState: "idle" | "loading" | "available" | "complete" | "failed";
   /** Reads at most one bounded page. The first call has neither cursor nor tail. */
   readonly browseEarlier: () => Promise<void>;
@@ -225,6 +225,13 @@ export interface UseFactorySessionViewResult {
  */
 
 type FactorySessionViewSnapshot = Omit<UseFactorySessionViewResult, "browseEarlier">;
+
+// Earlier history has its own finite retention policy: one requested page,
+// independently capped at the same conservative encoded-event ceiling used by
+// a default captured tail. This does not claim to bound the separate current
+// cold/live event map.
+const MAX_EARLIER_PAGE_BYTES = DEFAULT_MAX_TAIL_BYTES;
+const earlierPageEncoder = new TextEncoder();
 
 const COLD: Omit<FactorySessionViewSnapshot, "coveredThrough"> = {
   state: "joining",
@@ -243,7 +250,8 @@ const COLD: Omit<FactorySessionViewSnapshot, "coveredThrough"> = {
  * between its capture and authorization must still be reconciled.
  */
 class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
-  readonly #events = new Map<number, PublicJournalEvent>();
+  readonly #currentEvents = new Map<number, PublicJournalEvent>();
+  readonly #earlierEvents = new Map<number, PublicJournalEvent>();
   #controller: AbortController | undefined;
   #coldController: AbortController | undefined;
   #generation = 0;
@@ -317,7 +325,18 @@ class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
         await this.reads().readJournal(this.sessionId, options),
       );
       if (!this.#current(generation, signal)) return;
-      for (const event of page.events) this.#events.set(event.journal_seq, event);
+      if (page.events.length > this.tailLimit) {
+        throw new Error(`factory earlier history event budget exceeded (${this.tailLimit})`);
+      }
+      const pageBytes = earlierPageEncoder.encode(JSON.stringify(page.events)).length;
+      if (pageBytes > MAX_EARLIER_PAGE_BYTES) {
+        throw new Error(`factory earlier history byte budget exceeded (${MAX_EARLIER_PAGE_BYTES})`);
+      }
+      // Explicit history is a bounded viewing window, not a second replay
+      // engine. Advancing the opaque cursor replaces the prior older page;
+      // current cold/live events stay independently retained.
+      this.#earlierEvents.clear();
+      for (const event of page.events) this.#earlierEvents.set(event.journal_seq, event);
       this.#earlierStarted = true;
       this.#earlierCursor = page.next_cursor;
       this.publish({
@@ -344,10 +363,11 @@ class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
       || (cause.code !== "unauthenticated" && cause.code !== "not_authorized")) return false;
     // These are Factory's authoritative authentication/authorization decisions.
     // A verifier outage uses a different code and does not revoke cached state.
-    this.#events.clear();
+    this.#currentEvents.clear();
+    this.#resetEarlier();
     this.publish({
       state: "failed", liveState: "failed", status: null, gates: null,
-      events: [], coveredThrough: 0, error: cause,
+      events: [], coveredThrough: 0, error: cause, earlierState: "idle",
     });
     this.stop();
     return true;
@@ -380,7 +400,7 @@ class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
       if (captured === undefined) {
         throw new Error(`factory captured tail refused (${step.kind === "refused" ? step.reason : step.kind}) before reaching journal_tip ${tail.tip}`);
       }
-      for (const event of captured.events) this.#events.set(event.journal_seq, event);
+      for (const event of captured.events) this.#currentEvents.set(event.journal_seq, event);
       this.publish({
         state: "ready", status: projection, gates: gatePage, events: this.#ordered(),
         coveredThrough: Math.max(this.initialCoveredThrough, captured.coveredThrough), error: null,
@@ -447,23 +467,32 @@ class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
       )) {
         if (!this.#current(generation, signal)) return;
         if (event.kind === "ephemeral") continue;
+        let earlierReset = false;
         if (event.kind === "projection") {
           // A lower committed floor is a protocol-validated reset. Remove rows
           // the server no longer holds before admitting this generation's tail.
-          const ceiling = projected && event.coveredThrough < liveCoverage
+          const lowered = projected
+            ? event.coveredThrough < liveCoverage
+            : event.status.journal_tip < this.snapshot().coveredThrough;
+          const ceiling = projected && lowered
             ? event.coveredThrough : event.status.journal_tip;
-          for (const sequence of this.#events.keys()) {
-            if (sequence > ceiling) this.#events.delete(sequence);
+          for (const sequence of this.#currentEvents.keys()) {
+            if (sequence > ceiling) this.#currentEvents.delete(sequence);
+          }
+          if (lowered) {
+            this.#resetEarlier();
+            earlierReset = true;
           }
           projected = true;
         } else if (event.kind === "public") {
-          this.#events.set(event.event.journal_seq, event.event);
+          this.#currentEvents.set(event.event.journal_seq, event.event);
         }
         liveCoverage = event.coveredThrough;
         this.publish({
           state: "ready", status: event.status, gates,
           liveState: event.coveredThrough >= event.status.journal_tip ? "live" : "repairing",
           events: this.#ordered(), coveredThrough: event.coveredThrough, error: null,
+          ...(earlierReset ? { earlierState: "idle" as const } : {}),
         });
       }
     } catch (cause) {
@@ -475,7 +504,17 @@ class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
   }
 
   #ordered(): readonly PublicJournalEvent[] {
-    return [...this.#events.values()].sort((left, right) => left.journal_seq - right.journal_seq);
+    const merged = new Map(this.#earlierEvents);
+    for (const [sequence, event] of this.#currentEvents) merged.set(sequence, event);
+    return [...merged.values()].sort((left, right) => left.journal_seq - right.journal_seq);
+  }
+
+  #resetEarlier(): void {
+    this.#earlierController?.abort();
+    this.#earlierController = undefined;
+    this.#earlierEvents.clear();
+    this.#earlierCursor = undefined;
+    this.#earlierStarted = false;
   }
 }
 function positiveBound(value: number, name: string): number {

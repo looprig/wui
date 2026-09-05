@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo } from "react";
+import { CoreProtocolError } from "@looprig/protocol";
 import type { FactoryPageOptions, RecentSessionPage } from "@looprig/protocol";
 import { asError, Publisher, RefreshGuard } from "./stores/publisher.js";
 import { useStore } from "./use-store.js";
@@ -35,6 +36,7 @@ const EMPTY: FactorySessionListSnapshot = {
 
 class FactorySessionListStore extends Publisher<FactorySessionListSnapshot> {
   readonly #guard = new RefreshGuard();
+  #controller: AbortController | undefined;
 
   constructor(readonly reads: FactorySessionListReads) {
     super(EMPTY);
@@ -42,15 +44,22 @@ class FactorySessionListStore extends Publisher<FactorySessionListSnapshot> {
 
   stop(): void {
     this.#guard.start();
+    this.#controller?.abort();
+    this.#controller = undefined;
   }
 
-  async read(cursor?: string, signal?: AbortSignal): Promise<void> {
+  async read(cursor?: string): Promise<void> {
+    this.#controller?.abort();
+    const controller = new AbortController();
+    this.#controller = controller;
     const generation = this.#guard.start();
     this.publish({ loading: true, error: null });
     try {
-      const options: FactoryPageOptions = { limit: FACTORY_SESSION_PAGE_LIMIT };
+      const options: FactoryPageOptions = {
+        limit: FACTORY_SESSION_PAGE_LIMIT,
+        signal: controller.signal,
+      };
       if (cursor !== undefined) options.cursor = cursor;
-      if (signal !== undefined) options.signal = signal;
       const page = await this.reads.listRecentSessions(options);
       if (!this.#guard.isCurrent(generation)) return;
       this.publish({
@@ -63,7 +72,17 @@ class FactorySessionListStore extends Publisher<FactorySessionListSnapshot> {
       });
     } catch (cause) {
       if (!this.#guard.isCurrent(generation)) return;
+      if (cause instanceof CoreProtocolError
+        && (cause.code === "unauthenticated" || cause.code === "not_authorized")) {
+        this.publish({
+          sessions: [], nextCursor: undefined, previousCursor: undefined,
+          loading: false, loaded: false, error: cause,
+        });
+        return;
+      }
       this.publish({ loading: false, error: asError(cause) });
+    } finally {
+      if (this.#guard.isCurrent(generation)) this.#controller = undefined;
     }
   }
 }
@@ -74,10 +93,8 @@ export function useFactorySessionList(reads: FactorySessionListReads): UseFactor
   const snapshot = useStore(store);
 
   useEffect(() => {
-    const controller = new AbortController();
-    void store.read(undefined, controller.signal);
+    void store.read();
     return () => {
-      controller.abort();
       store.stop();
     };
   }, [store]);
