@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkDist } from "./check-dist.mjs";
+import { BUNDLE_MANIFEST_NAME } from "./write-bundle-manifest.mjs";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const dist = join(repository, "dist");
@@ -42,6 +43,43 @@ function manifest(directory) {
       };
     })
     .sort((left, right) => left.path.localeCompare(right.path));
+}
+
+/**
+ * Reads the marker out of a candidate bundle and insists it claims a release.
+ *
+ * The flag is an input to the build (`WUI_BUNDLE_RELEASE`, read by
+ * `vite.config.ts`'s bundle manifest plugin), so a release staged by any route
+ * that did not set it would install a tree `wui.BundleProtocolVersion` reports
+ * as a development build and Factory's default command refuses. That is a
+ * defect discovered after the tag, by a consumer. Reading the claim back out of
+ * the installed tree turns it into one discovered before the commit exists.
+ *
+ * An ABSENT manifest is reported separately, because it is a different fault
+ * with a different remedy: the build emitted no marker at all, which is the
+ * v0.1.0 failure one level up — a published bundle no consumer can identify.
+ *
+ * @param {string} directory Bundle directory to inspect.
+ */
+export function assertReleaseMarker(directory) {
+  const path = join(directory, BUNDLE_MANIFEST_NAME);
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    throw new Error(`installed release bundle carries no manifest at ${BUNDLE_MANIFEST_NAME}`);
+  }
+  let marker;
+  try {
+    marker = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`installed release bundle has an unreadable manifest: ${error.message}`);
+  }
+  if (marker?.release !== true) {
+    throw new Error(
+      `installed release bundle does not declare itself a release: ${BUNDLE_MANIFEST_NAME} says release=${JSON.stringify(marker?.release)}`,
+    );
+  }
 }
 
 function runChecked(command, args, label, options = {}) {
@@ -229,6 +267,7 @@ export async function stageReproducibleDist(command, args, platform = process.pl
       if (readFileSync(join(dist, "index.html"), "utf8").includes("placeholder")) {
         throw new Error("installed release bundle is still the placeholder");
       }
+      assertReleaseMarker(dist);
       runChecked("git", ["add", "-f", "--all", "--", "dist"], "git add dist");
       await commands.run(
         "go",

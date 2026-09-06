@@ -100,9 +100,16 @@ contract:
 # target rather than a documented ritual precisely so it cannot be forgotten.
 #
 # `make dist-reset` restores the exact bundle recorded by the current commit.
+# WUI_BUNDLE_RELEASE is what makes the marker in the staged bundle say
+# `release: true`. vite.config.ts's bundle manifest plugin reads it and writes
+# looprig-bundle.json into whichever --outDir the build was given, so the two
+# comparison builds and the installed tree all carry the same claim. It is set
+# here and nowhere else: this target is the only step that knows the tree it
+# installs was built twice, compared and gated. release-dist.mjs reads the claim
+# back out of the installed tree before allowing the commit.
 release-dist:
 	npm ci
-	node app/scripts/release-dist.mjs npm run build --workspace app -- --outDir {out} --emptyOutDir
+	WUI_BUNDLE_RELEASE=1 node app/scripts/release-dist.mjs npm run build --workspace app -- --outDir {out} --emptyOutDir
 	@echo "OK: reproducible SPA staged and the Go race/build gates pass. Commit, then tag."
 
 dist-reset:

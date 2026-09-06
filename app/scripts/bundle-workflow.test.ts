@@ -16,6 +16,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { assertReleaseMarker } from "./release-dist.mjs";
+import { BUNDLE_MANIFEST_NAME } from "./write-bundle-manifest.mjs";
 
 const repository = fileURLToPath(new URL("../..", import.meta.url));
 const temporaryDirectories: string[] = [];
@@ -94,6 +96,7 @@ function installFakeReleaseTools(
     buildSleep?: boolean;
     gitAdd?: boolean;
     duringBuildEdit?: "tracked" | "ignored" | "staged";
+    marker?: "absent" | "non-release";
   } = {},
 ) {
   const bin = join(clone, ".test-bin");
@@ -125,6 +128,17 @@ const index = process.env.BUNDLE_TEST_MODE === "placeholder"
   : '<script type="module" src="/assets/app.js"></script>';
 writeFileSync(resolve(out, "index.html"), index);
 writeFileSync(resolve(out, "assets/app.js"), 'export const marker = "' + marker + '";');
+// Stands in for vite.config.ts's bundleManifestPlugin: every build writes the
+// marker into its own --outDir, and the release flag is an input to the build.
+if (process.env.BUNDLE_TEST_MARKER !== "absent") {
+  const release = process.env.BUNDLE_TEST_MARKER === "non-release"
+    ? false
+    : process.env.WUI_BUNDLE_RELEASE === "1";
+  writeFileSync(
+    resolve(out, "looprig-bundle.json"),
+    JSON.stringify({ core_version: "v0.7.0", protocol_version: "0.1.0", release, sessionwire_version: 1 }),
+  );
+}
 if (count === 2) {
   const edit = process.env.BUNDLE_TEST_DURING_BUILD_EDIT;
   if (edit === "tracked" || edit === "staged") {
@@ -196,6 +210,7 @@ process.exit(result.status ?? 1);
     BUNDLE_TEST_LATE_TEMP: join(clone, ".late-temporary-write"),
     BUNDLE_TEST_GIT_ADD_FAIL: failures.gitAdd ? "1" : "0",
     BUNDLE_TEST_DURING_BUILD_EDIT: failures.duringBuildEdit ?? "",
+    BUNDLE_TEST_MARKER: failures.marker ?? "",
   };
 }
 
@@ -284,6 +299,39 @@ async function interruptAfterGateLeaderExit(clone: string) {
   });
   return { env, expected, result, temporaryRoot };
 }
+
+/**
+ * The staged bundle's marker, checked as a pure function.
+ *
+ * The workflow cases below drive the whole release through `make`, which is
+ * where the Makefile's `WUI_BUNDLE_RELEASE` and the build plugin are actually
+ * exercised. These are the same guard's rejections at unit cost, so each
+ * refusal is pinned to its own message rather than to "the release failed".
+ */
+describe("release marker check", () => {
+  function stage(body?: string): string {
+    const directory = mkdtempSync(join(tmpdir(), "wui-release-marker-"));
+    temporaryDirectories.push(directory);
+    if (body !== undefined) writeFileSync(join(directory, BUNDLE_MANIFEST_NAME), body);
+    return directory;
+  }
+
+  it("accepts a marker that claims a release", () => {
+    expect(() => assertReleaseMarker(stage('{"release":true}'))).not.toThrow();
+  });
+
+  it.each([
+    ["no manifest at all", undefined, /carries no manifest/],
+    ["a manifest that is not JSON", "looprig", /unreadable manifest/],
+    ["a development marker", '{"release":false}', /does not declare itself a release/],
+    ["an absent release key", '{"core_version":"v0.7.0"}', /does not declare itself a release/],
+    // Truthiness is not the test: only a JSON `true` is a release claim.
+    ["a stringly-typed claim", '{"release":"true"}', /does not declare itself a release/],
+    ["a JSON document that is not an object", '"release"', /does not declare itself a release/],
+  ])("refuses %s", (_label, body, message) => {
+    expect(() => assertReleaseMarker(stage(body))).toThrow(message);
+  });
+});
 
 describe("bundle release workflow", () => {
   it("rejects a non-POSIX release host before creating temporary state or running a build", () => {
@@ -403,6 +451,47 @@ describe("bundle release workflow", () => {
     expect(readFileSync(join(clone, "dist/assets/app.js"), "utf8")).toContain('"stable"');
     expect(run("git", ["diff", "--name-only", "--cached", "--", "dist"], clone)).not.toBe("");
     expect(existsSync(join(clone, "dist/assets/app.js"))).toBe(true);
+  });
+
+  /**
+   * The marker is what Factory's default command gates on, and `make
+   * release-dist` is the only thing that can honestly set it: it is the only
+   * step that knows the tree it is installing was built twice, compared, and
+   * verified. So the release flag is passed into the build here, and read back
+   * out of the installed tree before the commit is allowed to exist.
+   */
+  it("stages a bundle whose marker declares itself a release", () => {
+    const clone = cloneWithCurrentWorkflow();
+    const env = installFakeReleaseTools(clone, "deterministic");
+
+    const result = spawnSync("make", ["release-dist"], { cwd: clone, env, encoding: "utf8" });
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    const marker = JSON.parse(readFileSync(join(clone, "dist/looprig-bundle.json"), "utf8"));
+    expect(marker.release).toBe(true);
+    // Staged, not merely written: an unstaged marker is not in the release commit.
+    expect(run("git", ["diff", "--name-only", "--cached", "--", "dist"], clone).split("\n"))
+      .toContain("dist/looprig-bundle.json");
+  });
+
+  it.each([
+    // The v0.1.0 defect, one level up: a build that emits no marker publishes a
+    // tree for which wui.BundleProtocolVersion answers ErrNoBundleManifest.
+    ["a build that emits no marker", "absent" as const, "carries no manifest"],
+    // A build that ran without the release flag, or with a stale marker left in
+    // place. Factory would refuse the published bundle; this refuses the tag.
+    ["a marker that does not claim a release", "non-release" as const, "does not declare itself a release"],
+  ])("refuses to stage %s", (_label, marker, message) => {
+    const clone = cloneWithCurrentWorkflow();
+    const expected = manifest(clone);
+    const env = installFakeReleaseTools(clone, "deterministic", { marker });
+
+    const result = spawnSync("make", ["release-dist"], { cwd: clone, env, encoding: "utf8" });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(message);
+    // Rolled back: the refusal must leave the previous release installed.
+    expectPristineDist(clone, expected);
   });
 
   it("release-dist rejects nondeterministic builds without changing the snapshot or index", () => {
