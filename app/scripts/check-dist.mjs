@@ -60,11 +60,58 @@ const SOURCE_MAP_COMMENT_PATTERN = /(?:\/\/|\/\*)[#@]\s*sourceMappingURL=/;
 const LOCAL_FILESYSTEM_PATH_PATTERN = /\/(?:Users|home)\/[^\s"'`)>]+\/[^\s"'`)>]*/;
 
 /**
- * Scans already-read file contents for the three properties U5.3's runbook
- * step 3 requires of a released bundle and which, until now, were only ever
- * checked by hand: no source maps, no secrets, no local filesystem paths.
+ * The credential formats this scan recognises, each by its own documented
+ * shape and full documented length.
  *
- * The three are independent fields, for the same reason `classifyDistEntries`
+ * This list is deliberately short and deliberately strict. A secrets scan is
+ * only worth having if a hit means something: a pattern that fires on `ghp_`
+ * or a bare `AKIA` would fire on minified identifiers and base64 payloads,
+ * and a guard people learn to override is worse than no guard. So each entry
+ * matches a credential whose issuer publishes a fixed prefix AND a fixed (or
+ * minimum) body length, and nothing here matches on entropy, on a variable
+ * name like `apiKey`, or on a prefix alone.
+ *
+ * The consequence, which `classifyDistLeaks` states again for its caller, is
+ * that this is NOT a general secrets scan. A bespoke token, a password, or a
+ * credential in a format not listed here passes it. What it does catch is the
+ * realistic accident: a well-known provider credential pasted into app source
+ * or an env file and inlined by the bundler.
+ */
+const SECRET_PATTERNS = [
+  // Any PEM private key, whatever type names it ("RSA ", "EC ", "OPENSSH ",
+  // "ENCRYPTED "), including the bare PKCS#8 header.
+  { name: "PEM private key block", pattern: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/ },
+  // AWS long-term (AKIA) and temporary (ASIA) access key ids: the prefix plus
+  // exactly 16 further uppercase-or-digit characters.
+  { name: "AWS access key id", pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/ },
+  // GitHub's documented token formats: ghp_/gho_/ghu_/ghs_/ghr_ plus 36
+  // characters, and the fine-grained github_pat_ form.
+  { name: "GitHub token", pattern: /\b(?:gh[pours]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{40,})\b/ },
+  // Google API key: "AIza" plus exactly 35 of its charset.
+  { name: "Google API key", pattern: /\bAIza[0-9A-Za-z_-]{35}\b/ },
+  // Slack bot/user/app tokens.
+  { name: "Slack token", pattern: /\bxox[abopsr]-[A-Za-z0-9]{10,}/ },
+  // Anthropic and OpenAI keys, by their full prefixes rather than a bare
+  // "sk-": "sk-" alone appears in base64url payloads and in minified names.
+  { name: "Anthropic API key", pattern: /\bsk-ant-api[0-9]{2}-[A-Za-z0-9_-]{24,}/ },
+  { name: "OpenAI project key", pattern: /\bsk-proj-[A-Za-z0-9_-]{24,}/ },
+];
+
+/**
+ * Scans already-read file contents for the properties U5.3's runbook step 3
+ * requires of a released bundle and which, until now, were only ever checked
+ * by hand: no source map files, no `sourceMappingURL` references in emitted
+ * JS/CSS, no local filesystem paths, and no credential in one of the
+ * well-known formats {@link SECRET_PATTERNS} lists.
+ *
+ * `secrets` is worth reading twice before trusting it: it recognises a fixed
+ * list of provider credential formats, NOT secrets in general. An empty
+ * `secrets` means "none of those formats is present", which is a useful thing
+ * to know automatically and is not the same statement as "this bundle leaks
+ * no secret". The runbook's secrets criterion is therefore partly automated
+ * and still partly a reviewer's job.
+ *
+ * The four are independent fields, for the same reason `classifyDistEntries`
  * keeps its two independent: a tree can fail any subset of them, and folding
  * them into one list would hide whichever fault a test happened to construct
  * second.
@@ -74,22 +121,25 @@ const LOCAL_FILESYSTEM_PATH_PATTERN = /\/(?:Users|home)\/[^\s"'`)>]+\/[^\s"'`)>]
  * and a comment or string containing the same words in, say, `index.html`
  * is not a leaked source map.
  *
- * `localPaths` is scanned across every file regardless of extension —
- * including binary assets — because a leaked build-machine path is exactly
- * as real inside a font's embedded metadata as inside a JS string, and grep
- * makes no such distinction either.
+ * `localPaths` and `secrets` are scanned across every file regardless of
+ * extension — including binary assets — because a leaked build-machine path
+ * or credential is exactly as real inside a font's embedded metadata as
+ * inside a JS string, and grep makes no such distinction either.
  *
  * @param {readonly { path: string, content: string }[]} files Every FILE (not directory)
  *   in the tree, with its raw content already read. `content` should be read
  *   as `latin1` (one byte per code unit) rather than `utf8`, so scanning a
  *   binary asset for an ASCII byte pattern cannot itself throw on invalid
  *   UTF-8 and cannot re-encode bytes into different characters first.
- * @returns {{ ok: boolean, mapFiles: string[], sourceMapRefs: string[], localPaths: string[] }}
+ * @returns {{ ok: boolean, mapFiles: string[], sourceMapRefs: string[], localPaths: string[], secrets: string[] }}
+ *   `secrets` entries are `"<path>: <format name>"`, so a failure names which
+ *   pattern fired rather than leaving a reader to re-derive it.
  */
 export function classifyDistLeaks(files) {
   const mapFiles = [];
   const sourceMapRefs = [];
   const localPaths = [];
+  const secrets = [];
   for (const { path, content } of files) {
     const normalized = path.split("\\").join("/");
     if (normalized.endsWith(".map")) {
@@ -101,12 +151,22 @@ export function classifyDistLeaks(files) {
     if (LOCAL_FILESYSTEM_PATH_PATTERN.test(content)) {
       localPaths.push(normalized);
     }
+    for (const { name, pattern } of SECRET_PATTERNS) {
+      if (pattern.test(content)) {
+        secrets.push(`${normalized}: ${name}`);
+      }
+    }
   }
   return {
-    ok: mapFiles.length === 0 && sourceMapRefs.length === 0 && localPaths.length === 0,
+    ok:
+      mapFiles.length === 0 &&
+      sourceMapRefs.length === 0 &&
+      localPaths.length === 0 &&
+      secrets.length === 0,
     mapFiles,
     sourceMapRefs,
     localPaths,
+    secrets,
   };
 }
 
@@ -128,6 +188,7 @@ export function checkDist(dir = DIST_DIR) {
     mapFiles: leakResult.mapFiles,
     sourceMapRefs: leakResult.sourceMapRefs,
     localPaths: leakResult.localPaths,
+    secrets: leakResult.secrets,
   };
 }
 
@@ -148,6 +209,9 @@ if (import.meta.url === new URL(process.argv[1], "file:").href) {
     }
     if (result.localPaths.length > 0) {
       console.error(`wui/dist embeds a local filesystem path: ${result.localPaths.join(", ")}`);
+    }
+    if (result.secrets.length > 0) {
+      console.error(`wui/dist embeds a well-known credential format: ${result.secrets.join(", ")}`);
     }
     process.exit(1);
   }

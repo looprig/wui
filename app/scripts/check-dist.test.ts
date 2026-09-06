@@ -77,7 +77,7 @@ describe("classifyDistLeaks", () => {
   ];
 
   it("accepts a tree with no map files, no sourcemap comments and no local paths", () => {
-    expect(classifyDistLeaks(CLEAN)).toEqual({ ok: true, mapFiles: [], sourceMapRefs: [], localPaths: [] });
+    expect(classifyDistLeaks(CLEAN)).toEqual({ ok: true, mapFiles: [], sourceMapRefs: [], localPaths: [], secrets: [] });
   });
 
   it("flags a .map file present anywhere in the tree", () => {
@@ -86,7 +86,7 @@ describe("classifyDistLeaks", () => {
     // regression a future build could reintroduce silently.
     expect(
       classifyDistLeaks([...CLEAN, { path: "assets/index-C8jCNzUt.js.map", content: "{}" }]),
-    ).toEqual({ ok: false, mapFiles: ["assets/index-C8jCNzUt.js.map"], sourceMapRefs: [], localPaths: [] });
+    ).toEqual({ ok: false, mapFiles: ["assets/index-C8jCNzUt.js.map"], sourceMapRefs: [], localPaths: [], secrets: [] });
   });
 
   it("flags a sourceMappingURL comment in emitted JS", () => {
@@ -100,6 +100,7 @@ describe("classifyDistLeaks", () => {
       mapFiles: [],
       sourceMapRefs: ["assets/index-C8jCNzUt.js"],
       localPaths: [],
+      secrets: [],
     });
   });
 
@@ -117,6 +118,7 @@ describe("classifyDistLeaks", () => {
       mapFiles: [],
       sourceMapRefs: ["assets/index-DVeYZWBb.css"],
       localPaths: [],
+      secrets: [],
     });
   });
 
@@ -132,7 +134,7 @@ describe("classifyDistLeaks", () => {
         ...CLEAN,
         { path: "index.html", content: "<script>//# sourceMappingURL=oops.map</script>" },
       ]),
-    ).toEqual({ ok: true, mapFiles: [], sourceMapRefs: [], localPaths: [] });
+    ).toEqual({ ok: true, mapFiles: [], sourceMapRefs: [], localPaths: [], secrets: [] });
   });
 
   it("flags an absolute local filesystem path embedded in emitted JS", () => {
@@ -152,6 +154,7 @@ describe("classifyDistLeaks", () => {
       mapFiles: [],
       sourceMapRefs: [],
       localPaths: ["assets/index-C8jCNzUt.js"],
+      secrets: [],
     });
   });
 
@@ -166,6 +169,7 @@ describe("classifyDistLeaks", () => {
       mapFiles: [],
       sourceMapRefs: [],
       localPaths: ["assets/index-C8jCNzUt.js"],
+      secrets: [],
     });
   });
 
@@ -180,6 +184,7 @@ describe("classifyDistLeaks", () => {
       mapFiles: [],
       sourceMapRefs: [],
       localPaths: ["assets/index-C8jCNzUt.js"],
+      secrets: [],
     });
   });
 
@@ -192,7 +197,7 @@ describe("classifyDistLeaks", () => {
         ...CLEAN,
         { path: "index.html", content: '<script type="module" src="/assets/index-C8jCNzUt.js"></script>' },
       ]),
-    ).toEqual({ ok: true, mapFiles: [], sourceMapRefs: [], localPaths: [] });
+    ).toEqual({ ok: true, mapFiles: [], sourceMapRefs: [], localPaths: [], secrets: [] });
   });
 
   it("does not flag a legitimate base64 data URI", () => {
@@ -205,16 +210,17 @@ describe("classifyDistLeaks", () => {
             "body{background:url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCc+PC9zdmc+)}",
         },
       ]),
-    ).toEqual({ ok: true, mapFiles: [], sourceMapRefs: [], localPaths: [] });
+    ).toEqual({ ok: true, mapFiles: [], sourceMapRefs: [], localPaths: [], secrets: [] });
   });
 
-  it("reports all three problems at once rather than masking one behind another", () => {
+  it("reports all four problems at once rather than masking one behind another", () => {
     expect(
       classifyDistLeaks([
         { path: "assets/index-C8jCNzUt.js.map", content: "{}" },
         {
           path: "assets/index-C8jCNzUt.js",
-          content: 'console.log("/Users/example-dev/code");\n//# sourceMappingURL=index-C8jCNzUt.js.map',
+          content:
+            'console.log("/Users/example-dev/code","AKIAIOSFODNN7EXAMPLE");\n//# sourceMappingURL=index-C8jCNzUt.js.map',
         },
       ]),
     ).toEqual({
@@ -222,19 +228,95 @@ describe("classifyDistLeaks", () => {
       mapFiles: ["assets/index-C8jCNzUt.js.map"],
       sourceMapRefs: ["assets/index-C8jCNzUt.js"],
       localPaths: ["assets/index-C8jCNzUt.js"],
+      secrets: ["assets/index-C8jCNzUt.js: AWS access key id"],
     });
+  });
+
+  it("flags a leaked AWS access key id", () => {
+    // AKIAIOSFODNN7EXAMPLE is AWS's own documented example key, so this test
+    // names no real credential while exercising the real pattern.
+    expect(
+      classifyDistLeaks([
+        ...CLEAN,
+        { path: "assets/index-C8jCNzUt.js", content: 'const k="AKIAIOSFODNN7EXAMPLE";' },
+      ]),
+    ).toEqual({
+      ok: false,
+      mapFiles: [],
+      sourceMapRefs: [],
+      localPaths: [],
+      secrets: ["assets/index-C8jCNzUt.js: AWS access key id"],
+    });
+  });
+
+  it("flags a PEM private key block, whatever key type it names", () => {
+    for (const header of ["-----BEGIN PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN OPENSSH PRIVATE KEY-----"]) {
+      expect(
+        classifyDistLeaks([...CLEAN, { path: "assets/key.txt", content: `${header}\nMIIE\n` }]),
+      ).toEqual({
+        ok: false,
+        mapFiles: [],
+        sourceMapRefs: [],
+        localPaths: [],
+        secrets: ["assets/key.txt: PEM private key block"],
+      });
+    }
+  });
+
+  it("flags a GitHub personal access token", () => {
+    expect(
+      classifyDistLeaks([
+        ...CLEAN,
+        { path: "assets/index-C8jCNzUt.js", content: 'fetch("",{headers:{a:"ghp_0123456789abcdefghijklmnopqrstuvwxyz"}})' },
+      ]),
+    ).toEqual({
+      ok: false,
+      mapFiles: [],
+      sourceMapRefs: [],
+      localPaths: [],
+      secrets: ["assets/index-C8jCNzUt.js: GitHub token"],
+    });
+  });
+
+  it("does not flag a token-shaped prefix that is too short to be one", () => {
+    // Precision is the whole point: a guard that fires on `ghp_` alone, or on
+    // a bare `AKIA`, is one a reader learns to override, which is worse than
+    // no guard. Each pattern requires the credential's full documented length.
+    expect(
+      classifyDistLeaks([
+        ...CLEAN,
+        { path: "assets/index-C8jCNzUt.js", content: 'const a="ghp_short",b="AKIASHORT",c="sk-";' },
+      ]),
+    ).toEqual({ ok: true, mapFiles: [], sourceMapRefs: [], localPaths: [], secrets: [] });
+  });
+
+  it("does not flag a base64 data URI or minified identifiers", () => {
+    expect(
+      classifyDistLeaks([
+        ...CLEAN,
+        {
+          path: "assets/index-DVeYZWBb.css",
+          content:
+            "body{background:url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCc+PC9zdmc+)}",
+        },
+        { path: "assets/index-C8jCNzUt.js", content: "const AIzaSyBhelper=1,xoxb=2,skProj=3;" },
+      ]),
+    ).toEqual({ ok: true, mapFiles: [], sourceMapRefs: [], localPaths: [], secrets: [] });
   });
 });
 
 describe("checkDist", () => {
-  it("the committed dist tree carries no source maps, secrets, or local paths", () => {
+  it("the committed dist tree carries no source maps, local paths or known credential formats", () => {
     // U5.3's runbook step 3 was verified by hand on the committed bundle; this
     // pins that property so a future build regressing it fails the build
-    // instead of waiting for another manual check.
+    // instead of waiting for another manual check. `secrets` is the
+    // well-known-format scan classifyDistLeaks documents, not a general
+    // secrets scan, so the name says which claim is being made.
     const result = checkDist();
     expect(result.ok).toBe(true);
     expect(result.mapFiles).toEqual([]);
     expect(result.sourceMapRefs).toEqual([]);
     expect(result.localPaths).toEqual([]);
+    expect(result.secrets).toEqual([]);
   });
 });
