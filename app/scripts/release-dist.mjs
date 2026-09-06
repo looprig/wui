@@ -59,6 +59,16 @@ function manifest(directory) {
  * with a different remedy: the build emitted no marker at all, which is the
  * v0.1.0 failure one level up — a published bundle no consumer can identify.
  *
+ * What this is NOT, so nobody later reads more into it than it says: it is a
+ * WIRING check, not a proof of provenance. It reads back a value the build
+ * wrote from `WUI_BUNDLE_RELEASE` alone, so it establishes that the flag
+ * reached the build that produced this tree — nothing more. It does not
+ * corroborate that the two isolated builds ran, that they compared equal, or
+ * that anyone but a developer with an editor set the flag. Those are properties
+ * of the surrounding transaction in `stageReproducibleDist`, and the only thing
+ * that would make the claim independently checkable by a consumer is a
+ * signature, which this repository deliberately does not attempt.
+ *
  * @param {string} directory Bundle directory to inspect.
  */
 export function assertReleaseMarker(directory) {
