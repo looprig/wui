@@ -1,10 +1,14 @@
-# Built SPA. dist/ is the //go:embed target, so index.html must stay committed:
-# //go:embed requires the path to exist at compile time, and that placeholder is
-# what makes `GOWORK=off go build ./...` and `GOWORK=off go test ./...` work with
-# no Node toolchain installed. The real `npm run build -w app` overwrites
-# everything under dist/ EXCEPT this file.
+# Built SPA. dist/ is the //go:embed target, so two files must stay committed:
+# //go:embed requires the path to exist at compile time, and index.html plus the
+# bundle marker are what make `GOWORK=off go build ./...` and
+# `GOWORK=off go test ./...` work with no Node toolchain installed --
+# bundle.go's BundleProtocolVersion reads looprig-bundle.json out of the
+# embedded tree, so a build with no marker is a build that cannot answer.
+# `npm run build -w app` overwrites everything under dist/, marker included;
+# `make release-dist` force-adds the result onto a release commit.
 dist/*
 !dist/index.html
+!dist/looprig-bundle.json
 
 # npm workspaces
 node_modules/

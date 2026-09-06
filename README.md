@@ -12,6 +12,7 @@ process serving the UI is the process holding the rig.
 func Assets() http.Handler                                       // the SPA alone
 func Guard(next http.Handler, opts ...GuardOption) http.Handler  // Host/Origin guard
 func Handler(api http.Handler, opts ...Option) http.Handler      // the composed default
+func BundleProtocolVersion() (Bundle, error)                     // what the embedded bundle speaks
 ```
 
 ```go
@@ -19,19 +20,31 @@ api := serve.Handler(rig, catalogreader.New(catalog, store))
 h   := wui.Handler(api)   // /v1/ -> api, / -> SPA, Host/Origin guard over all of it
 ```
 
-The exported Go surface names no looprig type: `http.Handler` in, `http.Handler` out.
-`github.com/looprig/harness` is in `go.mod` for the **tests** — `contract/` is a
-verbatim, version-pinned copy of that harness version's `pkg/serve` wire contract and
-`contract/contract_test.go` is the drift guard — and no non-test file in this module
-imports it.
+The serving surface is `http.Handler` in, `http.Handler` out, and no exported name
+here comes from another looprig module. `BundleProtocolVersion` is the one function
+that returns a wui type: `Bundle` is the embedded bundle's own self-description —
+which sessionwire version its JavaScript negotiates, which pinned Core its contract
+came from, which `@looprig/protocol` build is in it, and whether the release process
+produced the tree at all. A server composes the official bundle only after checking
+that marker against its own Core support, and a non-release or absent marker is
+refused. See `bundle.go` for why the claim is read out of the tree instead of
+declared as a Go constant.
+
+`github.com/looprig/core` is in `go.mod` for the **tests** — `contract/` is a
+verbatim, version-pinned copy of that Core version's `sessionwire/v1` schemas and
+fixtures and `contract/contract_test.go` is the drift guard — and no non-test file in
+this module imports it. Because nothing compiled imports it, `go mod tidy` drops the
+pin; use `go get`.
 
 ## Layout
 
 - `assets.go` — `Assets()`, the embedded SPA with a path-confined SPA-router fallback
 - `guard.go`, `csrf.go`, `errors.go` — browser guards (see Security below)
 - `handler.go` — `Handler()`, composing api + assets + guards
-- `dist/` — the `//go:embed all:dist` target; committed files are the last release bundle
-- `contract/` — schemas and fixtures vendored from harness at a pinned version
+- `bundle.go` — `BundleProtocolVersion()`, the embedded bundle's protocol marker
+- `dist/` — the `//go:embed all:dist` target; `index.html` and `looprig-bundle.json`
+  are always committed, the rest is force-added onto a release commit
+- `contract/` — schemas and fixtures vendored from Core at a pinned version
 - `packages/`, `app/` — the npm workspaces (protocol, React adapter, SPA)
 
 ## Security

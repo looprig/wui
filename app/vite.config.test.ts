@@ -1,8 +1,14 @@
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createServer, type ConfigEnv, type UserConfig, type ViteDevServer } from "vite";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { createServer, type ConfigEnv, type Plugin, type UserConfig, type ViteDevServer } from "vite";
 import config, {
+  BUNDLE_MANIFEST_PLUGIN_NAME,
+  BUNDLE_RELEASE_ENV,
+  bundleManifestPlugin,
   DEFAULT_DEV_FACTORY_TARGET,
   DEV_API_PREFIX,
   DEV_FACTORY_TARGET_ENV,
@@ -11,6 +17,7 @@ import config, {
   resolveFactoryTarget,
   servesDevProxy,
 } from "./vite.config";
+import { BUNDLE_MANIFEST_NAME } from "./scripts/write-bundle-manifest.mjs";
 
 /**
  * The three invocations Vite distinguishes, exactly as it hands them over —
@@ -76,6 +83,128 @@ describe("vite config", () => {
     expect(assetsDir).toBe("assets");
     expect(assetsDir?.startsWith("_")).toBe(false);
     expect(assetsDir?.startsWith(".")).toBe(false);
+  });
+});
+
+/**
+ * The marker has to be written by the BUILD, not by a separate ritual.
+ *
+ * `make release-dist` builds into a temporary `--outDir` with `--emptyOutDir`
+ * and then replaces `dist/` wholesale with that tree, so anything a build does
+ * not produce is DELETED from the released bundle. A manifest written by a
+ * hand-run CLI survives development and disappears from the tag — which is the
+ * v0.1.0 failure again, one level up: a marker that says the right thing in the
+ * working tree and is absent from what consumers embed.
+ *
+ * So the writer is a build plugin, and these are its two load-bearing
+ * properties: it writes into the RESOLVED output directory (not the literal
+ * `../dist` in the config), and the release flag is an input to the build
+ * rather than a constant.
+ */
+describe("bundle manifest plugin", () => {
+  const temporaries: string[] = [];
+
+  afterEach(() => {
+    while (temporaries.length > 0) rmSync(temporaries.pop()!, { recursive: true, force: true });
+  });
+
+  function temporaryDirectory(): string {
+    const created = mkdtempSync(join(tmpdir(), "looprig-wui-vite-manifest-"));
+    temporaries.push(created);
+    return created;
+  }
+
+  /** Invokes a Vite hook whether it is declared as a function or as `{handler}`. */
+  function callHook(hook: unknown, ...args: unknown[]): void {
+    const handler = typeof hook === "function"
+      ? hook
+      : (hook as { handler: (...rest: unknown[]) => unknown }).handler;
+    (handler as (...rest: unknown[]) => unknown).apply({}, args);
+  }
+
+  function runPlugin(
+    outDir: string,
+    env: Record<string, string | undefined>,
+    root = "/nonexistent-root",
+  ): void {
+    const plugin = bundleManifestPlugin(env);
+    callHook(plugin.configResolved, { root, build: { outDir } });
+    callHook(plugin.closeBundle);
+  }
+
+  function writtenManifest(directory: string): Record<string, unknown> {
+    return JSON.parse(readFileSync(join(directory, BUNDLE_MANIFEST_NAME), "utf8")) as Record<string, unknown>;
+  }
+
+  /**
+   * Vite's `plugins` is an arbitrarily nested array of plugins, falsey holes
+   * and promises — `@vitejs/plugin-react` alone contributes an array. Flattened
+   * by hand rather than with `flat(Infinity)`, whose recursive return type is
+   * what tsc rejects with TS2589 here.
+   */
+  function pluginsOf(config: UserConfig): Plugin[] {
+    const flatten = (value: unknown): Plugin[] =>
+      Array.isArray(value) ? value.flatMap(flatten) : value ? [value as Plugin] : [];
+    return flatten(config.plugins);
+  }
+
+  it("is registered on the build, and only on the build", () => {
+    const found = pluginsOf(resolved(BUILD)).filter(
+      (plugin) => plugin?.name === BUNDLE_MANIFEST_PLUGIN_NAME,
+    );
+    expect(found).toHaveLength(1);
+    // `apply: "build"` is what keeps `npm run dev` and every vitest run — both
+    // of which load this same config — from writing into the committed dist.
+    expect(found[0]?.apply).toBe("build");
+  });
+
+  it("writes the marker into the output directory the build produced", () => {
+    const out = temporaryDirectory();
+    runPlugin(out, {});
+    expect(writtenManifest(out)).toEqual({
+      core_version: "v0.7.0",
+      protocol_version: "0.1.0",
+      release: false,
+      sessionwire_version: 1,
+    });
+  });
+
+  it("resolves a relative outDir against the project root, not the process directory", () => {
+    // This is the real config's shape: `root` is `app/` and `build.outDir` is
+    // the literal "../dist". Taking `outDir` as written would put the marker
+    // wherever the build happened to be invoked from — beside the bundle only
+    // by coincidence, and silently nowhere at all under `make release-dist`,
+    // which passes an absolute `--outDir` but runs from the repository root.
+    const root = temporaryDirectory();
+    const out = join(root, "nested-out");
+    mkdirSync(out);
+    runPlugin(out, {}, root);
+    expect(writtenManifest(out).release).toBe(false);
+
+    const relativeRoot = temporaryDirectory();
+    const relativeOut = join(relativeRoot, "from-relative");
+    mkdirSync(relativeOut);
+    runPlugin("from-relative", {}, relativeRoot);
+    expect(writtenManifest(relativeOut).release).toBe(false);
+  });
+
+  it("declares a release build a release, and every other build not one", () => {
+    const release = temporaryDirectory();
+    runPlugin(release, { [BUNDLE_RELEASE_ENV]: "1" });
+    expect(writtenManifest(release).release).toBe(true);
+
+    const ordinary = temporaryDirectory();
+    runPlugin(ordinary, { [BUNDLE_RELEASE_ENV]: "0" });
+    expect(writtenManifest(ordinary).release).toBe(false);
+  });
+
+  it("reads the flag from the environment it is given, not the ambient one", () => {
+    // The plugin defaults its parameter to `process.env`, so a test that could
+    // only state the ambient environment would leak into the whole node
+    // project. Passing the record is also what makes the case above a pair.
+    const out = temporaryDirectory();
+    runPlugin(out, { [BUNDLE_RELEASE_ENV]: "yes" });
+    expect(writtenManifest(out).release).toBe(false);
   });
 });
 

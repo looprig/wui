@@ -1,9 +1,11 @@
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { playwright } from "@vitest/browser-playwright";
-import type { ConfigEnv, ProxyOptions } from "vite";
+import type { ConfigEnv, Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
+import { writeBundleManifest } from "./scripts/write-bundle-manifest.mjs";
 
 /**
  * The development proxy for the Factory plane.
@@ -126,8 +128,58 @@ export function servesDevProxy(env: Pick<ConfigEnv, "command" | "mode">): boolea
   return env.command === "serve" && env.mode !== "test";
 }
 
+/** The name `vite.config.test.ts` looks the plugin up by. */
+export const BUNDLE_MANIFEST_PLUGIN_NAME = "looprig-bundle-manifest";
+
+/**
+ * The environment variable that makes a build a RELEASE build.
+ *
+ * `release` is an input to the build rather than a constant anywhere, because
+ * the release bundle and a development bundle are produced by the same command
+ * — `make release-dist` runs `npm run build` twice, into throwaway directories,
+ * and compares them. Only the flag distinguishes the artefact it publishes.
+ *
+ * Exactly `"1"`. Anything else, including `"true"` and `"yes"`, is not a
+ * release: this gates whether a consumer will serve the bundle as official, so
+ * the affirmative case is one spelling and everything else fails closed.
+ */
+export const BUNDLE_RELEASE_ENV = "WUI_BUNDLE_RELEASE";
+
+/**
+ * Writes `looprig-bundle.json` into whatever directory this build produced.
+ *
+ * It is a plugin, not a step in the `build` npm script, because the output
+ * directory is not fixed: `make release-dist` builds into two temporary
+ * directories with `--outDir {out} --emptyOutDir` and installs one of them over
+ * `dist/`. A writer that only ever wrote to `dist/` would leave the release
+ * candidate — the tree that actually becomes the tag — with no marker at all,
+ * and `wui.BundleProtocolVersion` would answer `ErrNoBundleManifest` for every
+ * consumer of the published module.
+ *
+ * `apply: "build"` matters: `npm run dev` and every vitest project load this
+ * same config, and neither should write into the committed bundle.
+ *
+ * @param env Environment to read {@link BUNDLE_RELEASE_ENV} from.
+ */
+export function bundleManifestPlugin(env: Record<string, string | undefined> = process.env): Plugin {
+  let outDir = "";
+  return {
+    name: BUNDLE_MANIFEST_PLUGIN_NAME,
+    apply: "build",
+    configResolved(config) {
+      // The RESOLVED directory, not `build.outDir` as written: that is the
+      // relative "../dist" above unless `--outDir` overrode it, and the plugin
+      // must not depend on the process's working directory either way.
+      outDir = resolve(config.root, config.build.outDir);
+    },
+    closeBundle() {
+      writeBundleManifest(outDir, { release: env[BUNDLE_RELEASE_ENV] === "1" });
+    },
+  };
+}
+
 export default defineConfig((env) => ({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), bundleManifestPlugin()],
   resolve: {
     // One React instance for everything. Without this a prebundled dependency
     // (@tanstack/react-router) and the app can end up with separate copies,
@@ -160,10 +212,12 @@ export default defineConfig((env) => ({
     outDir: "../dist",
     // Explicitly false. Vite would refuse to empty an outDir outside the
     // project root anyway (and warn on every build), but stating it here is
-    // what stops a later edit from deleting the tracked dist/index.html
-    // placeholder that //go:embed needs to exist at compile time on a machine
-    // with no Node toolchain. `npm run dist:reset` clears stale assets and
-    // restores the placeholder instead.
+    // what stops a later edit from deleting dist/index.html, which //go:embed
+    // needs at compile time on a machine with no Node toolchain and which this
+    // build only rewrites at the very end. The other file that must survive,
+    // dist/looprig-bundle.json, is rewritten by bundleManifestPlugin on every
+    // build, so it needs no protection here. `npm run dist:reset` clears stale
+    // assets and restores the committed snapshot.
     emptyOutDir: false,
     // Default, restated: //go:embed dist (without `all:`) silently skips any
     // entry whose name starts with `_` or `.`, so the asset directory must

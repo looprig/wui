@@ -5,11 +5,19 @@ package wui
 // served as-is; any other request falls back to dist/index.html so client-side
 // routes like /sessions/abc123 still return the app shell.
 //
-// dist/ holds a committed placeholder index.html: //go:embed requires the
-// embedded path to exist at compile time, so this keeps go build / go vet /
-// go test green with no Node toolchain installed. The real
-// `npm run build -w app` later overwrites everything under dist/ except that
-// committed file (see .gitignore).
+// dist/ is committed rather than generated at build time. //go:embed requires
+// the embedded path to exist at compile time, so committing the tree is what
+// keeps go build / go vet / go test green with no Node toolchain installed --
+// and, because the module zip is source-only, it is also literally what a
+// consumer's binary serves.
+//
+// .gitignore keeps exactly two files under dist/ tracked unconditionally:
+// index.html, the SPA fallback target, and looprig-bundle.json, the marker
+// BundleProtocolVersion reads (see bundle.go). The rest of the tree is ignored
+// day to day and force-added onto a release commit by `make release-dist`, so
+// what is checked in beside them is whatever that last staged. `npm run build
+// -w app` overwrites it in place; `make dist-reset` restores the committed
+// snapshot.
 
 import (
 	"embed"
@@ -20,9 +28,9 @@ import (
 	"strings"
 )
 
-// assetsFS is the embedded SPA build (currently just the placeholder
-// dist/index.html; see above). Unexported: the build is an implementation
-// detail of Assets, not a surface a consumer inspects.
+// assetsFS is the embedded SPA build: the committed dist/ tree described
+// above. Unexported: the build is an implementation detail of Assets and of
+// BundleProtocolVersion, not a surface a consumer inspects.
 //
 // The all: prefix is required, not stylistic. A bare `//go:embed dist` applies
 // the default walk rules, which silently skip every entry whose name begins

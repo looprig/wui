@@ -12,7 +12,14 @@
     "noEmit": true,
     "skipLibCheck": true,
     "isolatedModules": true,
-    "verbatimModuleSyntax": true
+    "verbatimModuleSyntax": true,
+    // `vite.config.ts` imports `scripts/write-bundle-manifest.mjs`, which is
+    // plain JavaScript because it is also a standalone CLI. Without allowJs
+    // that import is an implicit `any` and TS7016 fails the typecheck. The
+    // alternative, a hand-written `.d.mts`, would be a second authority for the
+    // manifest's shape that nothing holds to the first; inferring from the
+    // source keeps one. `checkJs` stays off: the script has its own tests.
+    "allowJs": true
   },
   "include": ["vite.config.ts", "vite.config.test.ts"]
 }
