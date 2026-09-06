@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { checkDist, classifyDistEntries, classifyDistLeaks } from "./check-dist.mjs";
 
@@ -318,5 +321,40 @@ describe("checkDist", () => {
     expect(result.sourceMapRefs).toEqual([]);
     expect(result.localPaths).toEqual([]);
     expect(result.secrets).toEqual([]);
+  });
+
+  it("reports a LEAKING tree as not embeddable — the leak check reaches ok", () => {
+    // The case above runs against the committed tree, which is clean, so it
+    // passes whether or not classifyDistLeaks's answer is wired into the
+    // decision. `ok` is the only thing anything downstream reads:
+    // release-dist.mjs branches on it for the build candidate and again after
+    // installing over dist/, and the CLI's exit status is it. So the leak
+    // classifier being correct is worth nothing unless a leaking tree makes
+    // `ok` false, which is what this constructs.
+    const dir = mkdtempSync(join(tmpdir(), "wui-check-dist-leak-"));
+    try {
+      mkdirSync(join(dir, "assets"));
+      writeFileSync(join(dir, "index.html"), '<script src="/assets/index-abc123.js"></script>');
+      writeFileSync(
+        join(dir, "assets", "index-abc123.js"),
+        'console.log("/Users/example-dev/wui/app/src/main.tsx","AKIAIOSFODNN7EXAMPLE");\n//# sourceMappingURL=index-abc123.js.map\n',
+      );
+      writeFileSync(join(dir, "assets", "index-abc123.js.map"), "{}");
+
+      const result = checkDist(dir);
+
+      // Not merely `ok === false`: every leak field must have carried its own
+      // offending path through, so a future change that wires only one of them
+      // into `ok` is still visible here.
+      expect(result.ok).toBe(false);
+      expect(result.missingIndex).toBe(false);
+      expect(result.skipped).toEqual([]);
+      expect(result.mapFiles).toEqual(["assets/index-abc123.js.map"]);
+      expect(result.sourceMapRefs).toEqual(["assets/index-abc123.js"]);
+      expect(result.localPaths).toEqual(["assets/index-abc123.js"]);
+      expect(result.secrets).toEqual(["assets/index-abc123.js: AWS access key id"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
