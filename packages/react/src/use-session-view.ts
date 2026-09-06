@@ -232,17 +232,23 @@ type FactorySessionViewSnapshot = Omit<UseFactorySessionViewResult, "browseEarli
 // cold/live event map.
 //
 // `#currentEvents` really is unbounded, and the reason it is not simply capped
-// here is a missing WIRE capability rather than an oversight. Evicting its
-// lowest sequences would bound memory and create a reachability hole: the only
-// history walk this view has is `browseEarlier`, which starts with no cursor
-// and no `tail` and follows `next_cursor` FORWARD from the beginning of the
-// journal, and `FactoryJournalOptions` offers no backward page — `tail` is a
-// tail-first read and is mutually exclusive with `cursor`. So an evicted middle
-// could be reached only by walking every page from sequence zero, which is the
-// full replay the join exists to avoid. A bound belongs here once a bounded
-// BACKWARD page exists (runbook 06 U2.1 step 7 names one); until then, capping
-// this map would trade a known memory ceiling for silent, unrecoverable
-// history loss. Do not add an eviction policy without that page.
+// here is a missing CLIENT capability rather than a missing wire one. A
+// bounded BACKWARD page genuinely does not exist: Core's `previous_cursor`
+// (`sessionwire/v1/queries.go`) and this repo's own
+// `public_journal_page.schema.json` declare the field, but neither `factory`
+// nor `sessionstore` ever sets it (runbook 06 U2.1 step 7 asks for one; it is
+// unimplemented). That much is real.
+//
+// But Factory already serves a bounded FORWARD page positioned at an
+// arbitrary sequence — `GET .../journal?from_seq=N&limit=M`
+// (`factory/internal/httpapi/sessions.go`, `journalPositionOf` and the
+// `ReadPublicJournal` call it feeds; exercised in `sessions_test.go` and
+// backed by `sessionstore.ReadPublicJournalRequest.FromSeq`). So an evicted
+// middle would be reachable in one bounded request, not by replay from
+// sequence zero — `FactoryJournalOptions` here just doesn't plumb `from_seq`
+// yet (it only carries `cursor`, `limit` and `tail`). Adding that plumbing,
+// plus an eviction policy for this map, is a reasonable follow-up; it is
+// simply not done here. It does not need a backward page first.
 const MAX_EARLIER_PAGE_BYTES = DEFAULT_MAX_TAIL_BYTES;
 const earlierPageEncoder = new TextEncoder();
 
