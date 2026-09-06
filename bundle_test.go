@@ -76,6 +76,68 @@ func TestEmbeddedBundleReleaseClaimMatchesItsTree(t *testing.T) {
 			bundleIndexPath,
 		)
 	}
+
+	// The implication above is satisfied by ANY marker over a built tree, and
+	// the committed tree is built -- so a hand-edited `"release": true` over a
+	// development bundle passes it. Inside this repository there is a signal
+	// that separates the two, even though a consumer at rest has none:
+	// `make release-dist` sets WUI_BUNDLE_RELEASE=1 on the node process
+	// (Makefile) and release-dist.mjs spawns this very `go test` with
+	// {...process.env}, so the variable is present in the environment of a
+	// release run's test and absent in every other run.
+	//
+	// This does not claim to defend against someone who sets the variable
+	// deliberately; nothing short of a signature does, and that is out of
+	// scope. It catches the realistic accident -- a marker committed with
+	// release: true from an ordinary `npm run build` -- on every developer run
+	// and every CI run, while staying green inside the release itself.
+	if want := os.Getenv(bundleReleaseEnv) == "1"; got.Release != want {
+		t.Fatalf(
+			"the embedded marker says release=%t, but %s=%q says this is release build=%t",
+			got.Release, bundleReleaseEnv, os.Getenv(bundleReleaseEnv), want,
+		)
+	}
+}
+
+// bundleReleaseEnv is app/vite.config.ts's BUNDLE_RELEASE_ENV, the one
+// variable that makes a build a release build. Duplicated as a literal rather
+// than read from the TypeScript, because the Go side has no way to read it and
+// a wrong value here would silently weaken the assertion above rather than
+// fail: if the two ever disagree, the release run is the place it shows.
+const bundleReleaseEnv = "WUI_BUNDLE_RELEASE"
+
+// TestBundleProtocolVersionReadsTheFileRatherThanRestatingIt pins what
+// bundle.go:7-13 says the whole file exists for: the values are read out of the
+// bundle, so that "a constant would keep saying the right thing while the tree
+// beneath it went stale" cannot happen here.
+//
+// It compares BundleProtocolVersion() against the marker read from the LIVE
+// working tree (os.DirFS("."), i.e. dist/looprig-bundle.json on disk) through
+// the same reader, value and error both. Any implementation that answers from
+// constants agrees with this only for as long as those constants happen to
+// equal the file; the moment the marker moves -- which is every release and
+// every protocol bump -- it fails.
+//
+// Stated honestly about its limit: a constant that is exactly equal to the
+// current marker in all four fields is not distinguishable from the real read
+// by any in-process test, because //go:embed fixes the embedded bytes at
+// compile time and no test can vary them. That mutant is equivalent FOR THE
+// CURRENT TREE and only for it; this test is what makes it stop being
+// equivalent the first time anything in the marker changes.
+func TestBundleProtocolVersionReadsTheFileRatherThanRestatingIt(t *testing.T) {
+	t.Parallel()
+
+	got, gotErr := BundleProtocolVersion()
+	// The source tree beside the test, not the compiled-in copy: this is the
+	// file `make release-dist` rewrites and a developer could edit.
+	want, wantErr := readBundleManifest(os.DirFS("."))
+	if !errors.Is(gotErr, wantErr) && !errors.Is(wantErr, gotErr) {
+		t.Fatalf("BundleProtocolVersion() error = %v, reading %s from the working tree gives %v",
+			gotErr, bundleManifestPath, wantErr)
+	}
+	if got != want {
+		t.Errorf("BundleProtocolVersion() = %+v, but %s on disk says %+v", got, bundleManifestPath, want)
+	}
 }
 
 // TestTreeCarriesBuiltOutputSeparatesThePlaceholderFromABuild is what
