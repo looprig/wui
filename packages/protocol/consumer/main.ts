@@ -101,12 +101,60 @@ async function assertFrameworksAreUnresolvable(): Promise<void> {
   console.log(`RESOLUTION_REPORT ${JSON.stringify(report)}`);
 }
 
+/**
+ * Checks the ClientLink double against the behaviours its header claims to
+ * mirror.
+ *
+ * This asserts the FAKE, not the package, and is worth its lines for one
+ * reason: three of those behaviours have no reader in the scenario below --
+ * that scenario always connects, always authorizes, and never subscribes the
+ * same channel twice -- so a double that quietly loosened any of them would
+ * leave every assertion in `main` still passing. It is what stops the double
+ * drifting looser than the dependency it stands in for. It is NOT evidence
+ * about `CentrifugeClientLink`: the justification for each expectation is the
+ * source citation in `fake-link.ts`'s header, not this function.
+ */
+async function assertLinkDoubleHoldsItsContract(): Promise<void> {
+  const link = new FakeClientLink();
+  const noop = { tenantId: TENANT, sessionId: SESSION, onPublication: () => {}, onReset: () => {} };
+  const first = link.subscribe(noop);
+
+  // Before the LINK has negotiated, a subscription reports no version -- the
+  // condition `joinFactorySessionView` repairs on.
+  equal(first.state, "subscribing", "a fresh subscription is not yet subscribed");
+  equal(first.version, undefined, "no version before the link has negotiated");
+  await link.connect();
+  equal(first.version, undefined, "no version before the SERVER has authorized the subscription");
+  const publishedTooEarly = await rejects(
+    async () => link.publishEnduring(TENANT, SESSION, {}),
+    "a publication before authorization",
+  );
+  check(publishedTooEarly instanceof Error, "a publication before authorization is refused");
+
+  link.authorize(TENANT, SESSION);
+  await first.ready;
+  equal(first.state, "subscribed", "an authorized subscription is subscribed");
+  equal(first.version, 1, "the negotiated version is visible once authorized");
+
+  const duplicate = await rejects(async () => link.subscribe(noop), "a second subscription on one channel");
+  check(duplicate instanceof Error, "one live subscription per channel, as Centrifuge enforces");
+
+  first.unsubscribe();
+  equal(link.openChannels, 0, "unsubscribe detaches the channel so it can be taken again");
+  const successor = link.subscribe(noop);
+  first.unsubscribe(); // idempotent, and must not deregister the successor
+  equal(link.openChannels, 1, "a late unsubscribe never detaches a successor on the same channel");
+  successor.unsubscribe();
+  equal(link.openChannels, 0, "the successor releases its own channel");
+}
+
 function journalEvent(seq: number, text: string): PublicJournalPage["events"][number] {
   return { event_id: `event-${seq}`, journal_seq: seq, body: { type: "session.message", text } };
 }
 
 async function main(): Promise<void> {
   await assertFrameworksAreUnresolvable();
+  await assertLinkDoubleHoldsItsContract();
 
   const objectBytes = new TextEncoder().encode("0123456789");
   const objectDigest = `sha256:${createHash("sha256").update(objectBytes).digest("hex")}`;
