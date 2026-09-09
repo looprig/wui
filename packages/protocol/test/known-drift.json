@@ -94,7 +94,8 @@
     "test/store.test.ts": 8,
     "test/surface.test.ts": 30,
     "test/toolsummary.test.ts": 59,
-    "test/transport.test.ts": 46
+    "test/transport.test.ts": 46,
+    "test/vanilla-consumer.test.ts": 8
   },
   "fileGranular": [
     "test/host-transport-csrf.test.ts",
