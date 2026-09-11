@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -170,16 +170,53 @@ export function classifyDistLeaks(files) {
   };
 }
 
+/**
+ * Walks a built tree, classifying every entry by `lstat` and NEVER descending
+ * through a symlink.
+ *
+ * `readdirSync(dir, { recursive: true })` cannot be used here, with or without
+ * `withFileTypes`: BOTH variants follow a symlinked directory and recurse into
+ * its target. Measured on this tree, a `dist/assets/link -> .` yields 66 entries
+ * (`link/link/link/...`) before the kernel answers ELOOP, and a
+ * `dist/assets/link -> /etc` walks out of the bundle entirely and throws EACCES
+ * on `/etc/cups/certs`. Neither is a path the release can survive, and neither
+ * is a path a build output should contain.
+ *
+ * Descending only when `lstat` says DIRECTORY is what makes the walk total: an
+ * lstat of a symlink is never a directory, so no link is ever followed, and a
+ * dangling link, a loop and a link to an unreadable directory all reduce to the
+ * same thing — one entry, classified, reported by name. That is the property
+ * `bundleManifest` depends on to be reachable; see its doc comment.
+ *
+ * @param {string} root Absolute path of the tree to walk.
+ * @returns {{ path: string, metadata: import("node:fs").Stats }[]} Entries with
+ *   root-relative, forward-slash-separated paths, parents before children.
+ */
+export function walkBundleEntries(root) {
+  const entries = [];
+  const visit = (relative) => {
+    const absolute = relative === "" ? root : join(root, relative);
+    for (const name of readdirSync(absolute).sort()) {
+      const path = relative === "" ? name : `${relative}/${name}`;
+      const metadata = lstatSync(join(absolute, name));
+      entries.push({ path, metadata });
+      if (metadata.isDirectory()) visit(path);
+    }
+  };
+  visit("");
+  return entries;
+}
+
 /** The tree `vite.config.ts`'s `build.outDir` writes and `wui/assets.go` embeds. */
 export const DIST_DIR = new URL("../../dist", import.meta.url);
 
 export function checkDist(dir = DIST_DIR) {
   const dirPath = typeof dir === "string" ? dir : fileURLToPath(dir);
-  const entries = readdirSync(dir, { recursive: true }).map(String);
-  const entryResult = classifyDistEntries(entries);
-  const files = entries
-    .filter((entry) => statSync(join(dirPath, entry)).isFile())
-    .map((entry) => ({ path: entry, content: readFileSync(join(dirPath, entry), "latin1") }));
+  const walked = walkBundleEntries(dirPath);
+  const entryResult = classifyDistEntries(walked.map((entry) => entry.path));
+  const files = walked
+    .filter((entry) => entry.metadata.isFile())
+    .map((entry) => ({ path: entry.path, content: readFileSync(join(dirPath, entry.path), "latin1") }));
   const leakResult = classifyDistLeaks(files);
   return {
     ok: entryResult.ok && leakResult.ok,

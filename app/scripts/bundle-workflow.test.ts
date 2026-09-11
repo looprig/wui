@@ -1,14 +1,19 @@
+import type { ChildProcess } from "node:child_process";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -16,7 +21,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { assertReleaseMarker } from "./release-dist.mjs";
+import { checkDist } from "./check-dist.mjs";
+import { assertReleaseMarker, bundleManifest } from "./release-dist.mjs";
 import { BUNDLE_MANIFEST_NAME } from "./write-bundle-manifest.mjs";
 
 const repository = fileURLToPath(new URL("../..", import.meta.url));
@@ -39,10 +45,14 @@ function cloneWithCurrentWorkflow(): string {
   run("git", ["clone", "--quiet", "--no-hardlinks", repository, clone], repository);
   copyFileSync(join(repository, "Makefile"), join(clone, "Makefile"));
   copyFileSync(join(repository, "app/package.json"), join(clone, "app/package.json"));
-  const releaseScript = join(repository, "app/scripts/release-dist.mjs");
-  if (existsSync(releaseScript)) {
-    mkdirSync(join(clone, "app/scripts"), { recursive: true });
-    copyFileSync(releaseScript, join(clone, "app/scripts/release-dist.mjs"));
+  // Every script the release entry point LOADS, not just the entry point. The
+  // clone is of HEAD, so overlaying `release-dist.mjs` alone left it importing
+  // the committed `check-dist.mjs`; a working-tree change that spans the two
+  // failed every clone-backed case at import time rather than being tested.
+  mkdirSync(join(clone, "app/scripts"), { recursive: true });
+  for (const script of ["release-dist.mjs", "check-dist.mjs", "write-bundle-manifest.mjs"]) {
+    const source = join(repository, "app/scripts", script);
+    if (existsSync(source)) copyFileSync(source, join(clone, "app/scripts", script));
   }
   return clone;
 }
@@ -75,6 +85,9 @@ type BuildMode =
   | "symlink-absolute-different"
   | "symlink-relative-same"
   | "symlink-relative-different"
+  | "symlink-dangling-absolute"
+  | "symlink-directory"
+  | "symlink-loop"
   | "fifo";
 
 type HandledReleaseSignal = "SIGHUP" | "SIGINT" | "SIGTERM";
@@ -104,7 +117,7 @@ function installFakeReleaseTools(
   const npm = join(bin, "npm");
   writeFileSync(npm, `#!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 const args = process.argv.slice(2);
 if (args[0] === "ci") process.exit(0);
@@ -151,11 +164,42 @@ if (count === 2) {
   if (edit === "ignored") writeFileSync(resolve("dist/assets/caller-during-build.js"), "caller edit during build");
 }
 const mode = process.env.BUNDLE_TEST_MODE;
+// One entry kind per mode, named rather than derived from substrings of the
+// mode name: the previous version read "relative"/"different" out of the string
+// and silently gave any unlisted symlink- mode an absolute /etc/hosts target.
+const symlinkTargets = {
+  "symlink-absolute-same": "/etc/hosts",
+  "symlink-absolute-different": count === 2 ? "/etc/passwd" : "/etc/hosts",
+  "symlink-relative-same": "target",
+  "symlink-relative-different": "target-" + count,
+  "symlink-dangling-absolute": "/looprig-no-such-target",
+  "symlink-directory": ".",
+};
+// Which modes must produce a link that does NOT resolve. A fixture that
+// silently made a VALID link would let its test pass for the wrong reason, so
+// the build asserts the kind it just created and fails loudly if it differs.
+const danglingModes = new Set([
+  "symlink-relative-same",
+  "symlink-relative-different",
+  "symlink-dangling-absolute",
+  "symlink-loop",
+]);
+if (mode === "symlink-loop") {
+  symlinkSync("loop-b", resolve(out, "assets/link"));
+  symlinkSync("link", resolve(out, "assets/loop-b"));
+} else if (symlinkTargets[mode] !== undefined) {
+  symlinkSync(symlinkTargets[mode], resolve(out, "assets/link"));
+}
 if (mode?.startsWith("symlink-")) {
-  const relative = mode.includes("relative");
-  const different = mode.includes("different");
-  const target = relative ? (different ? "target-" + count : "target") : (different && count === 2 ? "/etc/passwd" : "/etc/hosts");
-  symlinkSync(target, resolve(out, "assets/link"));
+  const link = resolve(out, "assets/link");
+  if (!lstatSync(link).isSymbolicLink()) {
+    console.error("fixture for " + mode + " did not create a symlink");
+    process.exit(70);
+  }
+  if (existsSync(link) === danglingModes.has(mode)) {
+    console.error("fixture for " + mode + " is " + (existsSync(link) ? "resolvable" : "dangling") + ", which the mode does not claim");
+    process.exit(71);
+  }
 }
 if (mode === "fifo") {
   const result = spawnSync("mkfifo", [resolve(out, "assets/pipe")]);
@@ -219,10 +263,74 @@ function expectPristineDist(clone: string, expected: Record<string, string>): vo
   expect(run("git", ["status", "--porcelain=v1", "--", "dist"], clone)).toBe("");
 }
 
-async function waitForFile(path: string): Promise<void> {
+interface RunningRelease {
+  child: ChildProcess;
+  logPath: string;
+}
+
+/**
+ * Starts a release the way the interrupt cases need it: as a direct `node`
+ * invocation, so a signal can be delivered to the release process itself rather
+ * than to `make`.
+ *
+ * `WUI_BUNDLE_RELEASE=1` is set HERE, and it is the whole reason these cases
+ * were failing. Going around `make` also goes around the only place the flag is
+ * set (`Makefile`'s `release-dist` recipe), so the fake build wrote a marker
+ * saying `release=false` and `assertReleaseMarker` — added to the release path
+ * long after these fixtures were written — refused the staged bundle BEFORE the
+ * Go gate ever spawned. `.gate-ready` was therefore never created, and the only
+ * symptom was `waitForFile` timing out ten seconds later with nothing to say.
+ * That is why it read as host slowness for days; it is not a timing fault and no
+ * timeout is large enough to fix it.
+ *
+ * Output goes to a FILE, not a pipe: the release passes `stdio: "inherit"` to
+ * its own children, so a pipe would be held open by every descendant and the
+ * `close` these cases await could outlive the process group they are testing.
+ */
+function spawnRelease(clone: string, env: NodeJS.ProcessEnv): RunningRelease {
+  const logPath = join(clone, ".release-output");
+  const log = openSync(logPath, "a");
+  try {
+    const child = spawn(
+      "node",
+      [
+        "app/scripts/release-dist.mjs",
+        "npm", "run", "build", "--workspace", "app", "--", "--outDir", "{out}", "--emptyOutDir",
+      ],
+      { cwd: clone, env: { ...env, WUI_BUNDLE_RELEASE: "1" }, stdio: ["ignore", log, log] },
+    );
+    return { child, logPath };
+  } finally {
+    closeSync(log);
+  }
+}
+
+function releaseOutput(release: RunningRelease): string {
+  return existsSync(release.logPath) ? readFileSync(release.logPath, "utf8") : "(no output)";
+}
+
+/**
+ * Waits for a handshake file, and refuses to report only that it did not appear.
+ *
+ * "The expected file is never created" is a symptom shared by every way a
+ * release can fail before reaching the step that writes it. Racing the child's
+ * exit turns the common case — the release already died, and said why — into an
+ * immediate failure carrying its output, instead of a ten-second wait ending in
+ * a message naming a path and no cause.
+ */
+async function waitForFile(path: string, release?: RunningRelease): Promise<void> {
   const deadline = Date.now() + 10_000;
   while (!existsSync(path)) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+    if (release !== undefined && release.child.exitCode !== null) {
+      throw new Error(
+        `release exited with code ${release.child.exitCode} before creating ${path}:\n${releaseOutput(release)}`,
+      );
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `timed out waiting for ${path}${release === undefined ? "" : `; release output so far:\n${releaseOutput(release)}`}`,
+      );
+    }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
@@ -233,15 +341,9 @@ async function interruptRelease(clone: string, signal: HandledReleaseSignal) {
   const temporaryRoot = join(clone, ".release-temporary");
   mkdirSync(temporaryRoot);
   env.TMPDIR = temporaryRoot;
-  const child = spawn(
-    "node",
-    [
-      "app/scripts/release-dist.mjs",
-      "npm", "run", "build", "--workspace", "app", "--", "--outDir", "{out}", "--emptyOutDir",
-    ],
-    { cwd: clone, env, stdio: "ignore" },
-  );
-  await waitForFile(env.BUNDLE_TEST_GATE_READY!);
+  const release = spawnRelease(clone, env);
+  const child = release.child;
+  await waitForFile(env.BUNDLE_TEST_GATE_READY!, release);
   child.kill(signal);
   const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.once("error", reject);
@@ -256,15 +358,9 @@ async function interruptFirstBuild(clone: string, signal: HandledReleaseSignal) 
   const temporaryRoot = join(clone, ".release-temporary");
   mkdirSync(temporaryRoot);
   env.TMPDIR = temporaryRoot;
-  const child = spawn(
-    "node",
-    [
-      "app/scripts/release-dist.mjs",
-      "npm", "run", "build", "--workspace", "app", "--", "--outDir", "{out}", "--emptyOutDir",
-    ],
-    { cwd: clone, env, stdio: "ignore" },
-  );
-  await waitForFile(env.BUNDLE_TEST_BUILD_READY!);
+  const release = spawnRelease(clone, env);
+  const child = release.child;
+  await waitForFile(env.BUNDLE_TEST_BUILD_READY!, release);
   child.kill(signal);
   const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.once("error", reject);
@@ -283,15 +379,9 @@ async function interruptAfterGateLeaderExit(clone: string) {
   const temporaryRoot = join(clone, ".release-temporary");
   mkdirSync(temporaryRoot);
   env.TMPDIR = temporaryRoot;
-  const child = spawn(
-    "node",
-    [
-      "app/scripts/release-dist.mjs",
-      "npm", "run", "build", "--workspace", "app", "--", "--outDir", "{out}", "--emptyOutDir",
-    ],
-    { cwd: clone, env, stdio: "ignore" },
-  );
-  await waitForFile(env.BUNDLE_TEST_GATE_LEADER_EXITED!);
+  const release = spawnRelease(clone, env);
+  const child = release.child;
+  await waitForFile(env.BUNDLE_TEST_GATE_LEADER_EXITED!, release);
   child.kill("SIGTERM");
   const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.once("error", reject);
@@ -330,6 +420,150 @@ describe("release marker check", () => {
     ["a JSON document that is not an object", '"release"', /does not declare itself a release/],
   ])("refuses %s", (_label, body, message) => {
     expect(() => assertReleaseMarker(stage(body))).toThrow(message);
+  });
+});
+
+/**
+ * Every entry kind the bundle walk can meet, and which component reports it.
+ *
+ * This exists because of a defect whose shape matters more than its instance:
+ * `bundleManifest` is the guard that names an unsupported entry, and it was
+ * UNREACHABLE for two of these kinds. `build` runs `checkDist` first, and
+ * `checkDist` classified with `statSync` — a path-FOLLOWING call. On a dangling
+ * symlink that throws ENOENT and on a symlink loop it throws ELOOP, so the
+ * release died with a raw fs error naming a path, and the guard that exists to
+ * say WHICH entry is unsupported never executed. Raising a timeout, rerunning
+ * on a quieter host, or fixing only the relative-dangling case the bug report
+ * happened to name would all have left the neighbouring kinds broken.
+ *
+ * So each case asserts BOTH halves, and the first half is the reachability
+ * claim: `checkDist` returns a verdict rather than throwing, and then
+ * `bundleManifest` is the thing that reports. A future change that makes
+ * `checkDist` follow a link again fails here, on the kind it broke, by name.
+ *
+ * `relative vs absolute` is deliberately crossed with `dangling` because it is
+ * NOT the axis the defect lay on: a dangling ABSOLUTE symlink fails `statSync`
+ * exactly as a dangling relative one does. The original fixture only ever
+ * pointed its absolute links at paths that exist, which is why the absolute
+ * cases passed and made the fault look like it was about relative links.
+ */
+describe("bundle entry classification", () => {
+  function stageTree(): string {
+    const directory = mkdtempSync(join(tmpdir(), "wui-bundle-entry-"));
+    temporaryDirectories.push(directory);
+    mkdirSync(join(directory, "assets"));
+    writeFileSync(join(directory, "index.html"), '<script type="module" src="/assets/app.js"></script>');
+    writeFileSync(join(directory, "assets/app.js"), 'export const marker = "stable";');
+    return directory;
+  }
+
+  /**
+   * `checkDist`'s verdict, or the error it died with, as a VALUE.
+   *
+   * The defect was an unhandled throw, so "it did not throw" has to be
+   * something a test reads and asserts rather than something it merely fails to
+   * notice. Catching turns a regression into a named assertion failure carrying
+   * the fs error, instead of an opaque ENOENT escaping the test body.
+   */
+  function verdictOf(directory: string): ReturnType<typeof checkDist> | Error {
+    try {
+      return checkDist(directory);
+    } catch (error) {
+      return error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
+  function expectReachedClassifier(directory: string): void {
+    const verdict = verdictOf(directory);
+    expect(
+      verdict instanceof Error ? `checkDist threw ${verdict.message}` : "checkDist reached a verdict",
+    ).toBe("checkDist reached a verdict");
+    expect((verdict as ReturnType<typeof checkDist>).ok).toBe(true);
+  }
+
+  /** A symlink fixture is only a fixture if it is the link it claims to be. */
+  function link(directory: string, name: string, target: string, expectDangling: boolean): string {
+    const path = join(directory, name);
+    symlinkSync(target, path);
+    expect(lstatSync(path).isSymbolicLink(), `${name} was not created as a symlink`).toBe(true);
+    expect(existsSync(path), `${name} dangling-ness is not what the case claims`).toBe(!expectDangling);
+    return path;
+  }
+
+  const supported = [
+    ["a regular file", (d: string) => writeFileSync(join(d, "assets/extra.js"), "export const extra = 1;"), "assets/extra.js", "file"],
+    ["a directory", (d: string) => mkdirSync(join(d, "assets/nested")), "assets/nested", "directory"],
+  ] as const;
+
+  it.each(supported)("admits %s", (_label, create, path, type) => {
+    const directory = stageTree();
+    create(directory);
+
+    expectReachedClassifier(directory);
+    const entry = bundleManifest(directory).find((candidate) => candidate.path === path);
+    expect(entry?.type).toBe(type);
+    if (type === "file") expect(entry?.sha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  const unsupported = [
+    ["a relative symlink to a file that exists", (d: string) => link(d, "assets/link", "app.js", false)],
+    ["an absolute symlink to a file that exists", (d: string) => link(d, "assets/link", "/etc/hosts", false)],
+    ["a relative symlink to a directory that exists", (d: string) => link(d, "assets/link", ".", false)],
+    ["an absolute symlink to a directory that exists", (d: string) => link(d, "assets/link", "/etc", false)],
+    // The reported instance.
+    ["a dangling relative symlink", (d: string) => link(d, "assets/link", "target", true)],
+    // Its neighbour, which the original fixture never constructed.
+    ["a dangling absolute symlink", (d: string) => link(d, "assets/link", "/looprig-no-such-target", true)],
+    // A symlink loop: statSync answers ELOOP rather than ENOENT, same blindness.
+    ["a symlink loop", (d: string) => {
+      symlinkSync("loop-b", join(d, "assets/link"));
+      symlinkSync("link", join(d, "assets/loop-b"));
+      expect(lstatSync(join(d, "assets/link")).isSymbolicLink()).toBe(true);
+      expect(() => readFileSync(join(d, "assets/link"))).toThrow(/ELOOP/);
+    }],
+    ["a FIFO", (d: string) => {
+      const result = spawnSync("mkfifo", [join(d, "assets/pipe")]);
+      expect(result.status).toBe(0);
+      expect(lstatSync(join(d, "assets/pipe")).isFIFO()).toBe(true);
+    }],
+  ] as const;
+
+  it.each(unsupported)("refuses %s, and reaches the classifier to say so", (_label, create) => {
+    const directory = stageTree();
+    create(directory);
+
+    // Reachability: checkDist has no opinion about a non-regular entry and
+    // must hand the tree on rather than dying on it.
+    expectReachedClassifier(directory);
+    // And the classifier is what reports, naming the entry.
+    expect(() => bundleManifest(directory)).toThrow(/unsupported bundle entry type: assets\//);
+  });
+
+  it("refuses a symlink standing in for the output root itself", () => {
+    const directory = stageTree();
+    const parent = mkdtempSync(join(tmpdir(), "wui-bundle-root-"));
+    temporaryDirectories.push(parent);
+    const root = join(parent, "dist");
+    symlinkSync(directory, root);
+    expect(lstatSync(root).isSymbolicLink()).toBe(true);
+
+    expect(() => bundleManifest(root)).toThrow(/unsupported bundle entry type at output root/);
+  });
+
+  /**
+   * The leak scan reads entry CONTENT, so following a link would have it scan
+   * bytes that are not in the bundle at all — a symlink to a private file would
+   * be scanned for credentials and, worse, a clean result would be reported for
+   * a tree whose actual published entry is unreadable. It classifies the entry.
+   */
+  it("does not read through a symlink when scanning for leaks", () => {
+    const directory = stageTree();
+    writeFileSync(join(directory, "assets/secret.txt"), "AKIAIOSFODNN7EXAMPLE");
+    link(directory, "assets/link", "secret.txt", false);
+
+    const result = checkDist(directory);
+
+    expect(result.secrets).toStrictEqual(["assets/secret.txt: AWS access key id"]);
   });
 });
 
@@ -627,11 +861,24 @@ describe("bundle release workflow", () => {
     expectPristineDist(clone, expected);
   });
 
+  /**
+   * The same entry-kind space `bundle entry classification` covers, driven end
+   * to end through `make`. The three link kinds below the original five are the
+   * neighbours of the reported defect: a dangling ABSOLUTE link fails a
+   * following `stat` exactly as a dangling relative one does, a loop answers
+   * ELOOP instead of ENOENT, and a DIRECTORY link is worse than either, because
+   * `readdirSync(..., { recursive: true })` follows it and walks out of the
+   * bundle. Only `symlink-relative-*` was ever reported; fixing those alone
+   * would have left all three.
+   */
   it.each([
     "symlink-absolute-same",
     "symlink-absolute-different",
     "symlink-relative-same",
     "symlink-relative-different",
+    "symlink-dangling-absolute",
+    "symlink-directory",
+    "symlink-loop",
     "fifo",
   ] as const)("rejects unsupported %s output before publication", (mode) => {
     const clone = cloneWithCurrentWorkflow();

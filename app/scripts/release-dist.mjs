@@ -1,10 +1,10 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { cpSync, lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkDist } from "./check-dist.mjs";
+import { checkDist, walkBundleEntries } from "./check-dist.mjs";
 import { BUNDLE_MANIFEST_NAME } from "./write-bundle-manifest.mjs";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -24,22 +24,38 @@ class ReleaseSignalError extends Error {
   }
 }
 
-function manifest(directory) {
+/**
+ * The bundle walk's entry classifier, and the sole reporter of an entry kind
+ * the release cannot publish.
+ *
+ * It classifies by `lstat`, so it judges the ENTRY, never the entry's target:
+ * a directory is a directory, a regular file is hashed, and everything else —
+ * symlink of any kind, FIFO, socket, device — is refused by name.
+ *
+ * This is only the sole reporter because nothing upstream of it stats the same
+ * tree by a path-following call. `checkDist`, which `build` runs FIRST, used to
+ * use `statSync`; a dangling symlink or a symlink loop made it throw ENOENT or
+ * ELOOP and the release died there, so the one guard that exists to name the
+ * offending entry never ran. `checkDist` therefore also lstats, and
+ * `bundle entry classification` in `bundle-workflow.test.ts` holds that
+ * ordering by asserting, per entry kind, that `checkDist` reaches a verdict
+ * and that this function is the thing that reports the refusal.
+ *
+ * @param {string} directory Bundle directory to walk.
+ */
+export function bundleManifest(directory) {
   const root = lstatSync(directory);
   if (!root.isDirectory() || root.isSymbolicLink()) {
     throw new Error("unsupported bundle entry type at output root");
   }
-  return readdirSync(directory, { recursive: true, withFileTypes: true })
-    .map((entry) => {
-      const absolute = join(entry.parentPath, entry.name);
-      const metadata = lstatSync(absolute);
-      const path = relative(directory, absolute).split("\\").join("/");
+  return walkBundleEntries(directory)
+    .map(({ path, metadata }) => {
       if (metadata.isDirectory()) return { path, type: "directory" };
       if (!metadata.isFile()) throw new Error(`unsupported bundle entry type: ${path}`);
       return {
         path,
         type: "file",
-        sha256: createHash("sha256").update(readFileSync(absolute)).digest("hex"),
+        sha256: createHash("sha256").update(readFileSync(join(directory, path))).digest("hex"),
       };
     })
     .sort((left, right) => left.path.localeCompare(right.path));
@@ -252,8 +268,8 @@ export async function stageReproducibleDist(command, args, platform = process.pl
     assertDistClean();
     await build(commands, command, args, first);
     await build(commands, command, args, second);
-    const firstManifest = manifest(first);
-    const secondManifest = manifest(second);
+    const firstManifest = bundleManifest(first);
+    const secondManifest = bundleManifest(second);
     if (JSON.stringify(firstManifest) !== JSON.stringify(secondManifest)) {
       throw new Error("release bundle is not reproducible: two isolated builds produced different manifests");
     }
@@ -267,7 +283,7 @@ export async function stageReproducibleDist(command, args, platform = process.pl
       publicationStarted = true;
       rmSync(dist, { recursive: true, force: true });
       cpSync(first, dist, { recursive: true, force: true });
-      if (JSON.stringify(manifest(dist)) !== JSON.stringify(firstManifest)) {
+      if (JSON.stringify(bundleManifest(dist)) !== JSON.stringify(firstManifest)) {
         throw new Error("installed release bundle differs from the validated candidate");
       }
       const classification = checkDist(dist);
