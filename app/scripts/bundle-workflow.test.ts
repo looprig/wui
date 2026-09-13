@@ -80,6 +80,7 @@ function trackedJavaScript(root: string): string {
 type BuildMode =
   | "deterministic"
   | "nondeterministic"
+  | "nondeterministic-filename"
   | "placeholder"
   | "symlink-absolute-same"
   | "symlink-absolute-different"
@@ -139,8 +140,17 @@ const marker = process.env.BUNDLE_TEST_MODE === "nondeterministic" ? String(coun
 const index = process.env.BUNDLE_TEST_MODE === "placeholder"
   ? "placeholder"
   : '<script type="module" src="/assets/app.js"></script>';
+// The asset's NAME varies per build in nondeterministic-filename, while every
+// byte in the bundle stays identical -- index.html deliberately keeps pointing
+// at the fixed /assets/app.js so the ONLY difference between the two builds is
+// the entry's path. This models Vite, which names assets by content hash, so a
+// genuinely nondeterministic SPA build shows up as a RENAME far more often than
+// as the same filename with different bytes.
+const assetName = process.env.BUNDLE_TEST_MODE === "nondeterministic-filename"
+  ? "assets/app-" + count + ".js"
+  : "assets/app.js";
 writeFileSync(resolve(out, "index.html"), index);
-writeFileSync(resolve(out, "assets/app.js"), 'export const marker = "' + marker + '";');
+writeFileSync(resolve(out, assetName), 'export const marker = "' + marker + '";');
 // Stands in for vite.config.ts's bundleManifestPlugin: every build writes the
 // marker into its own --outDir, and the release flag is an input to the build.
 if (process.env.BUNDLE_TEST_MARKER !== "absent") {
@@ -742,6 +752,55 @@ describe("bundle release workflow", () => {
     expect(run("git", ["status", "--porcelain=v1", "--", "dist"], clone)).toBe("");
   });
 
+  /**
+   * The PATH axis of the same comparison, which the content case above cannot
+   * reach.
+   *
+   * `bundleManifest` compares three axes -- path, type and sha256 -- and
+   * `stageReproducibleDist` compares the whole sorted entry list. Until this
+   * case, only the content axis was rowed: narrowing the comparison to
+   * `map((entry) => entry.sha256)` survived all 53 tests in this file, so
+   * nothing here discriminated a build that renamed its output. That is the
+   * wrong axis to leave open, because Vite names assets by content hash and a
+   * rename is the likeliest signature of a real nondeterministic build.
+   *
+   * The fixture holds every byte fixed and moves only the name, so the two
+   * builds produce an IDENTICAL multiset of sha256 values in an identical
+   * sorted order. A comparison that looked only at content would see two equal
+   * bundles and publish one of them.
+   *
+   * The third axis, `type`, deliberately gets no case, and the reason is that
+   * NO case could kill a mutant that drops it. `bundleManifest` emits exactly
+   * two kinds -- `{path, type: "directory"}` and `{path, type: "file", sha256}`
+   * -- and throws on every other entry kind, so `type` and the PRESENCE of
+   * `sha256` are the same bit written twice. For any two manifests it can
+   * produce, comparing `{path, sha256}` yields the same verdict as comparing
+   * `{path, type, sha256}`: two entries that differ in type differ in whether
+   * `sha256` is there at all. Dropping `type` is therefore an EQUIVALENT
+   * mutant, not a coverage gap, and equivalent mutants cannot be killed.
+   *
+   * Measured rather than reasoned, and the measurement corrected the reasoning:
+   * that mutant was first predicted to die on the content case above, was run,
+   * and SURVIVED 54/54 -- which is what equivalence looks like. If
+   * `bundleManifest` ever grows a third entry kind, or emits `sha256` for a
+   * non-file, this paragraph stops being true and the axis needs a real case.
+   */
+  it("release-dist rejects a build that renames its output, with every byte identical", () => {
+    const clone = cloneWithCurrentWorkflow();
+    const expected = manifest(clone);
+    const env = installFakeReleaseTools(clone, "nondeterministic-filename");
+
+    const result = spawnSync("make", ["release-dist"], { cwd: clone, env, encoding: "utf8" });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("not reproducible");
+    // Both builds ran: a refusal that short-circuited after one would pass the
+    // assertions above for the wrong reason.
+    expect(readFileSync(env.BUNDLE_TEST_COUNT!, "utf8")).toBe("2");
+    expect(manifest(clone)).toEqual(expected);
+    expect(run("git", ["status", "--porcelain=v1", "--", "dist"], clone)).toBe("");
+  });
+
   it("refuses to overwrite caller dist changes before it starts building", () => {
     const clone = cloneWithCurrentWorkflow();
     writeFileSync(join(clone, "dist/index.html"), "caller change");
@@ -805,7 +864,6 @@ describe("bundle release workflow", () => {
       expectPristineDist(clone, interrupted.expected);
       expect(existsSync(interrupted.env.BUNDLE_TEST_LATE_TEMP!)).toBe(false);
     },
-    20_000,
   );
 
   it("retains ownership when a gate leader exits as interruption arrives", async () => {
@@ -819,7 +877,7 @@ describe("bundle release workflow", () => {
     expect(existsSync(interrupted.env.BUNDLE_TEST_LATE_TEMP!)).toBe(false);
     expect(readdirSync(interrupted.temporaryRoot).filter((entry) => entry.startsWith("looprig-wui-release-dist-")))
       .toStrictEqual([]);
-  }, 20_000);
+  });
 
   it.each(["SIGHUP", "SIGINT", "SIGTERM"] as const)(
     "cleans temporary output when directly interrupted during build one with %s",
@@ -833,7 +891,6 @@ describe("bundle release workflow", () => {
         .toStrictEqual([]);
       expect(interrupted.result).toStrictEqual({ code: signalExitCode[signal], signal: null });
     },
-    20_000,
   );
 
   it.each([

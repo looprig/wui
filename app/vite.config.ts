@@ -265,6 +265,14 @@ export default defineConfig((env) => ({
           // and more on a loaded one. Eleven of its cases failed here at the
           // default while passing 28/28 at 60 s, so the cap was measuring the
           // machine rather than the script.
+          //
+          // This is the ONLY cap those cases get, and it must stay that way. A
+          // per-case third argument to `it`/`it.each` OVERRIDES this value, and
+          // seven interrupt cases carried a leftover 20_000 from before this
+          // line existed -- reintroducing the exact failure mode it was raised
+          // to remove. They were measured red here at load 62 (SIGTERM took
+          // 27.5 s against the 20 s cap) and the caps were removed. Do not add
+          // a per-case timeout to this project; move this number instead.
           testTimeout: 120_000,
         },
       },
