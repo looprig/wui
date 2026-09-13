@@ -18,13 +18,22 @@ import (
 // require touching this test, which is where a reviewer is told the marker
 // consumers read has changed.
 //
-// Release is deliberately NOT pinned here, and that is not a softened
-// assertion. `make release-dist` runs `go test -race` against the tree it has
-// just installed over dist/, and that tree's manifest says release: a literal
-// false would make the release target fail its own gate, and a literal true
-// would fail on every development commit. What is actually invariant about the
-// flag is that it must match the tree it describes, which is
-// TestEmbeddedBundleReleaseClaimMatchesItsTree below.
+// Release IS pinned here, by the same literal rule, and that is a change of
+// premise rather than a tightening. It used to be excluded for a stated reason:
+// "a literal false would make the release target fail its own gate, and a
+// literal true would fail on every development commit". The first half still
+// holds. The second half assumed the committed bundle is ordinarily a
+// development build -- true until task U6.0-shipdist, which installed a
+// `make release-dist` bundle as the tree this repository ships from here on.
+// The module zip is source-only, so the committed tree IS the artefact every
+// consumer embeds; it does not revert to a development build between releases,
+// and a commit that made it one would be the defect, not the norm.
+//
+// So the literal is `true`, and what it catches is the accident that is now the
+// realistic one: an ordinary `npm run build` overwrites dist/ with a marker
+// saying release=false (the plugin reads WUI_BUNDLE_RELEASE, which only
+// `make release-dist` sets), and that downgrade reaches a commit. `make
+// dist-reset` restores the committed bundle.
 func TestBundleProtocolVersionReadsEmbeddedManifest(t *testing.T) {
 	t.Parallel()
 
@@ -38,6 +47,9 @@ func TestBundleProtocolVersionReadsEmbeddedManifest(t *testing.T) {
 	if got.ProtocolVersion != "0.1.0" {
 		t.Errorf("BundleProtocolVersion().ProtocolVersion = %q, want %q", got.ProtocolVersion, "0.1.0")
 	}
+	if !got.Release {
+		t.Errorf("BundleProtocolVersion().Release = false, want true: the committed bundle is the shipped release artefact (task U6.0-shipdist); run `make dist-reset` if a development build overwrote it")
+	}
 	if got.SessionwireVersion != 1 {
 		t.Errorf("BundleProtocolVersion().SessionwireVersion = %d, want %d", got.SessionwireVersion, 1)
 	}
@@ -48,17 +60,40 @@ func TestBundleProtocolVersionReadsEmbeddedManifest(t *testing.T) {
 // U5.3), and Factory's default command refuses it on that basis (runbook 05,
 // task A9.2).
 //
-// Stated as an implication rather than as "the committed marker says false",
-// because both shapes are legitimate trees for this repository to hold: a
-// development commit carries whatever bundle was last force-added, and a
-// release commit carries one `make release-dist` built and verified. What is
-// never legitimate is the placeholder claiming to be a release, and that is
+// Stated as implications rather than as an equality, because the marker's value
+// alone does not distinguish a legitimate tree from an illegitimate one. What
+// is never legitimate is the placeholder claiming to be a release, and that is
 // what a consumer would have no way to detect for itself -- it sees the marker,
 // never the tree.
 //
 // The check is on the parsed marker rather than on the file's bytes: a consumer
 // never sees the bytes, and a reader that silently defaulted Release to true
 // would pass a bytes-level assertion.
+//
+// WHAT THIS TEST USED TO ASSERT, AND WHY IT NO LONGER CAN. Until task
+// U6.0-shipdist it required `marker.Release == (WUI_BUNDLE_RELEASE == "1")`,
+// an EQUALITY, on the premise that the committed bundle is a development build
+// except during a release run. U6.0-shipdist installed a `make release-dist`
+// bundle as the committed tree, which is what makes wui shippable at all --
+// the module zip is source-only, so whatever is committed under dist/ is what
+// every consumer embeds. Under that premise the equality is not merely weak,
+// it is WRONG in the reverse direction: it makes `GOWORK=off make check` and
+// `GOWORK=off go test ./...` -- the workspace's own standalone verification --
+// fail for every developer and every CI run on a correct release tree. It was
+// measured failing exactly that way before being replaced.
+//
+// The surviving direction is the one that is still invariant: a release run
+// must produce a marker that claims a release. That catches the wiring defect
+// release-dist.mjs's assertReleaseMarker catches from the Node side, from the
+// Go side, and it is silent about a release marker outside a release run --
+// which is now the ordinary state of this repository.
+//
+// The accident the dropped direction was aimed at ("a marker committed with
+// release: true from an ordinary npm run build") is not lost: it is now covered
+// better, and by its actual mechanism, in
+// TestBundleProtocolVersionReadsEmbeddedManifest. An ordinary build writes
+// release=FALSE, so the realistic downgrade is a false marker on a committed
+// tree, and a literal pin is what sees it.
 func TestEmbeddedBundleReleaseClaimMatchesItsTree(t *testing.T) {
 	t.Parallel()
 
@@ -70,32 +105,71 @@ func TestEmbeddedBundleReleaseClaimMatchesItsTree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("treeCarriesBuiltOutput: %v", err)
 	}
-	if got.Release && !built {
-		t.Fatalf(
-			"the embedded tree holds only %s and the manifest, yet its marker claims a release build",
-			bundleIndexPath,
-		)
-	}
-
-	// The implication above is satisfied by ANY marker over a built tree, and
-	// the committed tree is built -- so a hand-edited `"release": true` over a
-	// development bundle passes it. Inside this repository there is a signal
-	// that separates the two, even though a consumer at rest has none:
 	// `make release-dist` sets WUI_BUNDLE_RELEASE=1 on the node process
 	// (Makefile) and release-dist.mjs spawns this very `go test` with
 	// {...process.env}, so the variable is present in the environment of a
 	// release run's test and absent in every other run.
-	//
-	// This does not claim to defend against someone who sets the variable
-	// deliberately; nothing short of a signature does, and that is out of
-	// scope. It catches the realistic accident -- a marker committed with
-	// release: true from an ordinary `npm run build` -- on every developer run
-	// and every CI run, while staying green inside the release itself.
-	if want := os.Getenv(bundleReleaseEnv) == "1"; got.Release != want {
-		t.Fatalf(
-			"the embedded marker says release=%t, but %s=%q says this is release build=%t",
-			got.Release, bundleReleaseEnv, os.Getenv(bundleReleaseEnv), want,
-		)
+	if fault := releaseClaimFault(got.Release, built, os.Getenv(bundleReleaseEnv) == "1"); fault != "" {
+		t.Fatalf("embedded bundle: %s (marker release=%t, tree built=%t, %s=%q)",
+			fault, got.Release, built, bundleReleaseEnv, os.Getenv(bundleReleaseEnv))
+	}
+}
+
+// releaseClaimFault names why a release claim is incoherent with the tree it
+// describes and the run observing it, or returns "" when it is coherent.
+//
+// Extracted from the assertion above so the rule is a value a table can cross
+// rather than a branch only ever reached with one input: //go:embed fixes the
+// embedded tree at compile time, so the live test can exercise exactly one of
+// the eight combinations and could not tell a correct rule from `return ""`.
+func releaseClaimFault(claimsRelease, treeIsBuilt, releaseRun bool) string {
+	if claimsRelease && !treeIsBuilt {
+		return "the tree holds only " + bundleIndexPath + " and the manifest, yet its marker claims a release build"
+	}
+	if releaseRun && !claimsRelease {
+		return "a release run installed a tree whose marker does not claim a release, so " + bundleReleaseEnv + " did not reach the build"
+	}
+	return ""
+}
+
+// TestReleaseClaimFaultCrossesEveryCombination pins the rule at every point,
+// including the two the live assertion can never visit and the one this repo
+// deliberately stopped calling a fault.
+func TestReleaseClaimFaultCrossesEveryCombination(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		claimsRelease bool
+		treeIsBuilt   bool
+		releaseRun    bool
+		wantFault     bool
+	}{
+		{name: "placeholder claiming a release, outside a release run", claimsRelease: true, treeIsBuilt: false, releaseRun: false, wantFault: true},
+		{name: "placeholder claiming a release, inside a release run", claimsRelease: true, treeIsBuilt: false, releaseRun: true, wantFault: true},
+		{name: "release run whose marker does not claim a release", claimsRelease: false, treeIsBuilt: true, releaseRun: true, wantFault: true},
+		{name: "release run over a placeholder with no claim: reported as the flag fault", claimsRelease: false, treeIsBuilt: false, releaseRun: true, wantFault: true},
+		{name: "release run over a built tree that claims a release", claimsRelease: true, treeIsBuilt: true, releaseRun: true},
+		{
+			// The combination the old equality called a fault. It is the
+			// committed state of this repository after task U6.0-shipdist, and
+			// calling it a fault made every ordinary check run red.
+			name:          "committed release bundle read outside a release run",
+			claimsRelease: true, treeIsBuilt: true, releaseRun: false,
+		},
+		{name: "development build outside a release run", claimsRelease: false, treeIsBuilt: true, releaseRun: false},
+		{name: "no-Node placeholder making no claim", claimsRelease: false, treeIsBuilt: false, releaseRun: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := releaseClaimFault(tt.claimsRelease, tt.treeIsBuilt, tt.releaseRun)
+			if (got != "") != tt.wantFault {
+				t.Fatalf("releaseClaimFault(%t, %t, %t) = %q, want a fault = %t",
+					tt.claimsRelease, tt.treeIsBuilt, tt.releaseRun, got, tt.wantFault)
+			}
+		})
 	}
 }
 
