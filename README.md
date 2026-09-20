@@ -2,23 +2,31 @@
 
 The reusable **web** user interface for [looprig](https://github.com/looprig/harness),
 and the browser counterpart to [`tui`](https://github.com/looprig/tui): a React 19 +
-Vite SPA built to a static bundle, `//go:embed`-ed in the consumer's binary, served
-next to harness's own `pkg/serve` routes. There is no backend-for-frontend — the
-process serving the UI is the process holding the rig.
+Vite SPA built to a static bundle and embedded in the consumer's binary. The
+active browser path injects `wui.Assets()` into Factory's public listener;
+Factory reaches a Host over internal HostLink. The browser process need not
+hold the rig. `harness/pkg/serve` plus `wui.Handler` remains a deprecated
+compatibility path for published consumers.
 
 ## Go API
 
 ```go
 func Assets() http.Handler                                       // the SPA alone
 func Guard(next http.Handler, opts ...GuardOption) http.Handler  // Host/Origin guard
-func Handler(api http.Handler, opts ...Option) http.Handler      // the composed default
+func Handler(api http.Handler, opts ...Option) http.Handler      // deprecated compatibility adapter
 func BundleProtocolVersion() (Bundle, error)                     // what the embedded bundle speaks
 ```
+
+Deprecated Harness serve composition (existing consumers only):
 
 ```go
 api := serve.Handler(rig, catalogreader.New(catalog, store))
 h   := wui.Handler(api)   // /v1/ -> api, / -> SPA, Host/Origin guard over all of it
 ```
+
+New browser compositions pass `wui.Assets()` to Factory's UI-handler option
+and let Factory own authentication, origin/CSRF checks, REST, and ClientLink.
+WUI does not supply a login service or durable session store.
 
 The serving surface is `http.Handler` in, `http.Handler` out, and no exported name
 here comes from another looprig module. `BundleProtocolVersion` is the one function
@@ -49,11 +57,12 @@ pin; use `go get`.
 
 ## Security
 
-`harness/pkg/serve` has no `Origin` or `Host` check, and loopback binding alone does
-not stop DNS rebinding. `Handler` therefore wraps everything in a `Host`/`Origin`
+The deprecated `harness/pkg/serve` path has no `Origin` or `Host` check, and
+loopback binding alone does not stop DNS rebinding. `Handler` wraps it in a `Host`/`Origin`
 guard and applies a synchronizer-token CSRF check to the state-changing API routes
 only — never to the whole mux, which would turn every mutating request into a
 blanket 403 before routing resolved. `GET /v1/csrf-token` delivers the token.
+With `Assets()` under Factory, Factory owns those request checks.
 
 ## Building
 

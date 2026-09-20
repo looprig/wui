@@ -118,7 +118,12 @@ srv := &http.Server{
 
 **Shell commands** — Never pass user input to `exec.Command` as a shell string. Always pass args as separate parameters.
 
-wui does not implement command tools, and it makes no policy decision. It renders what `harness/pkg/serve` streams and forwards what the user answers, and stays independent of concrete tool and sandbox packages.
+wui does not implement command tools, and it makes no policy decision. Its
+active SPA speaks the Core `sessionwire/v1` contract and is served as
+`wui.Assets()` by Factory, which owns browser authentication, REST, and
+ClientLink. The `wui.Handler` adapter and its Harness-era fixtures are frozen
+deprecated compatibility for existing consumers. WUI remains independent of
+concrete tool and sandbox packages.
 
 **File paths** — Always call `filepath.Clean` and verify the result stays within the expected root before opening files from user-supplied paths.
 
