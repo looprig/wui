@@ -196,6 +196,45 @@ describe("ClientLink", () => {
     expect(refused.link.state).toBe("disconnected");
   });
 
+  it("reports a transport drop and the automatic re-subscribe so the join repairs (no replay exists)", async () => {
+    // centrifuge-js moves a subscription to `subscribing` on a socket drop and
+    // re-subscribes by itself: no `unsubscribed`, no `error`. Factory keeps no
+    // replay, so records committed meanwhile are never delivered.
+    const { link, transport } = setup();
+    const errors: Error[] = [];
+    const binding = link.subscribe({
+      tenantId: "tenant-1", sessionId: "session-1",
+      onPublication: () => undefined, onReset: () => undefined, onError: (error) => errors.push(error),
+    });
+    const sub = transport.subscriptions[0]!.sub;
+    sub.emit("subscribing", { code: 0, reason: "subscribe called" }); // the initial subscribe is not a drop
+    sub.emit("subscribed", {});
+    await binding.ready;
+    expect(errors).toStrictEqual([]);
+
+    transport.emit("disconnected", { code: 3, reason: "transport closed" });
+    sub.emit("subscribing", { code: 3, reason: "transport closed" });
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(RealtimeTransportError);
+    sub.emit("subscribed", {});
+    expect(errors).toHaveLength(1); // one repair per interruption
+  });
+
+  it("repairs on a second `subscribed` even if the drop itself was never observed", async () => {
+    const { link, transport } = setup();
+    const errors: Error[] = [];
+    const binding = link.subscribe({
+      tenantId: "tenant-1", sessionId: "session-1",
+      onPublication: () => undefined, onReset: () => undefined, onError: (error) => errors.push(error),
+    });
+    const sub = transport.subscriptions[0]!.sub;
+    sub.emit("subscribed", {});
+    await binding.ready;
+    sub.emit("subscribed", {});
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.message).toContain("resubscribed");
+  });
+
   it("authorizes one opaque session channel and validates publication/reset callbacks", async () => {
     const { link, transport, credentials } = setup();
     const publications: unknown[] = [];

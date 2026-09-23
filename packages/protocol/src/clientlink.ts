@@ -345,8 +345,30 @@ class CentrifugeClientLink implements ClientLink {
       if (error === undefined) resolveReady();
       else rejectReady(error);
     };
-    transportSubscription.on("subscribed", () => {
-      if (readySettled) return;
+    // A transport drop does NOT end a Centrifuge subscription: the client
+    // moves it to `subscribing` and re-subscribes by itself once the socket is
+    // back, emitting no `unsubscribed` and no `error`. Factory keeps no replay
+    // for the new binding (recovery is off), so every record committed while
+    // the socket was down is simply never delivered, and the next live record
+    // would be appended above that hole. Both transitions are therefore
+    // reported through `onError` once the subscription has been authorized, so
+    // the join repairs from its committed cursor: `subscribing` as soon as the
+    // drop is seen (the view stops claiming to be live), and a second
+    // `subscribed` as the backstop if the drop was never observed.
+    let interrupted = false;
+    const interruption = (reason: string, context: unknown): void => {
+      if (!authorized || interrupted) return;
+      interrupted = true;
+      options.onError?.(new RealtimeTransportError(reason, undefined, { cause: context }));
+    };
+    transportSubscription.on("subscribing", (context: unknown) => {
+      interruption("subscription interrupted by a transport drop", context);
+    });
+    transportSubscription.on("subscribed", (context: unknown) => {
+      if (readySettled) {
+        interruption("resubscribed after a transport interruption", context);
+        return;
+      }
       authorized = true;
       settleReady();
     });
