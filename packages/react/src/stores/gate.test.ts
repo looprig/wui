@@ -110,7 +110,7 @@ test("a response carries the action verbatim and the gate's own open event id", 
     commandId: "cmd-1",
   });
 
-  expect(link.rpcCalls[0]!.method).toBe("session.gate.respond");
+  expect(link.rpcCalls[0]!.method).toBe("gate.respond");
   expect(link.rpcCalls[0]!.request).toStrictEqual({
     version: 1,
     command_id: "cmd-1",

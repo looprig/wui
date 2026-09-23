@@ -139,7 +139,7 @@ describe("ClientLink", () => {
     expect(transport.connectCalls).toBe(1);
     expect(constructed).toHaveLength(1);
     expect(constructed[0]?.endpoint).toBe("/v1/realtime");
-    expect(constructed[0]?.options.data).toStrictEqual({ supported_versions: [1] });
+    expect(constructed[0]?.options.data).toStrictEqual({ supported_versions: [1], protocol_version: "1" });
 
     transport.state = "connected";
     transport.emit("connected", { client: "sdk-private", transport: "websocket", data: { version: 1 } });
@@ -175,6 +175,25 @@ describe("ClientLink", () => {
     await expect(connected).rejects.toBeInstanceOf(ContractValidationError);
     expect(transport.disconnectCalls).toBe(1);
     expect(link.state).toBe("disconnected");
+  });
+
+  it("accepts Factory's ClientLink reply and refuses one naming another ClientLink protocol", async () => {
+    // factory/internal/realtime/clientlink answers a connect with
+    // {protocol_version, factory_version}, not Core's {version}.
+    const accepted = setup();
+    const connected = accepted.link.connect();
+    accepted.transport.state = "connected";
+    accepted.transport.emit("connected", { data: { protocol_version: "1", factory_version: "v0.10.0" } });
+    await expect(connected).resolves.toStrictEqual({ version: 1 });
+    expect(accepted.link.state).toBe("connected");
+
+    const refused = setup();
+    refused.transport.emitDisconnectedOnDisconnect = true;
+    const mismatched = refused.link.connect();
+    refused.transport.emit("connected", { data: { protocol_version: "2", factory_version: "v9.0.0" } });
+    await expect(mismatched).rejects.toBeInstanceOf(RealtimeTransportError);
+    expect(refused.transport.disconnectCalls).toBe(1);
+    expect(refused.link.state).toBe("disconnected");
   });
 
   it("authorizes one opaque session channel and validates publication/reset callbacks", async () => {

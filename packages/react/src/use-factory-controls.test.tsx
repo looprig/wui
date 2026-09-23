@@ -222,7 +222,7 @@ const CONTROLS = [
   },
   {
     name: "gate",
-    method: "session.gate.respond",
+    method: "gate.respond",
     fire: (c: Controls): Promise<CommandResult> =>
       c.gate.respond(c.gate.gates[0]!, GATE_APPROVAL_ACTIONS.approve),
     again: (c: Controls): Promise<CommandResult> =>
@@ -438,7 +438,7 @@ test("a session's three controls do not contend with each other either", async (
   expect(h.link.rpcCalls.map((call) => call.method)).toStrictEqual([
     "session.input",
     "session.interrupt",
-    "session.gate.respond",
+    "gate.respond",
   ]);
   for (const call of h.link.rpcCalls) call.settle();
   await expect(composing).resolves.toMatchObject({ outcome: "accepted", commandId: "cmd-1" });

@@ -1,4 +1,5 @@
 import {
+  CoreInvalidRequestError,
   errorFromCoreEnvelope,
   MalformedResponseError,
   NetworkError,
@@ -38,8 +39,38 @@ export interface FactoryPageOptions extends RequestOptions {
 }
 
 export interface FactoryJournalOptions extends FactoryPageOptions {
-  /** A bounded tail-first read. Mutually exclusive with cursor. */
+  /** A bounded tail-first read. Mutually exclusive with cursor and fromSeq. */
   tail?: number;
+  /**
+   * A bounded FORWARD read starting at this journal sequence (Factory's
+   * `from_seq`). The page captures the tip at read time, and its `next_cursor`
+   * continues that one capture. Mutually exclusive with cursor and tail.
+   *
+   * This is how a view RESUMES from the sequence it last committed, so a
+   * reconnect shows every public event since that checkpoint rather than only
+   * the newest tail window.
+   */
+  fromSeq?: number;
+}
+
+/**
+ * Whether a journal read that carried a continuation `cursor` was refused
+ * because Factory does not honour that cursor for this session.
+ *
+ * Journal cursors are opaque, and Factory is free to change their encoding: a
+ * Host session's cursor is a `j1.` wrapper bound to the public session and its
+ * binding, so a cursor minted before a Factory upgrade (or before the session
+ * was re-bound) is answered `400 invalid_request` — "the cursor is not one this
+ * session issued; restart the walk". The only correct response is the one the
+ * message names: drop the cursor and start the walk again from a position the
+ * caller still knows (the tail, the beginning, or a committed sequence).
+ *
+ * Only meaningful for a read that sent a cursor. Every other parameter this
+ * package sends is validated before it leaves, so on such a read
+ * `invalid_request` names the cursor.
+ */
+export function isRejectedJournalCursor(cause: unknown): boolean {
+  return cause instanceof CoreInvalidRequestError;
 }
 
 export interface ObjectRangeOptions extends RequestOptions {
@@ -70,9 +101,10 @@ export interface FactoryRestOptions {
   credentials?: FactoryRestCredentials;
 }
 
-function query(options: FactoryPageOptions & { tail?: number }): string {
+function query(options: FactoryPageOptions & { tail?: number; fromSeq?: number }): string {
   const params = new URLSearchParams();
   if (options.cursor !== undefined) params.set("cursor", options.cursor);
+  if (options.fromSeq !== undefined) params.set("from_seq", String(options.fromSeq));
   if (options.limit !== undefined) params.set("limit", String(options.limit));
   if (options.tail !== undefined) params.set("tail", String(options.tail));
   const encoded = params.toString();
@@ -100,7 +132,12 @@ export class FactoryRestReads implements FactoryReads {
   private readonly credentials: FactoryRestCredentials;
 
   constructor(options: FactoryRestOptions = {}) {
-    this.fetchImpl = options.fetch ?? fetch;
+    // BOUND. A browser's `fetch` is a Window method: stored bare and called
+    // as `this.fetchImpl(...)` it runs with this object as its receiver and
+    // throws "Illegal invocation" before any request leaves — which the catch
+    // below reports as a NetworkError. Node's fetch does not check its
+    // receiver, so only a real browser against a real Factory ever saw it.
+    this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.baseUrl = normalizedBase(options.baseUrl);
     this.credentials = options.credentials ?? {};
   }
@@ -141,6 +178,14 @@ export class FactoryRestReads implements FactoryReads {
   async readJournal(sessionId: string, options: FactoryJournalOptions = {}): Promise<PublicJournalPage> {
     if (options.cursor !== undefined && options.tail !== undefined) {
       throw new RangeError("journal cursor and tail are mutually exclusive");
+    }
+    if (options.fromSeq !== undefined) {
+      if (options.cursor !== undefined || options.tail !== undefined) {
+        throw new RangeError("journal fromSeq is mutually exclusive with cursor and tail");
+      }
+      if (!Number.isSafeInteger(options.fromSeq) || options.fromSeq < 0) {
+        throw new RangeError("journal fromSeq must be a non-negative safe integer");
+      }
     }
     return validatePublicJournalPage(
       await this.getJSON(`/v1/sessions/${encodeURIComponent(sessionId)}/journal${query(options)}`, options.signal),

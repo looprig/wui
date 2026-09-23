@@ -66,7 +66,7 @@ describe("Factory retry-stable commands", () => {
       { method: "session.input", request: { version: 1, command_id: "cmd-input", session_id: "session-1", blocks: [{ type: "text", text: "continue" }] } },
       { method: "session.interrupt", request: { version: 1, command_id: "cmd-interrupt", session_id: "session-1" } },
       { method: "session.restore", request: { version: 1, command_id: "cmd-restore", session_id: "session-1" } },
-      { method: "session.gate.respond", request: { version: 1, command_id: "cmd-gate", session_id: "session-1", gate_id: "gate-1", action: "answer", values: { answer: "yes", count: 2 }, expected_open_event_id: "event-6" } },
+      { method: "gate.respond", request: { version: 1, command_id: "cmd-gate", session_id: "session-1", gate_id: "gate-1", action: "answer", values: { answer: "yes", count: 2 }, expected_open_event_id: "event-6" } },
     ]);
 
     for (const operation of pending) {
@@ -238,5 +238,23 @@ describe("Factory retry-stable commands", () => {
     expect(() => commands.respondResidentGate("session-1", input as unknown as ResidentGateResponseInput)).toThrow(
       "exactly one",
     );
+  });
+});
+
+describe("the command resolver's default fetch", () => {
+  it("is called with the global receiver, as a browser's Window.fetch requires", async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = function strictFetch(this: unknown): Promise<Response> {
+      if (this !== globalThis && this !== undefined) {
+        return Promise.reject(new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation"));
+      }
+      return Promise.resolve(new Response(JSON.stringify(accepted("command-1")), { status: 200 }));
+    } as typeof fetch;
+    try {
+      const commands = createFactoryCommands({ link: fakeLink([]), idGenerator: ids("command-1") });
+      await expect(commands.interrupt("session-1").resolve()).resolves.toStrictEqual(accepted("command-1"));
+    } finally {
+      globalThis.fetch = original;
+    }
   });
 });

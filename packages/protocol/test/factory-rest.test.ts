@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { FactoryRestReads } from "../src/factory-rest.js";
+import { FactoryRestReads, isRejectedJournalCursor } from "../src/factory-rest.js";
 import {
   CoreProtocolError,
   MalformedResponseError,
@@ -417,5 +417,67 @@ describe("FactoryRestReads browser identity bootstrap", () => {
   ])("rejects a bootstrap body outside the exact bounded DTO: %o", async (body) => {
     const reads = new FactoryRestReads({ fetch: async () => new Response(JSON.stringify(body)) });
     await expect(reads.readBootstrap()).rejects.toBeInstanceOf(MalformedResponseError);
+  });
+});
+
+describe("FactoryRestReads journal positions", () => {
+  const page = { journal_tip: 9, covered_through: 9, events: [] };
+
+  it("sends a forward read as Factory's from_seq, never combined with a cursor or tail", async () => {
+    const urls: string[] = [];
+    const reads = new FactoryRestReads({
+      fetch: async (url) => {
+        urls.push(url);
+        return new Response(JSON.stringify(page));
+      },
+    });
+    await reads.readJournal("session-1", { fromSeq: 7, limit: 16 });
+    expect(urls).toStrictEqual(["/v1/sessions/session-1/journal?from_seq=7&limit=16"]);
+    await expect(reads.readJournal("session-1", { fromSeq: 7, cursor: "j1.x" })).rejects.toBeInstanceOf(RangeError);
+    await expect(reads.readJournal("session-1", { fromSeq: 7, tail: 4 })).rejects.toBeInstanceOf(RangeError);
+    await expect(reads.readJournal("session-1", { fromSeq: -1 })).rejects.toBeInstanceOf(RangeError);
+    expect(urls).toHaveLength(1);
+  });
+
+  it("classifies Factory's refusal of a cursor it did not issue as a restartable walk", async () => {
+    const reads = new FactoryRestReads({
+      fetch: async () => new Response(JSON.stringify({
+        version: 1,
+        error: {
+          code: "invalid_request",
+          message: "the cursor is not one this session issued; restart the walk",
+          retryable: false,
+        },
+      }), { status: 400, headers: { "Content-Type": "application/json" } }),
+    });
+    const refusal = await reads.readJournal("session-1", { cursor: "c2.pre-upgrade" }).catch((cause: unknown) => cause);
+    expect(refusal).toBeInstanceOf(CoreProtocolError);
+    expect(isRejectedJournalCursor(refusal)).toBe(true);
+    expect(isRejectedJournalCursor(new NetworkError("offline"))).toBe(false);
+    expect(isRejectedJournalCursor(new CoreProtocolError({
+      version: 1, error: { code: "session_not_found", retryable: false },
+    }))).toBe(false);
+  });
+});
+
+describe("the default fetch", () => {
+  it("is called with the global receiver, as a browser's Window.fetch requires", async () => {
+    // A browser's fetch throws "Illegal invocation" when called with any other
+    // receiver; Node's does not, so this stub restores the browser's check.
+    const original = globalThis.fetch;
+    const receivers: unknown[] = [];
+    globalThis.fetch = function strictFetch(this: unknown): Promise<Response> {
+      receivers.push(this);
+      if (this !== globalThis && this !== undefined) {
+        return Promise.reject(new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation"));
+      }
+      return Promise.resolve(new Response(JSON.stringify({ tenant_id: "tenant-1" })));
+    } as typeof fetch;
+    try {
+      await expect(new FactoryRestReads().readBootstrap()).resolves.toStrictEqual({ tenant_id: "tenant-1" });
+      expect(receivers).toHaveLength(1);
+    } finally {
+      globalThis.fetch = original;
+    }
   });
 });

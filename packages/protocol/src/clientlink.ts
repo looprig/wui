@@ -215,6 +215,39 @@ function transportError(error: unknown): Error {
   return new RealtimeTransportError(message, code, { cause: error });
 }
 
+/**
+ * The ClientLink APPLICATION protocol this package speaks, as Factory's
+ * ClientLink names it (`factory/internal/realtime/clientlink.ProtocolVersion`).
+ *
+ * Factory decides a handshake on `protocol_version` alone and answers
+ * `{ protocol_version, factory_version }`. Every released Factory refuses a
+ * connect that does not name it (Centrifuge disconnect, no reply), which is
+ * what every wui <= v0.2.0 bundle did: it sent only Core's
+ * `{ supported_versions: [1] }` and so never reached realtime against a real
+ * Factory. Both members are sent now: Factory's decoder ignores the one it
+ * does not read, and a test double that speaks Core's negotiation still works.
+ */
+export const CLIENTLINK_PROTOCOL_VERSION = "1";
+
+/**
+ * The negotiated wire version from a connect reply: Factory's
+ * `{ protocol_version: "1", factory_version }`, or Core's
+ * `VersionNegotiationResponse`. A reply naming another ClientLink protocol is
+ * refused rather than read as Core's shape.
+ */
+function negotiatedFromConnectReply(data: unknown): VersionNegotiationResponse {
+  if (typeof data === "object" && data !== null && !Array.isArray(data) && "protocol_version" in data) {
+    const protocol = (data as Record<string, unknown>)["protocol_version"];
+    if (protocol !== CLIENTLINK_PROTOCOL_VERSION) {
+      throw new RealtimeTransportError(
+        `Factory speaks ClientLink protocol ${JSON.stringify(protocol)}, this client speaks ${CLIENTLINK_PROTOCOL_VERSION}`,
+      );
+    }
+    return validateVersionNegotiationResponse({ version: 1 });
+  }
+  return validateVersionNegotiationResponse(data);
+}
+
 class CentrifugeClientLink implements ClientLink {
   private readonly transport: ClientLinkTransport;
   private readonly credentials: ClientLinkCredentials;
@@ -230,7 +263,7 @@ class CentrifugeClientLink implements ClientLink {
     this.credentials = options.credentials ?? {};
     const endpoint = options.endpoint ?? "/v1/realtime";
     this.transport = options.transportFactory(endpoint, {
-      data: { supported_versions: [1] },
+      data: { supported_versions: [1], protocol_version: CLIENTLINK_PROTOCOL_VERSION },
       ...(options.credentials?.connectionToken === undefined
         ? {}
         : { getToken: () => options.credentials!.connectionToken!() }),
@@ -242,7 +275,7 @@ class CentrifugeClientLink implements ClientLink {
       this.currentState = "connected";
       try {
         const data = typeof context === "object" && context !== null && "data" in context ? context.data : undefined;
-        this.negotiated = validateVersionNegotiationResponse(data);
+        this.negotiated = negotiatedFromConnectReply(data);
         this.pendingConnect?.resolve(this.negotiated);
       } catch (error) {
         this.currentState = "disconnected";

@@ -24,7 +24,7 @@ export type FactoryCommandMethod =
   | "session.input"
   | "session.interrupt"
   | "session.restore"
-  | "session.gate.respond";
+  | "gate.respond";
 
 export interface CommandEnvelope {
   readonly version: 1;
@@ -153,7 +153,12 @@ class RestCommandResolver implements CommandResolver {
   private readonly credentials: FactoryRestCredentials;
 
   constructor(options: Pick<FactoryCommandsOptions, "fetch" | "baseUrl" | "credentials">) {
-    this.fetchImpl = options.fetch ?? fetch;
+    // BOUND. A browser's `fetch` is a Window method: stored bare and called
+    // as `this.fetchImpl(...)` it runs with this object as its receiver and
+    // throws "Illegal invocation" before any request leaves — which the catch
+    // below reports as a NetworkError. Node's fetch does not check its
+    // receiver, so only a real browser against a real Factory ever saw it.
+    this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.baseUrl = normalizedBase(options.baseUrl);
     this.credentials = options.credentials ?? {};
   }
@@ -337,7 +342,9 @@ export function createFactoryCommands(options: FactoryCommandsOptions): FactoryC
           ? { expected_open_journal_seq: input.expectedOpenJournalSeq! }
           : { expected_open_event_id: otherID(input.expectedOpenEventId, "expected_open_event_id") }),
       };
-      return new PendingCommand("session.gate.respond", request, options.link, resolver);
+      // Factory's ClientLink method name (`clientlink.MethodGateRespond`). wui
+      // <= v0.2.0 sent "session.gate.respond", which no Factory serves.
+      return new PendingCommand("gate.respond", request, options.link, resolver);
     },
   };
 }
