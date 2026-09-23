@@ -123,7 +123,7 @@ export function SessionsPage({ transport, onOpenSession }: SessionsPageProps): R
                 <SessionRow
                   key={session.session_id}
                   session={session}
-                  href={`/sessions/${session.session_id}`}
+                  href={`/sessions/${encodeURIComponent(session.session_id)}`}
                   onActivate={() => onOpenSession(session.session_id)}
                 />
               ))}

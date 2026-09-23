@@ -1136,3 +1136,77 @@ test("a gate opened live, after the page was read, is attested by a re-read", as
   expect(h.view.current?.gates?.gates[0]?.answerability).toBe("resident");
   expect(h.reads.of("listGates").length).toBeGreaterThan(listed);
 });
+
+test("a slow gate re-read never replaces the newer page a repair already adopted", async () => {
+  let parked: ((page: PublicGatePage) => void) | undefined;
+  let refreshStarted = false;
+  let hang = false;
+  const h = await mountFactoryView({
+    props: { gateRefreshMs: 20 },
+    setup: (_link, reads) => {
+      setPage(reads, 4, [4]);
+      reads.gates = gatePage(4, "unavailable");
+      const list = reads.listGates.bind(reads);
+      let calls = 0;
+      reads.listGates = async (sessionId, options = {}) => {
+        calls += 1;
+        // Call 1 is the cold read and call 2 the join's own; call 3 is the
+        // first timed refresh, which is parked until the test releases it.
+        if (calls === 3) {
+          refreshStarted = true;
+          return new Promise<PublicGatePage>((resolve) => { parked = resolve; });
+        }
+        // Once the newer page is in, later reads never answer, so a stale
+        // adoption could not be healed by a following refresh.
+        if (hang) return new Promise<PublicGatePage>(() => undefined);
+        return list(sessionId, options);
+      };
+    },
+  });
+  await liveReady(h, 4);
+  await expect.poll(() => refreshStarted).toBe(true);
+
+  // A repair generation reads a NEWER page, which says resident.
+  h.reads.gates = gatePage(4, "resident");
+  h.link.open.at(-1)!.fail(new Error("transport interrupted"));
+  await expect.poll(() => h.view.current?.gates?.gates[0]?.answerability).toBe("resident");
+  hang = true;
+
+  // The older, parked read now lands with the stale answer: it must lose.
+  parked!(gatePage(4, "unavailable"));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  expect(h.view.current?.gates?.gates[0]?.answerability).toBe("resident");
+});
+
+test("a Host session whose /status tip reads 0 still renders its cold capture", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    reads.status = { ...reads.status, journal_tip: 0 };
+    reads.page = { journal_tip: 5, covered_through: 5, events: [publicEvent(3), publicEvent(5)] };
+  } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([3, 5]);
+  expect(h.view.current?.status?.journal_tip).toBe(5);
+});
+
+test("an unchanged transient gate is re-read with a doubling backoff, and unmount stops the timer", async () => {
+  const h = await mountFactoryView({
+    props: { gateRefreshMs: 40 },
+    setup: (_link, reads) => {
+      setPage(reads, 4, [4]);
+      reads.gates = gatePage(4, "unavailable");
+    },
+  });
+  await liveReady(h, 4);
+  await expect.poll(() => h.reads.of("listGates").length, { timeout: 5000 }).toBeGreaterThanOrEqual(6);
+  const times = h.reads.of("listGates").slice(2).map((call) => call.at);
+  const gaps = times.slice(1).map((at, index) => at - times[index]!);
+  // 40 → 80 → 160 → 320: each wait at least the one before, and the later
+  // ones clearly longer than the base.
+  expect(gaps.at(-1)!).toBeGreaterThan(gaps[0]! * 2.5);
+
+  const before = h.reads.of("listGates").length;
+  await h.unmount();
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  expect(h.reads.of("listGates").length).toBe(before);
+});
