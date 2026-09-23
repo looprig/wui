@@ -216,20 +216,24 @@ export class FactoryFake {
   #journal(url: URL, response: ServerResponse): void {
     const tail = url.searchParams.get("tail");
     const cursor = url.searchParams.get("cursor");
-    // A real Factory cannot answer both at once, and neither does this. The
-    // REST client refuses the combination client-side; refusing it here too is
-    // what makes that guard's absence observable rather than invisible.
-    if (tail !== null && cursor !== null) {
-      this.#error(response, 400, "invalid_argument", "tail and cursor are mutually exclusive");
+    const fromSeq = url.searchParams.get("from_seq");
+    // A real Factory cannot answer two positions at once, and neither does
+    // this. The REST client refuses the combination client-side; refusing it
+    // here too is what makes that guard's absence observable rather than
+    // invisible.
+    if ([tail, cursor, fromSeq].filter((value) => value !== null).length > 1) {
+      this.#error(response, 400, "invalid_argument", "tail, cursor and from_seq are mutually exclusive");
       return;
     }
     const pages = this.#currentScript().pages;
     let page: PublicJournalPage | undefined;
     if (cursor === null) {
-      if (tail === null) {
-        // Sequence-zero replay is exactly what U2.1 removed. Refusing it here
-        // means a regression to `journal?after=0` fails as a Factory refusal.
-        this.#error(response, 400, "invalid_argument", "an opening journal read must be a bounded tail");
+      // An opening read is a bounded tail, or a RESUME one past a committed
+      // cursor. Sequence-zero replay is exactly what U2.1 removed: refusing a
+      // bare read, and a from_seq at the head, means a regression to
+      // `journal?after=0` fails as a Factory refusal.
+      if (tail === null && (fromSeq === null || !(Number(fromSeq) > 1))) {
+        this.#error(response, 400, "invalid_argument", "an opening journal read must be a bounded tail or a resume");
         return;
       }
       this.#issuedCursors.clear();

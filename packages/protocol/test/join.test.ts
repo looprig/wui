@@ -41,6 +41,7 @@ import {
   type LiveFrameSource,
 } from "../src/join.js";
 import type { ClientSubscription, SubscribeOptions } from "../src/clientlink.js";
+import { CoreInvalidRequestError } from "../src/errors.js";
 import type { ReadHistoryOptions } from "../src/transport.js";
 import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "../src/sse.js";
 import type { EventEnvelope, EventJournalPage, StatusEvent } from "../src/types.js";
@@ -433,7 +434,7 @@ it("a failed journal read aborts its generation's still-pending status read", as
   }
 });
 
-type JournalRequest = { tail?: number; limit?: number; cursor?: string; signal?: AbortSignal };
+type JournalRequest = { tail?: number; limit?: number; cursor?: string; fromSeq?: number; signal?: AbortSignal };
 
 /**
  * Answers a scripted sequence of journal pages — one per read, ACROSS
@@ -925,15 +926,31 @@ describe("joinFactorySessionView", () => {
     await gen.return();
   });
 
-  it("repairs when the projection and the tail page disagree about the tip", async () => {
+  it("takes the journal tip from the page when the projection disagrees (a Host session's status reads 0)", async () => {
+    // Factory answers /status for a Host (disposition) session from the
+    // catalog, which keeps no journal tip, and /journal from the runtime
+    // journal. Requiring the two to agree repaired every generation forever.
     const reads = new ScriptedFactoryReads([
-      { status: factoryStatus(6), page: { journal_tip: 5, covered_through: 5, events: [] } },
+      { status: factoryStatus(0), page: { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] } },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { repairDelayMs: 0 });
+    const projection = await factoryNext(gen);
+    expect(projection).toMatchObject({ kind: "projection", generation: 1, coveredThrough: 0 });
+    expect(projection.status.journal_tip).toBe(5);
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 1, coveredThrough: 5 });
+    expect(link.links).toHaveLength(1);
+    await gen.return();
+  });
+
+  it("still repairs a projection for another session", async () => {
+    const reads = new ScriptedFactoryReads([
+      { status: { ...factoryStatus(5), session_id: "session-2" }, page: { journal_tip: 5, covered_through: 5, events: [] } },
       { status: factoryStatus(5), page: { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] } },
     ]);
     const link = new ScriptedFactoryLink();
     const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { repairDelayMs: 0 });
     expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 0 });
-    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 5 });
     await gen.return();
   });
 
@@ -1279,6 +1296,178 @@ describe("joinFactorySessionView", () => {
     await expect(pending).resolves.toMatchObject({ done: true });
     expect(reads.journalOptions[1]!.signal?.aborted).toBe(true);
     expect(link.unsubscribed).toBe(1);
+  });
+});
+
+// --- Released-stack behaviour: resume, gap resets, opaque cursors ------------
+
+/** Answers each journal read from a function of its request, recording it. */
+class RoutedJournalReads implements FactoryJoinReads {
+  readonly journalOptions: JournalRequest[] = [];
+  constructor(
+    private readonly status: () => FactorySessionStatus,
+    private readonly journal: (request: JournalRequest, index: number) => PublicJournalPage,
+  ) {}
+  async readStatus(): Promise<FactorySessionStatus> {
+    return this.status();
+  }
+  async readJournal(_sessionId: string, options: JournalRequest = {}): Promise<PublicJournalPage> {
+    this.journalOptions.push(options);
+    return this.journal(options, this.journalOptions.length - 1);
+  }
+}
+
+/** Factory's answer to a cursor it did not issue: 400 invalid_request, "restart the walk". */
+function rejectedCursor(): CoreInvalidRequestError {
+  return new CoreInvalidRequestError({
+    version: 1,
+    error: {
+      code: "invalid_request",
+      message: "the cursor is not one this session issued; restart the walk",
+      retryable: false,
+    },
+  });
+}
+
+/** Drains the generator's `public` events until one reaches `through`. */
+async function publicUntil(gen: AsyncGenerator<FactoryJoinEvent>, through: number): Promise<FactoryJoinEvent[]> {
+  const seen: FactoryJoinEvent[] = [];
+  for (;;) {
+    const event = await factoryNext(gen);
+    seen.push(event);
+    if (event.kind !== "projection" && event.coveredThrough >= through) return seen;
+  }
+}
+
+describe("joinFactorySessionView against the released Factory/Host stack", () => {
+  it("resumes a committed cursor with a forward read, so a gap wider than one tail window is not skipped", async () => {
+    // The checkpoint is at 3, the tip is at 40 and the window is 4. A tail
+    // read would capture (36, 40] and silently advance the cursor over 4..36.
+    const reads = new RoutedJournalReads(() => factoryStatus(40), (request) => {
+      if (request.fromSeq === 4) {
+        return { journal_tip: 40, covered_through: 20, events: [publicEvent(4), publicEvent(20)], next_cursor: "j1.a.b" };
+      }
+      if (request.cursor === "j1.a.b") {
+        return { journal_tip: 40, covered_through: 40, events: [publicEvent(33), publicEvent(40)] };
+      }
+      throw new Error(`unexpected read ${JSON.stringify(request)}`);
+    });
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 3, tailLimit: 4, repairDelayMs: 0,
+    });
+    const events = await publicUntil(gen, 40);
+    expect(events.filter((event) => event.kind === "public").map((event) => event.coveredThrough))
+      .toStrictEqual([4, 20, 33, 40]);
+    expect(reads.journalOptions[0]).toMatchObject({ fromSeq: 4, limit: 4 });
+    expect("tail" in reads.journalOptions[0]!).toBe(false);
+    expect(reads.journalOptions[1]).toMatchObject({ cursor: "j1.a.b", limit: 4 });
+    await gen.return();
+  });
+
+  it("repairs a mid-stream gap reset forward from the committed cursor and continues live", async () => {
+    // A Host session's live tail skipped 6..8 and Factory reset viewers to the
+    // REAL journal tip (9). The replacement generation must read 6..9 from the
+    // journal — not a tail window — and then apply the next live record.
+    let generation = 0;
+    const reads = new RoutedJournalReads(() => factoryStatus(generation === 1 ? 5 : 9), (request) => {
+      if (request.tail !== undefined) return { journal_tip: 5, covered_through: 5, events: [publicEvent(5)] };
+      if (request.fromSeq === 6) {
+        return { journal_tip: 9, covered_through: 9, events: [publicEvent(6), publicEvent(8), publicEvent(9)] };
+      }
+      throw new Error(`unexpected read ${JSON.stringify(request)}`);
+    });
+    const link: ScriptedFactoryLink = new ScriptedFactoryLink();
+    const counting: FactoryJoinLink = { subscribe: (options) => { generation += 1; return link.subscribe(options); } };
+    const gen = joinFactorySessionView(reads, counting, "tenant-1", "session-1", { repairDelayMs: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 1, coveredThrough: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 1, coveredThrough: 5 });
+
+    const repairing = gen.next();
+    link.links[0]!.reset({
+      type: "session.reset", tenant_id: "tenant-1", session_id: "session-1", last_contiguous: 9, journal_tip: 9,
+    });
+    expect(await factoryResult(repairing)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 5 });
+    const replayed = [await factoryNext(gen), await factoryNext(gen), await factoryNext(gen)];
+    expect(replayed.map((event) => event.kind === "public" ? event.event.journal_seq : -1)).toStrictEqual([6, 8, 9]);
+    // A reset ABOVE the cursor never moves it: only a lower floor does.
+    expect(reads.journalOptions[1]).toMatchObject({ fromSeq: 6 });
+
+    const live = gen.next();
+    link.links[1]!.publish(publication(10));
+    expect(await factoryResult(live)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 10 });
+    await gen.return();
+  });
+
+  it("restarts the walk when Factory refuses a continuation cursor (400), never replaying the stale cursor", async () => {
+    // Pre-v0.9.0 cursors (`c2.`) and a `j1.` cursor minted for an older binding
+    // are both answered 400 invalid_request. The next generation starts over.
+    const reads = new RoutedJournalReads(() => factoryStatus(6), (request, index) => {
+      if (request.cursor === "c2.stale") throw rejectedCursor();
+      if (index === 0) return { journal_tip: 6, covered_through: 2, events: [publicEvent(2)], next_cursor: "c2.stale" };
+      return { journal_tip: 6, covered_through: 6, events: [publicEvent(2), publicEvent(6)] };
+    });
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { tailLimit: 8, repairDelayMs: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 0 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 2 });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 6 });
+    expect(reads.journalOptions.map((request) => request.cursor)).toStrictEqual([undefined, "c2.stale", undefined]);
+    expect(reads.journalOptions[2]).toMatchObject({ tail: 8 });
+    expect(link.links[0]!.unsubscribed).toBe(1);
+    await gen.return();
+  });
+
+  it("restarts a refused cursor from the COMMITTED sequence once one exists", async () => {
+    const reads = new RoutedJournalReads(() => factoryStatus(12), (request) => {
+      if (request.cursor === "j1.old") throw rejectedCursor();
+      if (request.fromSeq === 5 && reads.journalOptions.length === 1) {
+        return { journal_tip: 12, covered_through: 7, events: [publicEvent(7)], next_cursor: "j1.old" };
+      }
+      if (request.fromSeq === 5) return { journal_tip: 12, covered_through: 12, events: [publicEvent(7), publicEvent(12)] };
+      throw new Error(`unexpected read ${JSON.stringify(request)}`);
+    });
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 4, repairDelayMs: 0,
+    });
+    const events = await publicUntil(gen, 12);
+    expect(events.at(-1)).toMatchObject({ kind: "public", generation: 2, coveredThrough: 12 });
+    expect(reads.journalOptions.map((request) => request.fromSeq ?? request.cursor))
+      .toStrictEqual([5, "j1.old", 5]);
+    await gen.return();
+  });
+
+  it("commits a forward capture's attested prefix when it runs out of budget, and resumes past it", async () => {
+    const reads = new RoutedJournalReads(() => factoryStatus(9), (request) => {
+      if (request.fromSeq === 3) return { journal_tip: 9, covered_through: 4, events: [publicEvent(4)], next_cursor: "j1.p1" };
+      if (request.cursor === "j1.p1") return { journal_tip: 9, covered_through: 6, events: [publicEvent(6)], next_cursor: "j1.p2" };
+      if (request.fromSeq === 7) return { journal_tip: 9, covered_through: 9, events: [publicEvent(9)] };
+      throw new Error(`unexpected read ${JSON.stringify(request)}`);
+    });
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 2, maxTailPages: 2, maxRepairAttempts: 1, repairDelayMs: 0,
+    });
+    const events = await publicUntil(gen, 9);
+    expect(events.map((event) => `${event.kind}@${event.generation}:${event.coveredThrough}`)).toStrictEqual([
+      "projection@1:2", "public@1:4", "public@1:6", "projection@2:6", "public@2:9",
+    ]);
+    // `j1.p2` is never followed: it belonged to the refused capture.
+    expect(reads.journalOptions.map((request) => request.fromSeq ?? request.cursor)).toStrictEqual([3, "j1.p1", 7]);
+    await gen.return();
+  });
+
+  it("never commits a TAIL capture's prefix over budget: its prefix is not contiguous with any cursor", async () => {
+    const reads = new TailPageReads(factoryStatus(9), [
+      { journal_tip: 9, covered_through: 6, events: [publicEvent(6)], next_cursor: "cursor-1" },
+      { journal_tip: 9, covered_through: 9, events: [publicEvent(9)] },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", { maxTailPages: 1, repairDelayMs: 0 });
+    const first = await factoryNext(gen);
+    expect(first).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 0 });
+    await gen.return();
   });
 });
 

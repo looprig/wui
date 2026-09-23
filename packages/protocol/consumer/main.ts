@@ -368,17 +368,18 @@ async function main(): Promise<void> {
     check(errors.length === 0, `the join reported errors: ${errors.map((error) => error.message).join(", ")}`);
     // U2.1's "no journal?after=0 merely to open a current view", asserted
     // POSITIVELY rather than as the absence of a string the fake would refuse
-    // anyway: every journal read this run made was either a bounded `tail`
-    // capture or a continuation of one by the cursor the previous page issued.
-    // Nothing named a sequence, so nothing could have replayed from zero.
+    // anyway: the view OPENED with a bounded `tail` capture continued by the
+    // cursor its page issued, and the repair RESUMED one past the committed
+    // cursor the reset lowered (from_seq=4) — the only sequence ever named, so
+    // nothing could have replayed from zero.
     const journalReads = factory.requests
       .filter((entry) => entry.includes("/journal?"))
       .map((entry) => entry.slice(entry.indexOf("?") + 1));
     check(journalReads.length === 3, `expected three journal reads, saw ${journalReads.length}`);
     equal(
       journalReads.map((query) => (query.includes("tail=") ? "tail" : query.includes("cursor=") ? "cursor" : query)),
-      ["tail", "cursor", "tail"],
-      "each generation opened with a bounded tail and continued only by cursor",
+      ["tail", "cursor", "from_seq=4&limit=256"],
+      "the view opened with a bounded tail continued only by cursor, and the repair resumed past the lowered cursor",
     );
 
     // ---- gates come from the durable projection ---------------------------

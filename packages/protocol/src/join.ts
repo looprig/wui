@@ -373,11 +373,12 @@ export interface CapturedTailResult {
  * ## What it will not do
  *
  * It follows the cursor the pages hand back, and NOTHING else. It never issues
- * a second `tail`, never names a sequence, and so can never restart at zero or
- * walk an entire history: the only reachable content is `(0, T]` for the ONE
- * `T` the capture began with, under three finite ceilings (`maxPages`,
- * `maxEvents`, `maxBytes`) that bound the walk even if the Factory keeps
- * offering cursors.
+ * a second read of its own, never names a sequence, and so can never restart
+ * at zero or walk an entire history: the only reachable content is `(0, T]`
+ * for the ONE `T` the capture began with, under three finite ceilings
+ * (`maxPages`, `maxEvents`, `maxBytes`) that bound the walk even if the
+ * Factory keeps offering cursors. The capture's FIRST page is the caller's:
+ * a tail read, or a forward read at a committed cursor.
  *
  * Every step is checked against the capture rather than believed:
  *
@@ -432,6 +433,29 @@ export class CapturedTail {
     return this.#step;
   }
 
+  /**
+   * The prefix of the capture that pages have ATTESTED so far: every admitted
+   * event at or below the last admitted `covered_through`, and that watermark.
+   * `undefined` before any page was admitted.
+   *
+   * This is NOT the capture's result and says nothing about `(coveredThrough,
+   * tip]`. It is only safe to commit when the capture was a FORWARD read that
+   * began exactly one past the caller's committed cursor, because then the
+   * prefix is contiguous with what the caller already holds. A `tail` capture
+   * starts at `tip - limit + 1`, so its prefix can sit above a hole — that is
+   * the fail-open case `result` exists to refuse, and `joinFactorySessionView`
+   * reads this only for a forward capture.
+   */
+  get attested(): CapturedTailResult | undefined {
+    if (this.#coveredThrough < 0) return undefined;
+    const covered = this.#coveredThrough;
+    const events = [...this.#events.entries()]
+      .filter(([sequence]) => sequence <= covered)
+      .sort(([left], [right]) => left - right)
+      .map(([, event]) => event);
+    return { events, coveredThrough: covered };
+  }
+
   /** The capture, or `undefined` until it has actually reached its tip. */
   get result(): CapturedTailResult | undefined {
     if (this.#step.kind !== "complete") return undefined;
@@ -481,6 +505,13 @@ export class CapturedTail {
 function refused(reason: CapturedTailRefusal): CapturedTailStep {
   return { kind: "refused", reason };
 }
+
+/**
+ * The refusals that mean "this capture was too BIG for one generation", not
+ * "this capture is inconsistent". Only these let a forward capture commit the
+ * prefix it attested and continue from there in the next generation.
+ */
+const BUDGET_REFUSALS: ReadonlySet<CapturedTailRefusal> = new Set(["page_budget", "event_budget", "byte_budget"]);
 
 const capturedTailEncoder = new TextEncoder();
 
@@ -583,6 +614,26 @@ async function followCapturedTail(
  * REFUSED and repaired from the last committed cursor — never committed
  * halfway, because a durable cursor over unattested coverage is the failure
  * this join exists to prevent.
+ *
+ * ## A committed cursor is resumed FORWARD, not re-tailed
+ *
+ * Once this join has committed a cursor (`initialCoveredThrough`, or anything
+ * applied since), every generation's first read is a forward read at
+ * `coveredThrough + 1` rather than a tail. The two differ exactly when the
+ * outage was longer than one tail window: a tail captures `(T - limit, T]`,
+ * and merging it above a cursor at `C < T - limit` would advance the cursor
+ * over `(C, T - limit]` without ever having read it. That is what a Host
+ * session's gap `session.reset` and every reconnect after a long disconnect
+ * would otherwise produce. A forward capture starts contiguous with the
+ * cursor, so when it runs out of budget its attested prefix is committed and
+ * the next generation continues past it (see `CapturedTail.attested`); a
+ * capture that fails any CONSISTENCY rule is still refused whole.
+ *
+ * Continuation cursors are opaque and belong to the one capture that issued
+ * them. None is ever carried into a later generation, so a cursor Factory no
+ * longer honours (a `j1.` wrapper minted before a re-placement, or a cursor
+ * from before a Factory upgrade — answered 400 `invalid_request`) costs one
+ * repair: the next generation starts a fresh walk from the committed sequence.
  */
 export async function* joinFactorySessionView(
   reads: FactoryJoinReads,
@@ -632,6 +683,7 @@ export async function* joinFactorySessionView(
     const currentGeneration = ++generation;
     // Per-generation, and captured by this generation's callbacks below.
     const generationBase = coveredThrough;
+    const forward = generationBase > 0;
     previousBase = generationBase;
     const queue = new FactorySignalQueue(maxBuffered);
     let prejoinOpen = true;
@@ -708,9 +760,20 @@ export async function* joinFactorySessionView(
       let tail: CapturedTail;
       let followed: "complete" | "repair" | "aborted";
       try {
+        // A view holding a committed cursor RESUMES from it: a forward read at
+        // `coveredThrough + 1` (Factory's `from_seq`) captures the tip at read
+        // time and its continuation cursor walks to that tip, so a reconnect
+        // after a long outage — or a `session.reset` naming a gap — re-reads
+        // every public event since the checkpoint rather than only the newest
+        // tail window, which would leave `(coveredThrough, tip - limit]` a
+        // silent hole. A view with nothing committed reads the bounded tail:
+        // opening a session never replays it from sequence zero.
+        const firstPage: FactoryJournalOptions = forward
+          ? { fromSeq: generationBase + 1, limit: tailLimit, signal: controller.signal }
+          : { tail: tailLimit, limit: tailLimit, signal: controller.signal };
         const cold = Promise.all([
           reads.readStatus(sessionId, { signal: controller.signal }),
-          reads.readJournal(sessionId, { tail: tailLimit, limit: tailLimit, signal: controller.signal }),
+          reads.readJournal(sessionId, firstPage),
         ]);
         const result = await raceGeneration(cold, queue, options.signal);
         if (typeof result === "string") {
@@ -718,11 +781,12 @@ export async function* joinFactorySessionView(
           repair = result === "repair";
           continue;
         }
-        status = validateFactorySessionStatus(result.value[0]);
         const captured = validatePublicJournalPage(result.value[1]);
-        // Checked BEFORE any continuation is paid for: a capture the status
-        // does not agree with is not worth walking.
-        if (status.session_id !== sessionId || status.journal_tip !== captured.journal_tip) {
+        // The PAGE is the authority on the journal tip; see `withJournalTip`.
+        status = withJournalTip(validateFactorySessionStatus(result.value[0]), captured.journal_tip);
+        // Checked BEFORE any continuation is paid for: a status for another
+        // session is not a projection of this capture.
+        if (status.session_id !== sessionId) {
           controller.abort();
           repair = true;
           continue;
@@ -752,6 +816,28 @@ export async function* joinFactorySessionView(
       if (followed !== "complete") {
         controller.abort();
         repair = followed === "repair";
+        if (!repair) continue;
+        // A FORWARD capture that ran out of budget before its tip still
+        // attested a contiguous prefix starting at `generationBase + 1`. Commit
+        // that prefix — it is exactly as attested as a whole capture, only
+        // shorter — so the next generation resumes past it. Without this a
+        // gap larger than one generation's budget repairs forever without
+        // progress and the join gives up; with it, every generation advances.
+        const step = tail.step;
+        const prefix = tail.attested;
+        if (forward && step.kind === "refused" && BUDGET_REFUSALS.has(step.reason)
+          && prefix !== undefined && prefix.coveredThrough > coveredThrough) {
+          yield { kind: "projection", generation: currentGeneration, status, coveredThrough };
+          for (const event of prefix.events) {
+            if (event.journal_seq <= coveredThrough) continue;
+            coveredThrough = event.journal_seq;
+            yield { kind: "public", generation: currentGeneration, status, event, coveredThrough };
+          }
+          if (prefix.coveredThrough > coveredThrough) {
+            coveredThrough = prefix.coveredThrough;
+            yield { kind: "coverage", generation: currentGeneration, status, coveredThrough };
+          }
+        }
         continue;
       }
       const captured = tail.result;
@@ -847,6 +933,23 @@ export async function* joinFactorySessionView(
     }
     if (!repair) return;
   }
+}
+
+/**
+ * `status` with its `journal_tip` replaced by the tip a journal page captured.
+ *
+ * The two reads are made by different parts of Factory, and for a Host-owned
+ * session they do not agree: Factory (<= v0.10.0) answers `/status` from the
+ * catalog, which keeps NO journal tip for a disposition session (it reads 0),
+ * while `/journal` reads the runtime's own journal through the composition's
+ * journal resolver. Requiring the two to be equal — as wui <= v0.2.0 did —
+ * repaired every generation of every Host session forever: the view never
+ * went live. Even for a legacy session the two are separate reads of a moving
+ * tip. The page's tip is the one this capture's coverage is measured against,
+ * so it is the one every consumer of the yielded status sees.
+ */
+export function withJournalTip(status: FactorySessionStatus, tip: number): FactorySessionStatus {
+  return status.journal_tip === tip ? status : { ...status, journal_tip: tip };
 }
 
 /**

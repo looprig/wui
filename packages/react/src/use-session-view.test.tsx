@@ -1,13 +1,20 @@
 import { useEffect } from "react";
 import {
   createFactoryClient,
+  CoreInvalidRequestError,
   CoreProtocolError,
   DEFAULT_MAX_TAIL_BYTES,
   DEFAULT_MAX_REPAIR_ATTEMPTS,
   DEFAULT_REPAIR_DELAY_MS,
   MAX_REPAIR_BACKOFF_FACTOR,
 } from "@looprig/protocol";
-import type { EnduringPublication, FactoryClient, FactoryClientOptions, PublicJournalPage } from "@looprig/protocol";
+import type {
+  EnduringPublication,
+  FactoryClient,
+  FactoryClientOptions,
+  PublicGatePage,
+  PublicJournalPage,
+} from "@looprig/protocol";
 import { expect, test } from "vitest";
 import { render, renderHook } from "vitest-browser-react";
 import { FakeClientLink } from "./testing/fake-link.js";
@@ -166,6 +173,7 @@ interface ViewProps {
   maxRepairAttempts?: number;
   maxTailPages?: number;
   maxTailBytes?: number;
+  gateRefreshMs?: number;
 }
 
 interface MountOptions {
@@ -200,6 +208,7 @@ async function mountFactoryView(options: MountOptions = {}): Promise<FactoryHarn
       ...(inner.maxRepairAttempts === undefined ? {} : { maxRepairAttempts: inner.maxRepairAttempts }),
       ...(inner.maxTailPages === undefined ? {} : { maxTailPages: inner.maxTailPages }),
       ...(inner.maxTailBytes === undefined ? {} : { maxTailBytes: inner.maxTailBytes }),
+      ...(inner.gateRefreshMs === undefined ? {} : { gateRefreshMs: inner.gateRefreshMs }),
     });
     useEffect(() => {
       view.current = value;
@@ -1003,4 +1012,127 @@ test("invalid bounds fail before I/O", async () => {
     [{ coveredThrough: -1 }, "coveredThrough must be a non-negative safe integer"],
   ];
   for (const [props, message] of cases) await expect(mountFactoryView({ props })).rejects.toThrow(message);
+});
+
+// --- Released-stack behaviour (factory v0.10.0, host v0.10.1, harness v0.39.1) ---
+
+function rejectedCursor(): CoreInvalidRequestError {
+  return new CoreInvalidRequestError({
+    version: 1,
+    error: {
+      code: "invalid_request",
+      message: "the cursor is not one this session issued; restart the walk",
+      retryable: false,
+    },
+  });
+}
+
+function gatePage(tip: number, answerability: "resident" | "unavailable" | "suspended", gateId = "gate-1"): PublicGatePage {
+  return {
+    journal_tip: tip,
+    open_gate_count: 1,
+    gates: [{
+      gate_id: gateId, kind: "harness.permission", prompt: { title: "Allow shell?" },
+      opened_event_id: `event-${tip}`, opened_journal_seq: tip,
+      deadline: "2026-09-23T13:00:00Z", answerability,
+    }],
+  };
+}
+
+test("an earlier-history cursor Factory refuses (400) restarts the walk from the beginning", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    setPage(reads, 9, [8, 9]);
+  } });
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(9);
+  h.reads.queue("readJournal", {
+    journal_tip: 9, covered_through: 3, events: [publicEvent(2), publicEvent(3)], next_cursor: "c2.pre-upgrade",
+  });
+  await h.view.current!.browseEarlier();
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([2, 3, 8, 9]);
+
+  // The Factory was upgraded between clicks: its cursors are `j1.` now.
+  h.reads.fail("readJournal", rejectedCursor());
+  h.reads.queue("readJournal", { journal_tip: 9, covered_through: 0, events: [] }); // consumed by the refused call
+  h.reads.queue("readJournal", {
+    journal_tip: 9, covered_through: 2, events: [publicEvent(1), publicEvent(2)], next_cursor: "j1.fresh",
+  });
+  await h.view.current!.browseEarlier();
+
+  const journal = h.reads.of("readJournal");
+  expect(journal[2]?.options.cursor).toBe("c2.pre-upgrade");
+  expect(journal[3]?.options.cursor).toBeUndefined();
+  expect(journal[3]?.options.tail).toBeUndefined();
+  expect(h.view.current?.error).toBeNull();
+  expect(h.view.current?.earlierState).toBe("available");
+  // The old window was replaced by the restarted walk, not merged with it.
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([1, 2, 8, 9]);
+
+  h.reads.queue("readJournal", { journal_tip: 9, covered_through: 7, events: [publicEvent(5)] });
+  await h.view.current!.browseEarlier();
+  expect(h.reads.of("readJournal")[4]?.options.cursor).toBe("j1.fresh");
+});
+
+test("a cold continuation cursor Factory refuses (400) recaptures the tail instead of failing the view", async () => {
+  const h = await mountFactoryView({ setup: (link, reads) => {
+    link.holdConnect = true;
+    reads.status = { ...reads.status, journal_tip: 6 };
+    reads.queue("readJournal", { journal_tip: 6, covered_through: 2, events: [publicEvent(2)], next_cursor: "c2.old" });
+    reads.page = { journal_tip: 6, covered_through: 6, events: [publicEvent(2), publicEvent(6)] };
+    const read = reads.readJournal.bind(reads);
+    reads.readJournal = async (sessionId, options = {}) => {
+      if (options.cursor === "c2.old") {
+        await read(sessionId, options);
+        throw rejectedCursor();
+      }
+      return read(sessionId, options);
+    };
+  } });
+  await expect.poll(() => h.view.current?.state).toBe("ready");
+  expect(h.view.current?.events.map((event) => event.journal_seq)).toEqual([2, 6]);
+  expect(h.view.current?.coveredThrough).toBe(6);
+  expect(h.reads.of("readJournal").map((call) => call.options.cursor ?? `tail:${call.options.tail}`))
+    .toEqual(["tail:256", "c2.old", "tail:256"]);
+});
+
+test("a gate that reads unavailable during failover is re-read until its session is resident again", async () => {
+  const h = await mountFactoryView({
+    props: { gateRefreshMs: 20 },
+    setup: (_link, reads) => {
+      setPage(reads, 4, [4]);
+      reads.gates = gatePage(4, "unavailable");
+    },
+  });
+  await liveReady(h, 4);
+  expect(h.view.current?.gates?.gates[0]?.answerability).toBe("unavailable");
+
+  // A successor Host attached; nothing is written to the journal for that.
+  h.reads.gates = gatePage(4, "resident");
+  await expect.poll(() => h.view.current?.gates?.gates[0]?.answerability).toBe("resident");
+
+  // A resident page needs no re-read: the polling stops.
+  const settled = h.reads.of("listGates").length;
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  expect(h.reads.of("listGates").length).toBe(settled);
+  expect(h.link.rpcCalls).toEqual([]);
+});
+
+test("a gate opened live, after the page was read, is attested by a re-read", async () => {
+  const h = await mountFactoryView({
+    props: { gateRefreshMs: 20 },
+    setup: (_link, reads) => setPage(reads, 2, [1, 2]),
+  });
+  await liveReady(h, 2);
+  expect(h.view.current?.gates?.gates).toEqual([]);
+  const listed = h.reads.of("listGates").length;
+
+  h.reads.gates = gatePage(3, "resident", "gate-live");
+  h.link.open[0]!.deliver({
+    type: "enduring_publication", tenant_id: TENANT, session_id: FSID,
+    event_id: "event-3", journal_seq: 3, covered_through: 3,
+    body: { type: "GateOpened", session_id: FSID, gate: { id: "gate-live", kind: "harness.permission" } },
+  });
+  await expect.poll(() => h.view.current?.gates?.gates[0]?.gate_id).toBe("gate-live");
+  expect(h.view.current?.gates?.gates[0]?.answerability).toBe("resident");
+  expect(h.reads.of("listGates").length).toBeGreaterThan(listed);
 });
