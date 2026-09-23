@@ -590,15 +590,17 @@ async function followCapturedTail(
  * off; only a stuck loop terminates, and it terminates by THROWING, so the
  * failure is reported rather than silently retried forever.
  *
- * ## `session.reset` lowers the cursor
+ * ## `session.reset` lowers the cursor only when the journal shrank
  *
- * A `session.reset` names `last_contiguous`: the greatest sequence the
- * Factory still holds contiguously. When it is BELOW this join's committed
- * `coveredThrough` the session truncated behind us, and repairing from the
- * unchanged cursor asks for coverage that no longer exists — every subsequent
- * page fails `page.covered_through < coveredThrough` and repairs again. The
- * validated reset is therefore applied as a floor on the cursor before the
- * replacement generation starts. A reset that fails validation, or that names
+ * A `session.reset` always repairs. Its `last_contiguous` describes what
+ * Factory delivered to this LINK (often 0), not the journal, so it never moves
+ * the cursor. Its `journal_tip`, when BELOW this join's committed
+ * `coveredThrough`, means the session truncated behind us, and repairing from
+ * the unchanged cursor would ask for coverage that no longer exists — every
+ * subsequent page fails `page.covered_through < coveredThrough` and repairs
+ * again. Only then is `last_contiguous` (what this link was delivered in
+ * order, never above `journal_tip`) applied as a floor on the cursor before
+ * the replacement generation starts. A reset that fails validation, or that names
  * another tenant/session, still forces a repair (matching every publication
  * path) but must NOT move the cursor.
  *
@@ -730,12 +732,23 @@ export async function* joinFactorySessionView(
         // A reset ALWAYS repairs, but only a validated reset for this exact
         // channel is allowed to move the durable cursor: a forged or
         // wrong-session frame that lowered it would re-expose already-applied
-        // sequences. See "session.reset lowers the cursor" above.
+        // sequences. See "session.reset lowers the cursor only when the journal shrank" above.
         try {
           const parsed = validateSessionReset(value);
+          // `last_contiguous` is NOT a statement about the journal: Factory
+          // names the greatest sequence it published to THIS link in an
+          // unbroken run (factory internal/routing/repair.go, deliveryBinding),
+          // which is 0 for a binding that has delivered nothing and sticks at
+          // the first sparse gap. Below the cursor it is ordinary, and lowering
+          // to it threw a view back to the tail window. The only evidence of a
+          // journal that truly shrank is a reset tip below what this join has
+          // committed. Then nothing above the in-order run this link was
+          // actually delivered can be trusted, so the floor is
+          // `last_contiguous` (Core holds it at or below `journal_tip`).
           if (token === activeToken
             && parsed.tenant_id === tenantId
-            && parsed.session_id === sessionId) {
+            && parsed.session_id === sessionId
+            && parsed.journal_tip < coveredThrough) {
             resetFloor = resetFloor === undefined
               ? parsed.last_contiguous
               : Math.min(resetFloor, parsed.last_contiguous);

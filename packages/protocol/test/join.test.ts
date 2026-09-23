@@ -1471,6 +1471,222 @@ describe("joinFactorySessionView against the released Factory/Host stack", () =>
   });
 });
 
+// --- Gate fix round: link-scoped resets, budget refusals, a journal model ------
+
+/**
+ * A journal with a real tip, sparse public records, and cursors that pin the
+ * captured tip — the shape sessionstore serves through Factory.
+ */
+class ModelJournal implements FactoryJoinReads {
+  tip = 0;
+  readonly publicSeqs = new Set<number>();
+  refuseCursorOnce = false;
+  readonly requests: JournalRequest[] = [];
+  append(count: number, isPublic: (seq: number) => boolean = () => true): void {
+    for (let index = 0; index < count; index += 1) {
+      this.tip += 1;
+      if (isPublic(this.tip)) this.publicSeqs.add(this.tip);
+    }
+  }
+  async readStatus(): Promise<FactorySessionStatus> {
+    return factoryStatus(0); // a Host session's /status tip reads 0
+  }
+  async readJournal(_sessionId: string, options: JournalRequest = {}): Promise<PublicJournalPage> {
+    this.requests.push(options);
+    const limit = options.limit ?? 256;
+    let from: number;
+    let captured = this.tip;
+    if (options.cursor !== undefined) {
+      if (this.refuseCursorOnce) {
+        this.refuseCursorOnce = false;
+        throw rejectedCursor();
+      }
+      const [, next, tip] = options.cursor.split(":");
+      from = Number(next);
+      captured = Number(tip);
+    } else if (options.fromSeq !== undefined) {
+      from = Math.max(options.fromSeq, 1);
+    } else {
+      from = this.tip >= limit ? this.tip - limit + 1 : 1;
+    }
+    let covered = Math.min(from - 1, captured);
+    const events: ReturnType<typeof publicEvent>[] = [];
+    for (let seq = from, scanned = 0; seq <= captured && scanned < limit; seq += 1, scanned += 1) {
+      covered = seq;
+      if (this.publicSeqs.has(seq)) events.push(publicEvent(seq));
+    }
+    return {
+      journal_tip: captured, covered_through: covered, events,
+      ...(covered < captured ? { next_cursor: `c:${covered + 1}:${captured}` } : {}),
+    };
+  }
+  label(request: JournalRequest): string | number {
+    return request.fromSeq ?? request.cursor ?? `tail${request.tail}`;
+  }
+}
+
+/** A view that drops rows above a LOWERED projection, as `useFactorySessionView` does. */
+function heldBy(events: FactoryJoinEvent[], initial: number[]): { held: number[]; duplicates: number[] } {
+  const held = new Set(initial);
+  const duplicates: number[] = [];
+  let coverage = Math.max(0, ...initial);
+  for (const event of events) {
+    if (event.kind === "projection" && event.coveredThrough < coverage) {
+      for (const seq of [...held]) if (seq > event.coveredThrough) held.delete(seq);
+    }
+    if (event.kind === "public") {
+      if (held.has(event.event.journal_seq)) duplicates.push(event.event.journal_seq);
+      held.add(event.event.journal_seq);
+    }
+    coverage = event.coveredThrough;
+  }
+  return { held: [...held].sort((a, b) => a - b), duplicates };
+}
+
+async function until(gen: AsyncGenerator<FactoryJoinEvent>, coverage: number, out: FactoryJoinEvent[]): Promise<void> {
+  for (;;) {
+    const event = await factoryNext(gen);
+    out.push(event);
+    if (event.coveredThrough >= coverage) return;
+  }
+}
+
+describe("joinFactorySessionView: resets are link-scoped, budgets commit, consistency never does", () => {
+  it("a reset whose last_contiguous is 0 (the link delivered nothing) never throws the view back to the tail", async () => {
+    const journal = new ModelJournal();
+    journal.append(10);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(journal, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 10, tailLimit: 8, repairDelayMs: 0,
+    });
+    const out: FactoryJoinEvent[] = [await factoryNext(gen)];
+    journal.append(90);
+    const repairing = gen.next();
+    link.links[0]!.reset({
+      type: "session.reset", tenant_id: "tenant-1", session_id: "session-1", last_contiguous: 0, journal_tip: 100,
+    });
+    out.push(await factoryResult(repairing));
+    await until(gen, 100, out);
+    await gen.return();
+    const { held, duplicates } = heldBy(out, Array.from({ length: 10 }, (_, index) => index + 1));
+    expect(held).toStrictEqual(Array.from({ length: 100 }, (_, index) => index + 1));
+    expect(duplicates).toStrictEqual([]);
+    expect(journal.requests.some((request) => request.tail !== undefined)).toBe(false);
+    expect(journal.label(journal.requests[1]!)).toBe(11);
+  });
+
+  it("a sticky last_contiguous below the cursor (sparse public records) resumes from the cursor", async () => {
+    const journal = new ModelJournal();
+    journal.append(30, (seq) => seq % 3 !== 0);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(journal, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 30, tailLimit: 8, repairDelayMs: 0,
+    });
+    const out: FactoryJoinEvent[] = [await factoryNext(gen)];
+    journal.append(20, (seq) => seq % 3 !== 0);
+    const repairing = gen.next();
+    link.links[0]!.reset({
+      type: "session.reset", tenant_id: "tenant-1", session_id: "session-1", last_contiguous: 5, journal_tip: 50,
+    });
+    out.push(await factoryResult(repairing));
+    await until(gen, 50, out);
+    await gen.return();
+    expect(journal.label(journal.requests[1]!)).toBe(31);
+    const published = out.filter((event) => event.kind === "public").map((event) => (event as { event: { journal_seq: number } }).event.journal_seq);
+    expect(published).toStrictEqual([...journal.publicSeqs].filter((seq) => seq > 30).sort((a, b) => a - b));
+  });
+
+  it("a gap far beyond budget, a refused cursor mid-walk and a racing live record deliver exactly the public set", async () => {
+    const journal = new ModelJournal();
+    journal.append(5);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(journal, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 5, tailLimit: 4, maxTailPages: 2, maxTailEvents: 6, repairDelayMs: 0, maxRepairAttempts: 3,
+    });
+    const out: FactoryJoinEvent[] = [await factoryNext(gen)];
+    journal.append(60, (seq) => seq % 7 !== 0);
+    journal.refuseCursorOnce = true;
+    const repairing = gen.next();
+    link.links[0]!.reset({
+      type: "session.reset", tenant_id: "tenant-1", session_id: "session-1", last_contiguous: 5, journal_tip: 65,
+    });
+    out.push(await factoryResult(repairing));
+    await until(gen, 65, out);
+    journal.append(1);
+    const live = gen.next();
+    link.links.at(-1)!.publish(publication(66));
+    out.push(await factoryResult(live));
+    await gen.return();
+    const published = out.filter((event) => event.kind === "public").map((event) => (event as { event: { journal_seq: number } }).event.journal_seq);
+    expect(published).toStrictEqual([...journal.publicSeqs].filter((seq) => seq > 5).sort((a, b) => a - b));
+  });
+
+  it("a reset whose journal_tip is BELOW the cursor (the journal shrank) lowers it to last_contiguous", async () => {
+    const reads = new ScriptedFactoryReads([
+      { status: factoryStatus(9), page: { journal_tip: 9, covered_through: 9, events: [] } },
+      { status: factoryStatus(6), page: { journal_tip: 6, covered_through: 6, events: [] } },
+    ]);
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 9, repairDelayMs: 0,
+    });
+    expect(await factoryNext(gen)).toMatchObject({ kind: "projection", generation: 1, coveredThrough: 9 });
+    const repairing = gen.next();
+    link.links[0]!.reset({
+      type: "session.reset", tenant_id: "tenant-1", session_id: "session-1", last_contiguous: 4, journal_tip: 6,
+    });
+    expect(await factoryResult(repairing)).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 4 });
+    expect(reads.journalOptions[1]).toMatchObject({ fromSeq: 5 });
+    await gen.return();
+  });
+
+  it.each([
+    ["event_budget", { maxTailEvents: 2 }],
+    ["byte_budget", { maxTailBytes: 300 }],
+  ] as const)("commits a forward capture's prefix on %s and resumes past it", async (_reason, bounds) => {
+    const reads = new RoutedJournalReads(() => factoryStatus(9), (request) => {
+      if (request.fromSeq === 3) return { journal_tip: 9, covered_through: 4, events: [publicEvent(4)], next_cursor: "j1.p1" };
+      if (request.cursor === "j1.p1") {
+        return { journal_tip: 9, covered_through: 7, events: [publicEvent(5), publicEvent(6), publicEvent(7)], next_cursor: "j1.p2" };
+      }
+      if (request.fromSeq === 5) return { journal_tip: 9, covered_through: 9, events: [publicEvent(5), publicEvent(9)] };
+      throw new Error(`unexpected read ${JSON.stringify(request)}`);
+    });
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 2, maxRepairAttempts: 1, repairDelayMs: 0, ...bounds,
+    });
+    const events: FactoryJoinEvent[] = [];
+    await until(gen, 9, events);
+    expect(events.map((event) => `${event.kind}@${event.generation}:${event.coveredThrough}`)).toStrictEqual([
+      "projection@1:2", "public@1:4", "projection@2:4", "public@2:5", "public@2:9",
+    ]);
+    await gen.return();
+  });
+
+  it.each([
+    ["tip_moved", { journal_tip: 12, covered_through: 12, events: [publicEvent(12)] }],
+    ["coverage_stalled", { journal_tip: 9, covered_through: 4, events: [], next_cursor: "j1.again" }],
+    ["missing_cursor", { journal_tip: 9, covered_through: 6, events: [publicEvent(6)] }],
+    ["event_conflict", { journal_tip: 9, covered_through: 9, events: [publicEvent(4, "other-event"), publicEvent(9)] }],
+  ] as const)("never partially commits a forward capture refused for %s", async (_reason, second) => {
+    const reads = new RoutedJournalReads(() => factoryStatus(9), (request, index) => {
+      if (index === 0) return { journal_tip: 9, covered_through: 4, events: [publicEvent(4)], next_cursor: "j1.p1" };
+      if (index === 1) return second as unknown as PublicJournalPage;
+      return { journal_tip: 9, covered_through: 9, events: [publicEvent(4), publicEvent(9)] };
+    });
+    const link = new ScriptedFactoryLink();
+    const gen = joinFactorySessionView(reads, link, "tenant-1", "session-1", {
+      initialCoveredThrough: 2, repairDelayMs: 0,
+    });
+    const first = await factoryNext(gen);
+    // Nothing from the refused generation: it is repaired whole.
+    expect(first).toMatchObject({ kind: "projection", generation: 2, coveredThrough: 2 });
+    expect(reads.journalOptions[2]).toMatchObject({ fromSeq: 3 });
+    await gen.return();
+  });
+});
+
 // --- 2. Multi-page cold journal ------------------------------------------------
 
 describe("joinSessionView: multi-page cold journal", () => {

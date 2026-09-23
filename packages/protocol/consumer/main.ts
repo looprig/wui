@@ -211,9 +211,11 @@ async function main(): Promise<void> {
       { events: [journalEvent(5, "second public event")], journal_tip: 7, covered_through: 7 },
     ],
   };
-  // GENERATION 2 is what a repaired join must see after `session.reset` lowers
-  // the durable cursor to 3: sequences 5 and 6 are RE-delivered, which is only
-  // possible if the cursor actually moved backwards.
+  // GENERATION 2 is what a repaired join reads after a `session.reset` whose
+  // `last_contiguous` (3) is below the cursor (8). That value is LINK-scoped —
+  // what Factory delivered to this link in an unbroken run — so it is not
+  // truncation and must not move the cursor: the repair resumes at from_seq=9
+  // and delivers only 10, never re-delivering 5 or 8.
   const generationTwo: JournalScript = {
     status: {
       session_id: SESSION,
@@ -357,8 +359,8 @@ async function main(): Promise<void> {
     const secondGeneration = snapshots.slice(snapshotsBeforeReset);
     equal(
       secondGeneration.map((snapshot) => snapshot.event?.journal_seq ?? null),
-      [null, 5, 8, 10],
-      "the repair re-delivers everything above last_contiguous, proving the cursor was LOWERED to 3",
+      [null, 10],
+      "the repair delivers only what the view lacks: a link-scoped last_contiguous never lowers the cursor",
     );
     equal(secondGeneration[0]?.status?.state, "waiting_on_gate", "the repaired projection carries the new durable status");
     check(
@@ -369,16 +371,16 @@ async function main(): Promise<void> {
     // U2.1's "no journal?after=0 merely to open a current view", asserted
     // POSITIVELY rather than as the absence of a string the fake would refuse
     // anyway: the view OPENED with a bounded `tail` capture continued by the
-    // cursor its page issued, and the repair RESUMED one past the committed
-    // cursor the reset lowered (from_seq=4) — the only sequence ever named, so
-    // nothing could have replayed from zero.
+    // cursor its page issued, and the repair RESUMED one past the
+    // committed cursor (from_seq=9) — the only sequence ever named, so nothing
+    // could have replayed from zero.
     const journalReads = factory.requests
       .filter((entry) => entry.includes("/journal?"))
       .map((entry) => entry.slice(entry.indexOf("?") + 1));
     check(journalReads.length === 3, `expected three journal reads, saw ${journalReads.length}`);
     equal(
       journalReads.map((query) => (query.includes("tail=") ? "tail" : query.includes("cursor=") ? "cursor" : query)),
-      ["tail", "cursor", "from_seq=4&limit=256"],
+      ["tail", "cursor", "from_seq=9&limit=256"],
       "the view opened with a bounded tail continued only by cursor, and the repair resumed past the lowered cursor",
     );
 
