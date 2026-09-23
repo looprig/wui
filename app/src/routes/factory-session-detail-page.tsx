@@ -9,6 +9,8 @@ import {
 } from "@looprig/protocol";
 import type { UseFactorySessionViewResult } from "@looprig/react";
 import { ToolCaptureViewer } from "../components/transcript/tool-capture-viewer";
+import { Composer } from "../components/composer";
+import { causeCommandId, type SentInput } from "../lib/own-commands";
 
 const TERMINAL_STATES = new Set(["failed", "interrupted", "stopped", "completed", "cancelled"]);
 
@@ -30,6 +32,40 @@ export interface FactoryDetailGate extends PublicGateEntry {
   readonly answerable: boolean;
 }
 
+/**
+ * What a gate card says when it offers no button. Answerability is Factory's
+ * attestation, re-read while it is transient, so these describe a state that
+ * may change on its own — above all `unavailable`, which is what a gate reads
+ * while its session has no live owner (a Host failover or release). An open
+ * gate survives that (harness >= v0.39.0), so it is shown as waiting, not gone.
+ */
+export function gateStateLabel(answerability: string): string {
+  switch (answerability) {
+    case "unavailable": return "Waiting for the session to be resident again — this gate stays open";
+    case "suspended": return "Suspended — not answerable right now";
+    case "submitted": return "Answer submitted — waiting for the agent";
+    case "expired": return "Expired";
+    case "": return "Not yet attested — checking whether it can be answered";
+    default: return "No resident action is available";
+  }
+}
+
+/** The write half of the detail page. Optional so a read-only embedding stays read-only. */
+export interface FactoryDetailComposer {
+  /** Resolves `true` when the input was admitted (the draft may be cleared). */
+  onSubmit: (text: string) => Promise<boolean>;
+  submitting: boolean;
+  error: Error | null;
+  /** Inputs this tab sent that no journal event names as its cause yet. */
+  awaiting: readonly SentInput[];
+  /** Every command id this tab admitted, to mark the events each one caused. */
+  own: ReadonlySet<string>;
+  /** An input whose delivery is unconfirmed (reply lost); retry replays the same command. */
+  unconfirmed: string | null;
+  onRetry: () => void;
+  onDiscard: () => void;
+}
+
 export interface FactorySessionDetailPageProps {
   sid: string;
   view: UseFactorySessionViewResult;
@@ -42,6 +78,7 @@ export interface FactorySessionDetailPageProps {
    */
   gates: readonly FactoryDetailGate[];
   onGateRespond?: (gateId: string, action: GateApprovalAction) => void;
+  composer?: FactoryDetailComposer;
 }
 
 interface PublicCapture {
@@ -66,7 +103,7 @@ function publicCaptures(body: unknown): PublicCapture[] {
 }
 
 /** Durable session projection. Realtime health is metadata, never a render prerequisite. */
-export function FactorySessionDetailPage({ sid, view, reads, gates, onGateRespond }: FactorySessionDetailPageProps): React.JSX.Element {
+export function FactorySessionDetailPage({ sid, view, reads, gates, onGateRespond, composer }: FactorySessionDetailPageProps): React.JSX.Element {
   if (view.status === null && view.state !== "failed") {
     return <main className="p-6"><p role="status">Loading session…</p></main>;
   }
@@ -95,9 +132,17 @@ export function FactorySessionDetailPage({ sid, view, reads, gates, onGateRespon
       <div role="log" aria-live="polite" className="min-h-0 flex-1 overflow-y-auto p-4">
         {view.events.length === 0 ? <p className="text-sm text-muted">Nothing here yet</p> : view.events.map((event) => {
           const captures = publicCaptures(event.body);
+          const cause = causeCommandId(event.body);
+          const own = cause !== "" && composer?.own.has(cause) === true;
           return (
-            <article key={event.event_id} data-testid={`factory-event-${event.journal_seq}`} className="mb-2 rounded-md border border-border bg-card p-3">
+            <article
+              key={event.event_id}
+              data-testid={`factory-event-${event.journal_seq}`}
+              data-own-command={own ? cause : undefined}
+              className="mb-2 rounded-md border border-border bg-card p-3"
+            >
               <span className="font-mono text-xs text-muted">#{event.journal_seq}</span>
+              {own ? <span data-testid="factory-event-own" className="ml-2 font-mono text-xs text-loop">you</span> : null}
               <pre className="mt-1 overflow-auto whitespace-pre-wrap font-mono text-xs">{JSON.stringify(event.body, null, 2)}</pre>
               {captures.map((entry) => (
                 <div key={`${event.event_id}:${entry.index}`} data-capture-instance={`${event.event_id}:${entry.index}`}>
@@ -107,6 +152,12 @@ export function FactorySessionDetailPage({ sid, view, reads, gates, onGateRespon
             </article>
           );
         })}
+        {composer?.awaiting.map((input) => (
+          <article key={input.commandId} data-testid="factory-awaiting-input" data-command-id={input.commandId} className="mb-2 rounded-md border border-dashed border-border p-3">
+            <span className="font-mono text-xs text-muted">sent · waiting for the agent</span>
+            <p className="mt-1 whitespace-pre-wrap text-sm">{input.text}</p>
+          </article>
+        ))}
       </div>
       {gates.length === 0 ? null : (
         <section data-testid="factory-gate-stack" className="mx-4 border-t border-border py-3">
@@ -114,7 +165,7 @@ export function FactorySessionDetailPage({ sid, view, reads, gates, onGateRespon
             <article key={gate.gateId} data-testid="factory-gate-card" className="mb-2 rounded-md border border-border bg-card p-3">
               <p className="font-medium">{gate.prompt.title === "" ? "Decision required" : gate.prompt.title}</p>
               <p className="text-sm text-muted">{gate.prompt.body}</p>
-              <p className="font-mono text-xs text-muted">{gate.kind} · {gate.answerability === "" ? "unattested" : gate.answerability}</p>
+              <p data-testid="factory-gate-answerability" className="font-mono text-xs text-muted">{gate.kind} · {gate.answerability === "" ? "unattested" : gate.answerability}</p>
               {gate.kind === "harness.permission" && gate.answerable && onGateRespond !== undefined ? (
                 <div data-testid="factory-gate-actions" className="mt-2 flex gap-2">
                   {Object.values(GATE_APPROVAL_ACTIONS).map((action) => (
@@ -125,12 +176,29 @@ export function FactorySessionDetailPage({ sid, view, reads, gates, onGateRespon
                 </div>
               ) : (
                 <p data-testid="factory-gate-unavailable" className="mt-2 text-xs text-muted">
-                  {gate.answerable ? "Answer this gate in a supported client" : "No resident action is available"}
+                  {gate.answerable ? "Answer this gate in a supported client" : gateStateLabel(gate.answerability)}
                 </p>
               )}
             </article>
           ))}
         </section>
+      )}
+      {composer === undefined ? null : (
+        <>
+          {composer.unconfirmed === null ? null : (
+            <div role="status" data-testid="composer-unconfirmed" className="mx-4 flex items-center gap-2 rounded-md border border-border p-2 text-xs">
+              <span className="flex-1">Delivery of &ldquo;{composer.unconfirmed}&rdquo; is unconfirmed.</span>
+              <button type="button" onClick={composer.onRetry} className="rounded border border-border px-2 py-1">Retry</button>
+              <button type="button" onClick={composer.onDiscard} className="rounded border border-border px-2 py-1">Discard</button>
+            </div>
+          )}
+          <Composer
+            onSubmit={composer.onSubmit}
+            submitting={composer.submitting || composer.unconfirmed !== null}
+            gateOpen={gates.length > 0}
+            error={composer.error}
+          />
+        </>
       )}
       <button
         type="button"

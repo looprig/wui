@@ -277,3 +277,38 @@ test("StrictMode's double render folds the same board once", async () => {
   await expect.poll(() => document.querySelectorAll("[data-testid=factory-gate-card]").length).toBe(1);
   await expect.element(page.getByTestId("factory-gate-stack")).toHaveTextContent("gate 2");
 });
+
+test("a gate that survives a Host failover goes unavailable and back to answerable as later pages attest it", () => {
+  // harness v0.39.0 keeps the gate open across a restore; Factory reads it
+  // `unavailable` while no Host owns the session. The board keeps the card and
+  // takes each page's attestation — last page wins — with no journal event.
+  let state = foldFactoryGateView(emptyFactoryGateBoardState(), {
+    generation: 0, sessionId: SID, page: gatePage([gateRecord(GATE_A, 3, "resident")]), events: [],
+  });
+  const answerable = (): boolean[] => publicGates(state.board).map(acceptsResidentResponse);
+  expect(answerable()).toStrictEqual([true]);
+  state = foldFactoryGateView(state, {
+    generation: 0, sessionId: SID, page: gatePage([gateRecord(GATE_A, 3, "unavailable")]), events: [],
+  });
+  expect(answerable()).toStrictEqual([false]);
+  state = foldFactoryGateView(state, {
+    generation: 0, sessionId: SID, page: gatePage([gateRecord(GATE_A, 3, "resident")]), events: [],
+  });
+  expect(answerable()).toStrictEqual([true]);
+});
+
+test("a resolve naming the PUBLIC session id closes the page's gate; a runtime-id body never could", () => {
+  // Before host v0.10.0 a Host relayed bodies carrying the RUNTIME session id,
+  // so a live GateResolved never matched the gate the page listed under the
+  // public id. Bodies now carry the public id, and the tombstone applies.
+  const RUNTIME_SID = "33333333-3333-4333-8333-333333333333";
+  const page = gatePage([gateRecord(GATE_A, 3)]);
+  const stale = foldFactoryGateView(emptyFactoryGateBoardState(), {
+    generation: 0, sessionId: SID, page, events: [resolvedEvent(GATE_A, 5, RUNTIME_SID)],
+  });
+  expect(publicGates(stale.board).filter((gate) => gate.sessionId === SID)).toHaveLength(1);
+  const current = foldFactoryGateView(emptyFactoryGateBoardState(), {
+    generation: 0, sessionId: SID, page, events: [resolvedEvent(GATE_A, 5)],
+  });
+  expect(publicGates(current.board)).toHaveLength(0);
+});

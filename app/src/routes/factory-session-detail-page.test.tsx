@@ -3,7 +3,7 @@ import { expect, test, vi } from "vitest";
 import { render } from "vitest-browser-react";
 import type { FactoryReads } from "@looprig/protocol";
 import type { UseFactorySessionViewResult } from "@looprig/react";
-import { FactorySessionDetailPage, type FactoryDetailGate } from "./factory-session-detail-page";
+import { FactorySessionDetailPage, type FactoryDetailComposer, type FactoryDetailGate } from "./factory-session-detail-page";
 
 const inertReads = {} as FactoryReads;
 
@@ -189,4 +189,61 @@ test.each(["not_authorized", "session_not_found"])("session %s invalidation unmo
   })} />);
   expect(document.querySelector("[data-testid=tool-capture-output]")).toBeNull();
   await expect.element(page.getByTestId("detail-read-error")).toBeInTheDocument();
+});
+
+test("an unavailable gate offers no answer and says it is waiting for the session, not gone", async () => {
+  render(<FactorySessionDetailPage sid="session-1" view={view()} reads={inertReads} onGateRespond={vi.fn()}
+    gates={[gate({ answerability: "unavailable", answerable: false })]} />);
+  await expect.element(page.getByTestId("factory-gate-card")).toBeInTheDocument();
+  expect(document.querySelector("[data-testid=factory-gate-actions]")).toBeNull();
+  await expect.element(page.getByTestId("factory-gate-answerability")).toHaveTextContent("unavailable");
+  await expect.element(page.getByTestId("factory-gate-unavailable"))
+    .toHaveTextContent("Waiting for the session to be resident again");
+});
+
+function composerProps(overrides: Partial<FactoryDetailComposer> = {}): FactoryDetailComposer {
+  return {
+    onSubmit: vi.fn(async () => true),
+    submitting: false,
+    error: null,
+    awaiting: [],
+    own: new Set(),
+    unconfirmed: null,
+    onRetry: vi.fn(),
+    onDiscard: vi.fn(),
+    ...overrides,
+  };
+}
+
+test("marks the events this tab's own admitted command caused, by cause.command_id", async () => {
+  const mine = "11111111-2222-4333-8444-555555555555";
+  render(<FactorySessionDetailPage sid="session-1" reads={inertReads} gates={[]} composer={composerProps({ own: new Set([mine]) })}
+    view={view({ events: [
+      { event_id: "event-1", journal_seq: 1, body: { type: "TurnStarted", cause: { command_id: mine } } },
+      { event_id: "event-2", journal_seq: 2, body: { type: "TurnStarted", cause: { command_id: "someone-else" } } },
+      { event_id: "event-3", journal_seq: 3, body: { type: "SessionIdle" } },
+    ] })} />);
+  await expect.element(page.getByTestId("factory-event-1")).toHaveAttribute("data-own-command", mine);
+  expect(page.getByTestId("factory-event-2").element().hasAttribute("data-own-command")).toBe(false);
+  expect(document.querySelectorAll("[data-testid=factory-event-own]")).toHaveLength(1);
+});
+
+test("sends input through the composer and shows it as waiting until the journal names its command", async () => {
+  const onSubmit = vi.fn(async () => true);
+  render(<FactorySessionDetailPage sid="session-1" reads={inertReads} gates={[]} view={view()}
+    composer={composerProps({ onSubmit, awaiting: [{ commandId: "command-1", text: "and then?" }] })} />);
+  await expect.element(page.getByTestId("factory-awaiting-input")).toHaveTextContent("and then?");
+  await userEvent.fill(page.getByTestId("composer-input"), "keep going");
+  await userEvent.click(page.getByTestId("composer-submit"));
+  expect(onSubmit).toHaveBeenCalledWith("keep going");
+});
+
+test("an unconfirmed input offers retry of the same command and locks a second send", async () => {
+  const onRetry = vi.fn();
+  render(<FactorySessionDetailPage sid="session-1" reads={inertReads} gates={[]} view={view()}
+    composer={composerProps({ unconfirmed: "first message", onRetry })} />);
+  await expect.element(page.getByTestId("composer-unconfirmed")).toHaveTextContent("first message");
+  await expect.element(page.getByTestId("composer-input")).toBeDisabled();
+  await userEvent.click(page.getByRole("button", { name: "Retry", exact: true }));
+  expect(onRetry).toHaveBeenCalledTimes(1);
 });
