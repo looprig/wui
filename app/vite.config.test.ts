@@ -162,7 +162,7 @@ describe("bundle manifest plugin", () => {
     const out = temporaryDirectory();
     runPlugin(out, {});
     expect(writtenManifest(out)).toEqual({
-      core_version: "v0.7.0",
+      core_version: "v0.11.0",
       protocol_version: "0.1.0",
       release: false,
       sessionwire_version: 1,

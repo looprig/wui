@@ -35,7 +35,7 @@ describe("readBundleInputs", () => {
     // hold for whatever those files happen to say, including a value drifted
     // out from under the embedded Go marker.
     expect(readBundleInputs(repository)).toEqual({
-      coreVersion: "v0.7.0",
+      coreVersion: "v0.11.0",
       protocolVersion: "0.1.0",
       sessionwireVersion: 1,
     });
@@ -127,7 +127,7 @@ describe("writeBundleManifest", () => {
     writeBundleManifest(out, { release: true, repository });
     const written = JSON.parse(readFileSync(join(out, BUNDLE_MANIFEST_NAME), "utf8"));
     expect(written).toEqual({
-      core_version: "v0.7.0",
+      core_version: "v0.11.0",
       protocol_version: "0.1.0",
       release: true,
       sessionwire_version: 1,
