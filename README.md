@@ -8,6 +8,28 @@ Factory reaches a Host over internal HostLink. The browser process need not
 hold the rig. `harness/pkg/serve` plus `wui.Handler` remains a deprecated
 compatibility path for published consumers.
 
+## Status
+
+The embedded bundle is a release bundle that works against a released Factory:
+it connects over ClientLink, lists and reads sessions from the durable journal,
+answers gates (`gate.respond`), sends input from the session detail page, and
+on reconnect resumes from its committed journal cursor. Known limit: Factory
+has no per-command status route, so the SPA cannot resolve whether an
+ambiguous (unacknowledged) command submission was admitted.
+
+A composing server should keep Factory's session-journal resolver wired (as
+Carbon does with `WithSessionJournalResolver`); without it the SPA cannot
+match a session's events to the commands it sent.
+
+## Install
+
+```sh
+go get github.com/looprig/wui@latest
+```
+
+wui sits at tier 4. Its only Looprig requirement is `github.com/looprig/core`,
+and that one is test-only (see below).
+
 ## Go API
 
 ```go
@@ -53,6 +75,8 @@ pin; use `go get`.
 - `dist/` — the `//go:embed all:dist` target; `index.html` and `looprig-bundle.json`
   are always committed, the rest is force-added onto a release commit
 - `contract/` — schemas and fixtures vendored from Core at a pinned version
+  (refresh with `make contract`)
+- `legacy-contract/` — frozen Harness-era fixtures for the deprecated `Handler` test
 - `packages/`, `app/` — the npm workspaces (protocol, React adapter, SPA)
 
 ## Security
