@@ -35,10 +35,12 @@ export interface CommandEnvelope {
 export interface CreateCommandRequest extends CommandEnvelope {
   readonly agent_id: string;
   readonly blocks?: readonly Record<string, unknown>[];
+  readonly metadata?: MessageMetadata;
 }
 
 export interface InputCommandRequest extends CommandEnvelope {
   readonly blocks: readonly Record<string, unknown>[];
+  readonly metadata?: MessageMetadata;
 }
 
 export type InterruptCommandRequest = CommandEnvelope;
@@ -117,6 +119,82 @@ function sessionID(value: string): SessionID {
 
 function otherID(value: string, field: string): string {
   return opaqueID(value, field);
+}
+
+/** Core sessionwire/v1.MessageMetadata: app-defined string fields on create or input. */
+export type MessageMetadata = Readonly<Record<string, string>>;
+export type MessageMetadataErrorCode = "too_many_fields" | "invalid_key" | "reserved_key" | "value_too_large" | "invalid_value" | "too_large";
+
+export const MAX_METADATA_FIELDS = 16;
+export const MAX_METADATA_KEY_BYTES = 64;
+export const MAX_METADATA_VALUE_BYTES = 1024;
+export const MAX_METADATA_BYTES = 4096;
+const METADATA_KEY = /^[a-z][a-z0-9_]{0,63}$/;
+
+export class MessageMetadataError extends TypeError {
+  readonly code: MessageMetadataErrorCode;
+  readonly key: string;
+
+  constructor(code: MessageMetadataErrorCode, key = "") {
+    super(key === "" ? `metadata is invalid (${code})` : `metadata field ${JSON.stringify(key)} is invalid (${code})`);
+    this.name = "MessageMetadataError";
+    this.code = code;
+    this.key = key;
+  }
+}
+
+function validMetadataValue(value: string): boolean {
+  if (!hasOnlyPairedSurrogates(value)) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit < 0x20 && unit !== 0x09 && unit !== 0x0a) return false;
+  }
+  return true;
+}
+
+/** Number of bytes Go encoding/json writes for a string, including quotes. */
+function goJSONStringBytes(value: string): number {
+  let bytes = 2;
+  for (const char of value) {
+    switch (char) {
+      case "<": case ">": case "&": case "\u2028": case "\u2029":
+        bytes += 6;
+        break;
+      case "\"": case "\\": case "\t": case "\n":
+        bytes += 2;
+        break;
+      default:
+        bytes += idEncoder.encode(char).byteLength;
+    }
+  }
+  return bytes;
+}
+
+function canonicalMetadataBytes(entries: readonly (readonly [string, string])[]): number {
+  let bytes = 2 + Math.max(entries.length - 1, 0);
+  for (const [key, value] of entries) bytes += goJSONStringBytes(key) + 1 + goJSONStringBytes(value);
+  return bytes;
+}
+
+/** Validate in Core's sorted-key and field order; return a separate copy for the retry snapshot. */
+function metadata(value: MessageMetadata | undefined): MessageMetadata | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new MessageMetadataError("invalid_value");
+  const entries = Object.entries(value);
+  if (entries.length === 0) return undefined;
+  if (entries.length > MAX_METADATA_FIELDS) throw new MessageMetadataError("too_many_fields");
+  entries.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  for (const [key, field] of entries) {
+    if (!METADATA_KEY.test(key) || idEncoder.encode(key).byteLength > MAX_METADATA_KEY_BYTES) {
+      throw new MessageMetadataError("invalid_key");
+    }
+    if (key.startsWith("looprig")) throw new MessageMetadataError("reserved_key", key);
+    if (typeof field !== "string") throw new MessageMetadataError("invalid_value", key);
+    if (idEncoder.encode(field).byteLength > MAX_METADATA_VALUE_BYTES) throw new MessageMetadataError("value_too_large", key);
+    if (!validMetadataValue(field)) throw new MessageMetadataError("invalid_value", key);
+  }
+  if (canonicalMetadataBytes(entries) > MAX_METADATA_BYTES) throw new MessageMetadataError("too_large");
+  return Object.fromEntries(Object.entries(value));
 }
 
 function blocks(value: readonly Record<string, unknown>[] | undefined, required: boolean): readonly Record<string, unknown>[] | undefined {
@@ -260,10 +338,13 @@ export type CommandAttempt<T extends FactoryCommandRequest = FactoryCommandReque
 export interface CreateCommandInput {
   agentId: string;
   blocks?: readonly Record<string, unknown>[];
+  /** App-defined audit fields; Factory stamps the sender separately. */
+  metadata?: MessageMetadata;
 }
 
 export interface InputCommandInput {
   blocks: readonly Record<string, unknown>[];
+  metadata?: MessageMetadata;
 }
 
 export type ResidentGateResponseInput = {
@@ -302,17 +383,27 @@ export function createFactoryCommands(options: FactoryCommandsOptions): FactoryC
   });
   return {
     create(input) {
+      const fields = metadata(input.metadata);
+      const agent = otherID(input.agentId, "agent_id");
+      const body = input.blocks === undefined ? undefined : blocks(input.blocks, false);
       const request: CreateCommandRequest = {
         version: 1,
         command_id: commandID(generate()),
         session_id: sessionID(generate()),
-        agent_id: otherID(input.agentId, "agent_id"),
-        ...(input.blocks === undefined ? {} : { blocks: blocks(input.blocks, false) }),
+        agent_id: agent,
+        ...(body === undefined ? {} : { blocks: body }),
+        ...(fields === undefined ? {} : { metadata: fields }),
       };
       return new PendingCommand("session.create", request, options.link, resolver);
     },
     input(target, input) {
-      const request: InputCommandRequest = { ...envelope(target), blocks: blocks(input.blocks, true)! };
+      const fields = metadata(input.metadata);
+      const body = blocks(input.blocks, true)!;
+      const request: InputCommandRequest = {
+        ...envelope(target),
+        blocks: body,
+        ...(fields === undefined ? {} : { metadata: fields }),
+      };
       return new PendingCommand("session.input", request, options.link, resolver);
     },
     interrupt(target) {

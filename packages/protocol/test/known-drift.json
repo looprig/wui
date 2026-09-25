@@ -61,7 +61,7 @@
     "test/blocks.test.ts": 24,
     "test/conformance.test.ts": 40,
     "test/clientlink.test.ts": 16,
-    "test/commands.test.ts": 19,
+    "test/commands.test.ts": 23,
     "test/contract.test.ts": 78,
     "test/enduring.test.ts": 62,
     "test/errors.test.ts": 15,

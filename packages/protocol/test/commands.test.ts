@@ -3,7 +3,9 @@ import {
   CommandIdentityError,
   CommandIdentityMismatchError,
   createFactoryCommands,
+  MessageMetadataError,
   type CommandID,
+  type MessageMetadata,
   type ResidentGateResponseInput,
   type SessionID,
 } from "../src/commands.js";
@@ -14,7 +16,7 @@ import {
   RealtimeTransportError,
   RequestAbortedError,
 } from "../src/errors.js";
-import { ContractValidationError } from "../src/validate.js";
+import { ContractValidationError, validateFactory } from "../src/validate.js";
 
 const accepted = (command_id: string): CommandStatus => ({
   command_id,
@@ -256,5 +258,69 @@ describe("the command resolver's default fetch", () => {
     } finally {
       globalThis.fetch = original;
     }
+  });
+});
+
+describe("message metadata on create and input", () => {
+  it("sends optional metadata after blocks while absent metadata keeps the old bytes", () => {
+    const commands = createFactoryCommands({ link: fakeLink([]), idGenerator: ids("c1", "s1", "c2", "c3") });
+    const metadata: MessageMetadata = { space: "family", client: "oxy-ios" };
+    const create = commands.create({ agentId: "agent-1", blocks: [{ type: "text", Text: "hi" }], metadata });
+    const input = commands.input("s1", { blocks: [{ type: "text", Text: "more" }], metadata });
+    const bare = commands.input("s1", { blocks: [{ type: "text", Text: "plain" }] });
+    expect(create.request.metadata).toStrictEqual(metadata);
+    expect(input.bytes).toBe('{"version":1,"command_id":"c2","session_id":"s1","blocks":[{"type":"text","Text":"more"}],"metadata":{"space":"family","client":"oxy-ios"}}');
+    expect(bare.bytes).toBe('{"version":1,"command_id":"c3","session_id":"s1","blocks":[{"type":"text","Text":"plain"}]}');
+    expect(() => validateFactory("create_request", create.request)).not.toThrow();
+    expect(() => validateFactory("input_request", input.request)).not.toThrow();
+    expect(() => validateFactory("input_request", bare.request)).not.toThrow();
+  });
+
+  it("never sends a caller-supplied principal", () => {
+    const commands = createFactoryCommands({ link: fakeLink([]), idGenerator: ids("c1", "s1", "c2") });
+    const principal = { tenant: "acme", subject: "someone-else", kind: "actor" };
+    const create = commands.create({ agentId: "agent-1", principal } as never);
+    const input = commands.input("s1", { blocks: [{ type: "text", Text: "x" }], principal } as never);
+    expect(create.request).not.toHaveProperty("principal");
+    expect(input.request).not.toHaveProperty("principal");
+  });
+
+  it("rejects Core-invalid metadata before minting an identity", () => {
+    const generate = vi.fn(() => "id");
+    const commands = createFactoryCommands({ link: fakeLink([]), idGenerator: generate });
+    const cases: Array<[MessageMetadata, string]> = [
+      [Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`k${i}`, "v"])), "too_many_fields"],
+      [{ Space: "x" }, "invalid_key"],
+      [{ ["k".repeat(65)]: "x" }, "invalid_key"],
+      [{ looprig_x: "x" }, "reserved_key"],
+      [{ note: "x".repeat(1025) }, "value_too_large"],
+      [{ note: "a\u0000b" }, "invalid_value"],
+      [{ note: "a\u0007b" }, "invalid_value"],
+      [{ note: "\ud800" }, "invalid_value"],
+      [Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`k${i}`, "<".repeat(170)])), "too_large"],
+    ];
+    for (const [fields, code] of cases) {
+      expect(() => commands.input("s1", { blocks: [{ type: "text", Text: "x" }], metadata: fields }))
+        .toThrowError(MessageMetadataError);
+      try {
+        commands.input("s1", { blocks: [{ type: "text", Text: "x" }], metadata: fields });
+      } catch (error) {
+        expect((error as MessageMetadataError).code).toBe(code);
+      }
+    }
+    expect(generate).not.toHaveBeenCalled();
+  });
+
+  it("accepts Core boundaries and omits an empty metadata object", () => {
+    const commands = createFactoryCommands({ link: fakeLink([]), idGenerator: ids("c1", "c2") });
+    const edge: MessageMetadata = {
+      ["a".repeat(64)]: "x".repeat(1024),
+      tabbed: "one\ttwo\nthree",
+      k2: "é中",
+    };
+    const ok = commands.input("s1", { blocks: [{ type: "text", Text: "x" }], metadata: edge });
+    expect(() => validateFactory("input_request", ok.request)).not.toThrow();
+    const empty = commands.input("s1", { blocks: [{ type: "text", Text: "x" }], metadata: {} });
+    expect(empty.request).not.toHaveProperty("metadata");
   });
 });
