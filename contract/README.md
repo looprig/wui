@@ -4,6 +4,9 @@ This directory is a vendored, version-pinned copy of Core's `sessionwire/v1`
 wire artifacts: the JSON Schema documents in `schema/` and golden fixtures in
 `fixtures/`. `VERSION` records the Core version copied here; it matches
 `CORE_VERSION` in the `Makefile` and the direct Core requirement in `go.mod`.
+Core v0.12.0 supplies 43 schemas and 43 fixtures, including eight new
+principal/metadata schema-and-fixture pairs; the 35 previous fixtures are
+byte-identical to the prior release.
 
 Core is the authority for this contract. WUI keeps an exact local mirror so its
 browser protocol can be reviewed and tested without resolving a sibling checkout.

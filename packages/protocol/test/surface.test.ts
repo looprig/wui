@@ -249,6 +249,9 @@ describe("@looprig/protocol public surface", () => {
   it("exports the payload decoders", () => {
     for (const name of [
       "decodeEnduring",
+      "decodePrincipal",
+      "eventPrincipal",
+      "principalLabel",
       "isZeroUUID",
       "decodeBlock",
       "decodeBlocks",
@@ -322,6 +325,11 @@ describe("@looprig/protocol public surface", () => {
       "createClient",
       "createFactoryClient",
       "createFactoryCommands",
+      "MessageMetadataError",
+      "MAX_METADATA_FIELDS",
+      "MAX_METADATA_KEY_BYTES",
+      "MAX_METADATA_VALUE_BYTES",
+      "MAX_METADATA_BYTES",
       "createClientLink",
       "FactoryRestReads",
       "createHostTransport",
@@ -352,6 +360,10 @@ describe("@looprig/protocol public surface", () => {
     // be there too or the pair is inconsistent.
     expect(protocol).toHaveProperty("bffErrorResponseSchema");
     expect(protocol).toHaveProperty("validateBFFErrorResponse");
+    for (const name of ["factoryCreateRequestSchema", "factoryInputRequestSchema", "factoryInterruptRequestSchema",
+      "factoryRestoreRequestSchema", "factoryGateResponseRequestSchema", "factoryPrincipalSchema"]) {
+      expect(protocol, `Factory schema missing from the barrel: ${name}`).toHaveProperty(name);
+    }
   });
 
   it("keeps the package's internal decode helpers OFF the public surface", () => {

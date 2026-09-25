@@ -21,6 +21,21 @@ A composing server should keep Factory's session-journal resolver wired (as
 Carbon does with `WithSessionJournalResolver`); without it the SPA cannot
 match a session's events to the commands it sent.
 
+## Principal, metadata and the presenter frame
+
+Create and input commands may carry optional app-defined `metadata`: string
+values within Core's field and byte limits. The browser checks those limits
+before minting a command identity. Metadata is audit-only unless the agent's
+presenter chooses to render it. A client never sends `principal`; Factory
+verifies and stamps the sender.
+
+When a journal records presenter context, the transcript dims those blocks
+around the user's own message and labels the sender `from <subject>`.
+Interrupts and gate answers also name their stamped sender. Journals written
+before harness v0.41.0 render as before. A client sending metadata needs
+Factory v0.12.0 or newer; it should feature-detect with
+`/v1/capabilities` (`message_metadata`). WUI does not yet read that flag.
+
 ## Install
 
 ```sh
