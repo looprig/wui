@@ -66,6 +66,50 @@ export function isZeroUUID(id: string | undefined): boolean {
   return id === undefined || id === "" || id === ZERO_UUID;
 }
 
+/** The sender Factory verified and stamped; display names are not identity. */
+export interface MessagePrincipal {
+  tenant: string;
+  subject: string;
+  kind: "actor" | "service";
+}
+
+/** Public journal projection of harness v0.41.0 MessageInput. Metadata is audit-only. */
+export interface MessageInput {
+  principal?: MessagePrincipal;
+  prefix: number;
+  suffix: number;
+}
+
+export function decodePrincipal(raw: unknown): MessagePrincipal | undefined {
+  if (!isRecord(raw)) return undefined;
+  const tenant = str(raw["tenant"]);
+  const subject = str(raw["subject"]);
+  const kind = str(raw["kind"]);
+  if (tenant === "" || subject === "" || (kind !== "actor" && kind !== "service")) return undefined;
+  return { tenant, subject, kind };
+}
+
+function count(raw: unknown): number {
+  return typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 ? raw : 0;
+}
+
+function decodeInput(raw: unknown): MessageInput | undefined {
+  if (!isRecord(raw)) return undefined;
+  const principal = decodePrincipal(raw["principal"]);
+  return { ...(principal === undefined ? {} : { principal }), prefix: count(raw["prefix"]), suffix: count(raw["suffix"]) };
+}
+
+/** Sender named by a public event body, if it carries a valid principal. */
+export function eventPrincipal(body: unknown): MessagePrincipal | undefined {
+  if (!isRecord(body)) return undefined;
+  const input = body["input"];
+  return decodePrincipal(isRecord(input) ? input["principal"] : undefined) ?? decodePrincipal(body["principal"]);
+}
+
+export function principalLabel(principal: MessagePrincipal): string {
+  return principal.kind === "service" ? `service ${principal.subject}` : principal.subject;
+}
+
 /**
  * TurnStarted is the first enduring turn event, carrying the exact UserMessage
  * committed as the turn's first message. TurnFoldedInto is the same shape for
@@ -84,6 +128,8 @@ export interface TurnOpenerPayload {
   kind: "TurnStarted" | "TurnFoldedInto";
   turnIndex: number;
   message: ConversationMessage | undefined;
+  /** Present only when the additive harness v0.41.0 member was on the wire. */
+  input?: MessageInput;
 }
 
 /**
@@ -186,6 +232,8 @@ export interface TurnFailedPayload {
 export interface TurnInterruptedPayload {
   kind: "TurnInterrupted";
   turnIndex: number;
+  /** Present only when Factory stamped the sender. */
+  principal?: MessagePrincipal;
 }
 
 /**
@@ -219,6 +267,8 @@ export interface InputCancelledPayload {
   turnIndex: number;
   reason: number;
   message: ConversationMessage | undefined;
+  /** Present only when the additive harness v0.41.0 member was on the wire. */
+  input?: MessageInput;
 }
 
 /**
@@ -407,6 +457,8 @@ export interface GateResolvedPayload {
   reason: string;
   action: string;
   source: { kind: string; reason: string };
+  /** Present only when Factory stamped the sender. */
+  principal?: MessagePrincipal;
 }
 
 /** The type-specific half of a decoded enduring event. Extended per task. */
@@ -469,12 +521,15 @@ export function decodeEnduring(envelope: EventEnvelope): DecodedEnduring {
 function decodePayload(type: string, raw: Record<string, unknown>): EnduringPayload {
   switch (type) {
     case "TurnStarted":
-    case "TurnFoldedInto":
+    case "TurnFoldedInto": {
+      const input = decodeInput(raw["input"]);
       return {
         kind: type,
         turnIndex: num(raw["turn_index"]),
         message: isRecord(raw["message"]) ? decodeMessage(raw["message"]) : undefined,
+        ...(input === undefined ? {} : { input }),
       };
+    }
     case "StepDone":
       return {
         kind: "StepDone",
@@ -498,23 +553,29 @@ function decodePayload(type: string, raw: Record<string, unknown>): EnduringPayl
         errorMessage: str(err["message"]),
       };
     }
-    case "TurnInterrupted":
-      return { kind: "TurnInterrupted", turnIndex: num(raw["turn_index"]) };
+    case "TurnInterrupted": {
+      const principal = decodePrincipal(raw["principal"]);
+      return { kind: "TurnInterrupted", turnIndex: num(raw["turn_index"]), ...(principal === undefined ? {} : { principal }) };
+    }
     case "TurnRejected": {
       const reason = num(raw["reason"]);
       return { kind: "TurnRejected", reason, reasonText: rejectReasonText(reason) };
     }
-    case "InputCancelled":
+    case "InputCancelled": {
+      const input = decodeInput(raw["input"]);
       return {
         kind: "InputCancelled",
         turnIndex: num(raw["turn_index"]),
         reason: num(raw["reason"]),
         message: isRecord(raw["message"]) ? decodeMessage(raw["message"]) : undefined,
+        ...(input === undefined ? {} : { input }),
       };
+    }
     case "GateOpened":
       return { kind: "GateOpened", gate: decodeGate(raw["gate"]) };
     case "GateResolved": {
       const source = isRecord(raw["source"]) ? raw["source"] : {};
+      const principal = decodePrincipal(raw["principal"]);
       return {
         kind: "GateResolved",
         gateId: str(raw["gate_id"]),
@@ -522,6 +583,7 @@ function decodePayload(type: string, raw: Record<string, unknown>): EnduringPayl
         reason: str(raw["reason"]),
         action: str(raw["action"]),
         source: { kind: str(source["kind"]), reason: str(source["reason"]) },
+        ...(principal === undefined ? {} : { principal }),
       };
     }
     case "LoopStarted":

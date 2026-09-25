@@ -33,7 +33,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { decodeEnduring, isZeroUUID, rejectReasonText } from "../src/enduring.js";
+import { decodeEnduring, eventPrincipal, isZeroUUID, principalLabel, rejectReasonText } from "../src/enduring.js";
 import type { EventEnvelope } from "../src/types.js";
 import { LOOP_A, LOOP_B, ZERO_UUID, envelope, textBlockWire, userMessageWire } from "./helpers.js";
 
@@ -126,6 +126,55 @@ describe("isZeroUUID", () => {
     expect(nearlyZero).toHaveLength(36);
     expect(isZeroUUID(nearlyZero)).toBe(false);
     expect(isZeroUUID(LOOP_A)).toBe(false);
+  });
+});
+
+describe("message input and stamped principal", () => {
+  const alex = { tenant: "acme", subject: "user_alex", kind: "actor" };
+
+  it("decodes TurnStarted input but does not project audit-only metadata", () => {
+    const decoded = decodeEnduring(envelope({
+      type: "TurnStarted",
+      payload: {
+        message: userMessageWire([textBlockWire("[from: Alex]"), textBlockWire("add milk")]),
+        input: { principal: alex, metadata: { space: "family" }, prefix: 1 },
+      },
+    }));
+    expect(decoded.payload).toMatchObject({ input: { principal: alex, prefix: 1, suffix: 0 } });
+    expect((decoded.payload as { input: object }).input).not.toHaveProperty("metadata");
+  });
+
+  it("preserves the pre-feature payload shape when input is absent", () => {
+    const decoded = decodeEnduring(envelope({ type: "TurnStarted", payload: { message: userMessageWire([textBlockWire("hi")]) } }));
+    expect(decoded.payload).not.toHaveProperty("input");
+  });
+
+  it("decodes input on TurnFoldedInto and InputCancelled", () => {
+    for (const type of ["TurnFoldedInto", "InputCancelled"]) {
+      const decoded = decodeEnduring(envelope({ type, payload: { input: { principal: alex, suffix: 2 } } }));
+      expect(decoded.payload).toMatchObject({ input: { principal: alex, prefix: 0, suffix: 2 } });
+    }
+  });
+
+  it("decodes interrupt and gate principals but drops malformed principals", () => {
+    expect(decodeEnduring(envelope({ type: "TurnInterrupted", payload: { principal: alex } })).payload)
+      .toStrictEqual({ kind: "TurnInterrupted", turnIndex: 0, principal: alex });
+    expect(decodeEnduring(envelope({ type: "GateResolved", payload: { gate_id: "g1", principal: alex } })).payload)
+      .toMatchObject({ kind: "GateResolved", principal: alex });
+    for (const bad of [{ tenant: "acme", subject: "", kind: "actor" }, { tenant: "acme", subject: "x", kind: "robot" }, "alex", null]) {
+      expect(decodeEnduring(envelope({ type: "TurnInterrupted", payload: { principal: bad } })).payload)
+        .not.toHaveProperty("principal");
+    }
+  });
+
+  it("finds principals in public event bodies and labels service senders", () => {
+    expect(eventPrincipal({ type: "TurnStarted", input: { principal: alex } })).toStrictEqual(alex);
+    expect(eventPrincipal({ type: "GateResolved", principal: { ...alex, subject: "svc", kind: "service" } }))
+      .toStrictEqual({ ...alex, subject: "svc", kind: "service" });
+    expect(eventPrincipal({ type: "StepDone" })).toBeUndefined();
+    expect(eventPrincipal("bad body")).toBeUndefined();
+    expect(principalLabel({ ...alex, kind: "actor" })).toBe("user_alex");
+    expect(principalLabel({ ...alex, subject: "svc", kind: "service" })).toBe("service svc");
   });
 });
 
