@@ -1,5 +1,5 @@
 import { memo } from "react";
-import type { TranscriptRow } from "@looprig/protocol";
+import { principalLabel, type TranscriptRow } from "@looprig/protocol";
 import { AgentProse } from "./agent-prose";
 import { SystemNotice } from "./system-notice";
 import { ToolCallStep } from "./tool-call-step";
@@ -54,7 +54,7 @@ export const TranscriptRowView = memo(function TranscriptRowView({
 function RowBody({ row }: { row: TranscriptRow }): React.JSX.Element {
   switch (row.kind) {
     case "user":
-      return <UserBubble blocks={row.blocks} />;
+      return <UserBubble blocks={row.blocks} frame={row.frame} principal={row.principal} />;
     case "assistant":
       return (
         <AgentProse
@@ -72,7 +72,9 @@ function RowBody({ row }: { row: TranscriptRow }): React.JSX.Element {
       // Content-less by construction: the only fact is that a turn was cut
       // short. Rendering nothing would make an interrupted turn look like one
       // that simply ended.
-      return <SystemNotice text="Turn interrupted" level="info" testId="tombstone-row" />;
+      return <SystemNotice
+        text={row.principal === undefined ? "Turn interrupted" : `Turn interrupted by ${principalLabel(row.principal)}`}
+        level="info" testId="tombstone-row" />;
     default:
       // Exhaustive: a row kind added to @looprig/protocol fails the build here
       // rather than silently rendering as nothing.

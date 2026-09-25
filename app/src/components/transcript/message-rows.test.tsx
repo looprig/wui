@@ -16,13 +16,31 @@ function text(blocks: string[]): ContentBlock[] {
 }
 
 describe("UserBubble", () => {
+  it("dims the presenter frame around the user's own blocks and names the sender", async () => {
+    render(<UserBubble blocks={text(["add milk"])}
+      frame={{ prefix: text(["[from: Alex]"]), suffix: text(["[end]"]) }}
+      principal={{ tenant: "acme", subject: "user_alex", kind: "actor" }} />);
+    await expect.element(page.getByTestId("user-from-chip")).toHaveTextContent("from user_alex");
+    const frame = [...document.querySelectorAll("[data-testid=user-frame-block]")];
+    expect(frame.map((item) => item.textContent)).toEqual(["[from: Alex]", "[end]"]);
+    for (const item of frame) expect(item.className).toContain("opacity-60");
+    const all = [...node("user-bubble").querySelectorAll("[data-testid=user-frame-block],[data-testid=user-text]")];
+    expect(all.map((item) => item.textContent)).toEqual(["[from: Alex]", "add milk", "[end]"]);
+  });
+
+  it("keeps a pre-feature user bubble free of frame blocks and sender chip", async () => {
+    render(<UserBubble blocks={text(["plain"])} />);
+    await expect.element(page.getByTestId("user-bubble")).toBeInTheDocument();
+    expect(document.querySelector("[data-testid=user-from-chip]")).toBeNull();
+    expect(document.querySelector("[data-testid=user-frame-block]")).toBeNull();
+  });
   it("right-aligns the turn and marks a pending row as not yet accepted", async () => {
     render(<UserBubble blocks={text(["run the tests"])} pending />);
     const bubble = page.getByTestId("user-bubble");
     await expect.element(bubble).toBeInTheDocument();
     expect(bubble.element().textContent).toContain("run the tests");
     expect(bubble.element().getAttribute("data-pending")).toBe("true");
-    expect(node("user-row").className).toContain("justify-end");
+    expect(node("user-row").className).toContain("items-end");
   });
 
   it("is not marked pending once the server has acknowledged the turn", async () => {

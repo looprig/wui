@@ -54,6 +54,12 @@ describe("TranscriptRowView", () => {
     expect(tombstone.element().textContent).toContain("interrupted");
   });
 
+  it("names a stamped interrupter but preserves the old wording when absent", async () => {
+    render(<TranscriptRowView row={{ ...rows.tombstone, principal: { tenant: "acme", subject: "user_alex", kind: "actor" } }} />);
+    await expect.element(page.getByTestId("tombstone-row")).toHaveTextContent("Turn interrupted by user_alex");
+    expect(rows.tombstone).not.toHaveProperty("principal");
+  });
+
   it("carries a notice's own level through rather than flattening it", async () => {
     render(<TranscriptRowView row={{ ...rows.notice, level: "error", text: "Turn rejected" }} />);
     const notice = page.getByTestId("system-notice");

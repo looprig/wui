@@ -1,4 +1,4 @@
-import type { ContentBlock } from "@looprig/protocol";
+import { principalLabel, type ContentBlock, type MessagePrincipal, type UserFrame } from "@looprig/protocol";
 import { cn } from "../../lib/cn";
 
 /**
@@ -16,16 +16,40 @@ import { cn } from "../../lib/cn";
  * acknowledges the command (`view.commandOutcomes`). It is PER-TAB and
  * deliberately dimmed: a second tab, and the TUI, see nothing for this submit
  * until `TurnStarted` (design §3b).
+ * A presenter frame was seen by the model but not typed by the user, so it is
+ * dimmed around the user's own blocks. A Factory-stamped sender gets a chip.
  */
+function BlockView({ block, testId, dim }: { block: ContentBlock; testId: string; dim?: boolean }): React.JSX.Element {
+  return block.type === "text" ? (
+    <span data-testid={testId} className={cn("block", dim && "opacity-60 text-muted")}>{block.text}</span>
+  ) : (
+    <span
+      data-testid={dim ? testId : "user-other-block"}
+      className={cn("mt-1 block w-fit rounded bg-bg px-1.5 py-0.5 font-mono text-xs text-muted", dim && "opacity-60")}
+    >
+      {block.type === "other" ? block.wireType : block.type}
+    </span>
+  );
+}
+
 export function UserBubble({
   blocks,
   pending,
+  frame,
+  principal,
 }: {
   blocks: readonly ContentBlock[];
   pending?: boolean;
+  frame?: UserFrame;
+  principal?: MessagePrincipal;
 }): React.JSX.Element {
   return (
-    <div data-testid="user-row" className="flex justify-end px-4 py-2">
+    <div data-testid="user-row" className="flex flex-col items-end px-4 py-2">
+      {principal === undefined ? null : (
+        <span data-testid="user-from-chip" className="mb-1 rounded-full bg-bg px-2 py-0.5 font-mono text-xs text-muted">
+          from {principalLabel(principal)}
+        </span>
+      )}
       <div
         data-testid="user-bubble"
         data-pending={pending ? "true" : "false"}
@@ -34,24 +58,9 @@ export function UserBubble({
           pending && "opacity-60",
         )}
       >
-        {blocks.map((block, index) =>
-          block.type === "text" ? (
-            // The index is the key on purpose: a message's blocks are a
-            // fixed, immutable array committed by one event — nothing
-            // reorders, inserts or removes within it.
-            <span key={index} data-testid="user-text" className="block">
-              {block.text}
-            </span>
-          ) : (
-            <span
-              key={index}
-              data-testid="user-other-block"
-              className="mt-1 block w-fit rounded bg-bg px-1.5 py-0.5 font-mono text-xs text-muted"
-            >
-              {block.type === "other" ? block.wireType : block.type}
-            </span>
-          ),
-        )}
+        {frame?.prefix.map((block, index) => <BlockView key={`p${index}`} block={block} testId="user-frame-block" dim />)}
+        {blocks.map((block, index) => <BlockView key={index} block={block} testId="user-text" />)}
+        {frame?.suffix.map((block, index) => <BlockView key={`s${index}`} block={block} testId="user-frame-block" dim />)}
       </div>
     </div>
   );
