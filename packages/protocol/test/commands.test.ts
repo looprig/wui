@@ -311,6 +311,24 @@ describe("message metadata on create and input", () => {
     expect(generate).not.toHaveBeenCalled();
   });
 
+  it("retains the metadata values it validated when a caller getter changes", () => {
+    let reads = 0;
+    const fields = Object.defineProperty({}, "note", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? "safe" : "bad\u0000value";
+      },
+    }) as MessageMetadata;
+    const commands = createFactoryCommands({ link: fakeLink([]), idGenerator: ids("c1") });
+
+    const pending = commands.input("s1", { blocks: [{ type: "text", Text: "x" }], metadata: fields });
+
+    expect(reads).toBe(1);
+    expect(pending.request.metadata).toStrictEqual({ note: "safe" });
+    expect(() => validateFactory("input_request", pending.request)).not.toThrow();
+  });
+
   it("accepts Core boundaries and omits an empty metadata object", () => {
     const commands = createFactoryCommands({ link: fakeLink([]), idGenerator: ids("c1", "c2") });
     const edge: MessageMetadata = {

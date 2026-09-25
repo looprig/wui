@@ -183,8 +183,8 @@ function metadata(value: MessageMetadata | undefined): MessageMetadata | undefin
   const entries = Object.entries(value);
   if (entries.length === 0) return undefined;
   if (entries.length > MAX_METADATA_FIELDS) throw new MessageMetadataError("too_many_fields");
-  entries.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
-  for (const [key, field] of entries) {
+  const sortedEntries = [...entries].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  for (const [key, field] of sortedEntries) {
     if (!METADATA_KEY.test(key) || idEncoder.encode(key).byteLength > MAX_METADATA_KEY_BYTES) {
       throw new MessageMetadataError("invalid_key");
     }
@@ -193,8 +193,8 @@ function metadata(value: MessageMetadata | undefined): MessageMetadata | undefin
     if (idEncoder.encode(field).byteLength > MAX_METADATA_VALUE_BYTES) throw new MessageMetadataError("value_too_large", key);
     if (!validMetadataValue(field)) throw new MessageMetadataError("invalid_value", key);
   }
-  if (canonicalMetadataBytes(entries) > MAX_METADATA_BYTES) throw new MessageMetadataError("too_large");
-  return Object.fromEntries(Object.entries(value));
+  if (canonicalMetadataBytes(sortedEntries) > MAX_METADATA_BYTES) throw new MessageMetadataError("too_large");
+  return Object.fromEntries(entries);
 }
 
 function blocks(value: readonly Record<string, unknown>[] | undefined, required: boolean): readonly Record<string, unknown>[] | undefined {
