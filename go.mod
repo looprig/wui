@@ -13,9 +13,9 @@ tool (
 // Because no compiled package imports Core, `go mod tidy` DROPS this require --
 // use `go get` to move it, never tidy (see CLAUDE.md).
 //
-// v0.11.0 is the version contract/ is vendored from. Keep it in step with
+// v0.12.0 is the version contract/ is vendored from. Keep it in step with
 // CORE_VERSION in the Makefile; contract/contract_test.go fails if they part.
-require github.com/looprig/core v0.11.0
+require github.com/looprig/core v0.12.0
 
 require (
 	cloud.google.com/go v0.123.0 // indirect

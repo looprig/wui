@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://looprig.dev/sessionwire/v1/create_request.schema.json",
-  "title": "CreateRequest",
-  "description": "Retry-safe durable create command. session_id and command_id are client-generated opaque V1 identities. metadata is optional client-supplied app-defined fields; principal is optional and only ever Factory-stamped.",
+  "$id": "https://looprig.dev/sessionwire/v1/create_request_metadata.schema.json",
+  "title": "CreateRequestMetadata",
+  "description": "A CreateRequest carrying client metadata. Same record and decoder as create_request; this pair pins the metadata-carrying shape.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "command_id", "session_id", "agent_id"],
+  "required": ["version", "command_id", "session_id", "agent_id", "metadata"],
   "properties": {
     "version": {"const": 1},
     "command_id": {"$ref": "#/$defs/id"},

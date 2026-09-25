@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://looprig.dev/sessionwire/v1/interrupt_request.schema.json",
-  "title": "InterruptRequest",
-  "description": "Retry-safe durable interrupt command. principal is optional and only ever Factory-stamped; metadata is never carried.",
+  "$id": "https://looprig.dev/sessionwire/v1/restore_request_principal.schema.json",
+  "title": "RestoreRequestPrincipal",
+  "description": "The RestoreRequest a Factory emits after stamping the verified sender. Same record and decoder as restore_request; this pair pins the principal-carrying shape.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "command_id", "session_id"],
+  "required": ["version", "command_id", "session_id", "principal"],
   "properties": {
     "version": {"const": 1},
     "command_id": {"$ref": "#/$defs/id"},

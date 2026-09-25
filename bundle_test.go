@@ -41,8 +41,8 @@ func TestBundleProtocolVersionReadsEmbeddedManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BundleProtocolVersion(): unexpected error %v", err)
 	}
-	if got.CoreVersion != "v0.11.0" {
-		t.Errorf("BundleProtocolVersion().CoreVersion = %q, want %q", got.CoreVersion, "v0.11.0")
+	if got.CoreVersion != "v0.12.0" {
+		t.Errorf("BundleProtocolVersion().CoreVersion = %q, want %q", got.CoreVersion, "v0.12.0")
 	}
 	if got.ProtocolVersion != "0.1.0" {
 		t.Errorf("BundleProtocolVersion().ProtocolVersion = %q, want %q", got.ProtocolVersion, "0.1.0")

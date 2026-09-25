@@ -62,7 +62,7 @@ check: fmt-check vet check-staticcheck check-gosec check-vuln test build
 # The pinned core version contract/ is vendored from. Keep in sync with the
 # go.mod require; the drift guard (contract/contract_test.go) fails if they part,
 # both on file bytes and on contract/VERSION.
-CORE_VERSION := v0.11.0
+CORE_VERSION := v0.12.0
 # Deferred (=), not immediate (:=): an immediate assignment runs `go list` on
 # EVERY make invocation, so `make fmt` on a machine with a cold module cache
 # would trigger a core download. Deferred, it runs only inside this recipe.
