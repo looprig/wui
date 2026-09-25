@@ -1,5 +1,7 @@
 import {
   GATE_APPROVAL_ACTIONS,
+  eventPrincipal,
+  principalLabel,
   toolResultCaptures,
   type FactoryReads,
   type FactorySessionStatus,
@@ -134,6 +136,7 @@ export function FactorySessionDetailPage({ sid, view, reads, gates, onGateRespon
           const captures = publicCaptures(event.body);
           const cause = causeCommandId(event.body);
           const own = cause !== "" && composer?.own.has(cause) === true;
+          const from = eventPrincipal(event.body);
           return (
             <article
               key={event.event_id}
@@ -143,6 +146,9 @@ export function FactorySessionDetailPage({ sid, view, reads, gates, onGateRespon
             >
               <span className="font-mono text-xs text-muted">#{event.journal_seq}</span>
               {own ? <span data-testid="factory-event-own" className="ml-2 font-mono text-xs text-loop">you</span> : null}
+              {from === undefined ? null : (
+                <span data-testid="factory-event-from" className="ml-2 font-mono text-xs text-muted">from {principalLabel(from)}</span>
+              )}
               <pre className="mt-1 overflow-auto whitespace-pre-wrap font-mono text-xs">{JSON.stringify(event.body, null, 2)}</pre>
               {captures.map((entry) => (
                 <div key={`${event.event_id}:${entry.index}`} data-capture-instance={`${event.event_id}:${entry.index}`}>

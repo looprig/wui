@@ -7,6 +7,22 @@ import { FactorySessionDetailPage, type FactoryDetailComposer, type FactoryDetai
 
 const inertReads = {} as FactoryReads;
 
+test("shows who sent a message, interrupted, and answered a gate", async () => {
+  const alex = { tenant: "acme", subject: "user_alex", kind: "actor" };
+  render(<FactorySessionDetailPage sid="session-1" view={view({ events: [
+    { event_id: "event-1", journal_seq: 1, body: { type: "TurnStarted", input: { principal: alex, prefix: 1 } } },
+    { event_id: "event-2", journal_seq: 2, body: { type: "TurnInterrupted", principal: alex } },
+    { event_id: "event-3", journal_seq: 3, body: { type: "GateResolved", principal: { ...alex, subject: "svc", kind: "service" } } },
+    { event_id: "event-4", journal_seq: 4, body: { type: "SessionIdle" } },
+  ] })} reads={inertReads} gates={[]} />);
+  await expect.element(page.getByTestId("factory-event-1")).toBeInTheDocument();
+  const chip = (seq: number) => document.querySelectorAll(`[data-testid=factory-event-${seq}] [data-testid=factory-event-from]`);
+  expect(chip(1)[0]?.textContent).toBe("from user_alex");
+  expect(chip(2)[0]?.textContent).toBe("from user_alex");
+  expect(chip(3)[0]?.textContent).toBe("from service svc");
+  expect(chip(4)).toHaveLength(0);
+});
+
 /**
  * A folded board entry, as `useFactoryGateBoard` + `useFactoryGate` produce
  * one. The page renders THIS, not `view.gates`: the raw page keeps a gate that
