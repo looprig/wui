@@ -25,15 +25,21 @@ import {
   eventJournalPageSchema,
   factoryAgentCapabilitySummarySchema,
   factoryCommandStatusSchema,
+  factoryCreateRequestSchema,
   factoryDepartmentCapabilitySummarySchema,
   factoryEnduringPublicationSchema,
   factoryEphemeralPublicationSchema,
   factoryErrorEnvelopeSchema,
+  factoryGateResponseRequestSchema,
+  factoryInputRequestSchema,
+  factoryInterruptRequestSchema,
   factoryJournalTipSchema,
   factoryObjectMetadataSchema,
   factoryPublicGatePageSchema,
   factoryPublicJournalPageSchema,
+  factoryPrincipalSchema,
   factoryRecentSessionPageSchema,
+  factoryRestoreRequestSchema,
   factorySessionResetSchema,
   factorySessionStatusSchema,
   factoryVersionNegotiationRequestSchema,
@@ -153,6 +159,12 @@ export type SessionStatus = FromSchema<
 >;
 
 /** Core sessionwire/v1 DTOs used only at the new Factory boundaries. */
+export type FactoryCreateRequest = FromSchema<typeof factoryCreateRequestSchema>;
+export type FactoryInputRequest = FromSchema<typeof factoryInputRequestSchema>;
+export type FactoryInterruptRequest = FromSchema<typeof factoryInterruptRequestSchema>;
+export type FactoryRestoreRequest = FromSchema<typeof factoryRestoreRequestSchema>;
+export type FactoryGateResponseRequest = FromSchema<typeof factoryGateResponseRequestSchema>;
+export type FactoryPrincipal = FromSchema<typeof factoryPrincipalSchema>;
 export type AgentCapabilitySummary = FromSchema<typeof factoryAgentCapabilitySummarySchema>;
 export type DepartmentCapabilitySummary = FromSchema<typeof factoryDepartmentCapabilitySummarySchema>;
 export type RecentSessionPage = FromSchema<typeof factoryRecentSessionPageSchema>;

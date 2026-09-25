@@ -62,7 +62,7 @@
     "test/conformance.test.ts": 40,
     "test/clientlink.test.ts": 16,
     "test/commands.test.ts": 19,
-    "test/contract.test.ts": 76,
+    "test/contract.test.ts": 78,
     "test/enduring.test.ts": 62,
     "test/errors.test.ts": 15,
     "test/factory-rest.test.ts": 31,

@@ -32,6 +32,12 @@ import type {
   EventHeader,
   EventJournalPage,
   FactorySessionStatus,
+  FactoryCreateRequest,
+  FactoryInputRequest,
+  FactoryInterruptRequest,
+  FactoryRestoreRequest,
+  FactoryGateResponseRequest,
+  FactoryPrincipal,
   EnduringPublication,
   EphemeralPublication,
   GateAcceptedResponse,
@@ -79,6 +85,10 @@ const DATE_TIME_PATTERN =
 const ajv = new Ajv2020({
   schemas: Object.values(allSchemas),
   strict: true,
+  // Core's gate-response oneOf uses `not: { required: [...] }` to express
+  // exclusive alternatives. Ajv's strictRequired lint rejects that valid
+  // schema shape; disabling the lint does not weaken runtime validation.
+  strictRequired: false,
 });
 
 ajv.addFormat("date-time", {
@@ -124,6 +134,12 @@ interface SchemaTypeMap {
 export type SchemaName = keyof SchemaTypeMap;
 
 interface FactorySchemaTypeMap {
+  create_request: FactoryCreateRequest;
+  input_request: FactoryInputRequest;
+  interrupt_request: FactoryInterruptRequest;
+  restore_request: FactoryRestoreRequest;
+  gate_response_request: FactoryGateResponseRequest;
+  principal: FactoryPrincipal;
   agent_capability_summary: AgentCapabilitySummary;
   department_capability_summary: DepartmentCapabilitySummary;
   recent_session_page: RecentSessionPage;

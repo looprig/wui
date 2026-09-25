@@ -71,6 +71,52 @@ describe("Factory boundary schema subset", () => {
     }
   });
 
+  it("has a same-stem Core fixture for every Factory schema mirror", () => {
+    const fixtures = new Set(readdirSync(fixtureDir));
+    const missing = Object.keys(factorySchemas).filter((stem) => !fixtures.has(`${stem}.json`));
+    expect(missing).toEqual([]);
+  });
+
+  it("validates the seven principal and metadata request variants and refuses invalid members", () => {
+    const variants: Record<string, FactorySchemaName> = {
+      "create_request_principal.json": "create_request",
+      "input_request_principal.json": "input_request",
+      "interrupt_request_principal.json": "interrupt_request",
+      "restore_request_principal.json": "restore_request",
+      "gate_response_request_principal.json": "gate_response_request",
+      "create_request_metadata.json": "create_request",
+      "input_request_metadata.json": "input_request",
+    };
+    const files = readdirSync(fixtureDir).filter((file) => /_request_(principal|metadata)\.json$/.test(file)).sort();
+    expect(files).toEqual(Object.keys(variants).sort());
+    for (const [file, schema] of Object.entries(variants)) {
+      expect(() => validateFactory(schema, readJson(fixtureDir, file)), file).not.toThrow();
+    }
+    const input = readJson(fixtureDir, "input_request_metadata.json") as Record<string, unknown>;
+    const interrupt = readJson(fixtureDir, "interrupt_request.json") as Record<string, unknown>;
+    const principal = (readJson(fixtureDir, "input_request_principal.json") as Record<string, unknown>)["principal"];
+    expect(() => validateFactory("interrupt_request", { ...interrupt, metadata: { space: "family" } }))
+      .toThrow(ContractValidationError);
+    expect(() => validateFactory("input_request", { ...input, metadata: { space: 1 } }))
+      .toThrow(ContractValidationError);
+    expect(() => validateFactory("input_request", { ...input, metadata: null }))
+      .toThrow(ContractValidationError);
+    expect(() => validateFactory("input_request", { ...input, metadata: {} }))
+      .toThrow(ContractValidationError);
+    expect(() => validateFactory("interrupt_request", {
+      ...interrupt,
+      principal: { ...(principal as Record<string, unknown>), display_name: "Alex" },
+    })).toThrow(ContractValidationError);
+    // Ajv's strictRequired lint must be off to compile this Core schema, but
+    // its oneOf still strictly enforces exactly one optimistic gate identity.
+    const gate = readJson(fixtureDir, "gate_response_request.json") as Record<string, unknown>;
+    expect(() => validateFactory("gate_response_request", {
+      ...gate, expected_open_journal_seq: 6,
+    })).toThrow(ContractValidationError);
+    const { expected_open_event_id: _eventId, ...withoutOpen } = gate;
+    expect(() => validateFactory("gate_response_request", withoutOpen)).toThrow(ContractValidationError);
+  });
+
   it("rejects malformed data through the Factory validator rather than casting it", () => {
     expect(() => validateFactory("command_status", { status: "accepted" })).toThrow(ContractValidationError);
     expect(() => validateFactory("enduring_publication", { type: "enduring_publication" })).toThrow(
