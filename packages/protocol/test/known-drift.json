@@ -81,6 +81,7 @@
     "test/rows-loops.test.ts": 21,
     "test/rows-partition.test.ts": 9,
     "test/rows-pending.test.ts": 22,
+    "test/rows-principal.test.ts": 7,
     "test/rows-stepdone.test.ts": 32,
     "test/rows-terminals.test.ts": 29,
     "test/rows-tools.test.ts": 13,

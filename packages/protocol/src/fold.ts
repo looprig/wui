@@ -85,10 +85,10 @@
  */
 import type { EphemeralFrame, EventEnvelope, EventHeader, PublicGatePage, StatusEvent } from "./types.js";
 import type { EnduringSseFrame, EphemeralSseFrame, SseFrame } from "./sse.js";
-import { decodeEnduring, isZeroUUID, turnFailureText } from "./enduring.js";
+import { decodeEnduring, isZeroUUID, principalLabel, turnFailureText, type MessageInput } from "./enduring.js";
 import { decodeGateProjection, type Gate, type PublicGateProjection } from "./gate.js";
 import { str, type ContentBlock } from "./blocks.js";
-import type { AssistantRow, LoopInfo, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft } from "./rows.js";
+import type { AssistantRow, LoopInfo, ToolRow, ToolRowStatus, TranscriptRow, TranscriptRowDraft, UserFrame } from "./rows.js";
 import {
   narrationOf,
   redactedThinkingOf,
@@ -970,6 +970,8 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
       if (!isZeroUUID(decoded.causeLoopId) || message === undefined) {
         return { ok: true, view: resolved };
       }
+      const framed = frameOf(message.blocks, decoded.payload.input);
+      const principal = decoded.payload.input?.principal;
       return {
         ok: true,
         view: appendRow(resolved, {
@@ -979,7 +981,9 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           journalSeq,
           live: false,
           orphanedLoop: isOrphanLoop(resolved, decoded.loopId),
-          blocks: message.blocks,
+          blocks: framed.blocks,
+          ...(framed.frame === undefined ? {} : { frame: framed.frame }),
+          ...(principal === undefined ? {} : { principal }),
         }),
       };
     }
@@ -1099,6 +1103,7 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
           journalSeq,
           live: false,
           orphanedLoop: isOrphanLoop(committed, decoded.loopId),
+          ...(decoded.payload.principal === undefined ? {} : { principal: decoded.payload.principal }),
         }),
       };
     }
@@ -1196,12 +1201,24 @@ function foldEnduringEnvelope(view: SessionView, envelope: EventEnvelope, journa
       return { ok: true, view: { ...next, gates } };
     }
     case "GateResolved": {
+      const answeredBy = decoded.payload.principal;
+      const withNotice = answeredBy === undefined ? next : appendRow(next, {
+        kind: "notice",
+        level: "info",
+        text: `gate ${decoded.payload.action === "" ? "closed" : decoded.payload.action} by ${principalLabel(answeredBy)}`,
+        loopId: decoded.loopId,
+        turnId: decoded.turnId,
+        journalSeq,
+        live: false,
+        orphanedLoop: isOrphanLoop(next, decoded.loopId),
+        principal: answeredBy,
+      });
       // A close for a gate this view never opened (a mid-stream join) removes
       // nothing and copies nothing — it is not an error.
-      if (!view.gates.has(decoded.payload.gateId)) return { ok: true, view: next };
+      if (!view.gates.has(decoded.payload.gateId)) return { ok: true, view: withNotice };
       const gates = new Map(view.gates);
       gates.delete(decoded.payload.gateId);
-      return { ok: true, view: { ...next, gates } };
+      return { ok: true, view: { ...withNotice, gates } };
     }
     default:
       return { ok: true, view: next };
@@ -1448,6 +1465,16 @@ function appendRow(view: SessionView, draft: TranscriptRowDraft): SessionView {
   const committed = { ...draft, ordinal: view.nextOrdinal };
   view.rows.push(committed);
   return { ...view, nextOrdinal: view.nextOrdinal + 1 };
+}
+
+/** Preserve all user content if a corrupt record's presenter counts cannot fit. */
+function frameOf(blocks: ContentBlock[], input: MessageInput | undefined): { blocks: ContentBlock[]; frame?: UserFrame } {
+  if (input === undefined || (input.prefix === 0 && input.suffix === 0)) return { blocks };
+  if (input.prefix + input.suffix > blocks.length) return { blocks };
+  return {
+    blocks: blocks.slice(input.prefix, blocks.length - input.suffix),
+    frame: { prefix: blocks.slice(0, input.prefix), suffix: blocks.slice(blocks.length - input.suffix) },
+  };
 }
 
 /**

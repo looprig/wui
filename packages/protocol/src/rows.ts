@@ -50,6 +50,7 @@
  * never reach the browser; only the fact that something was withheld does.
  */
 import type { ContentBlock, ConversationMessage } from "./blocks.js";
+import type { MessagePrincipal } from "./enduring.js";
 import type { ToolResultCaptureSummary } from "./toolsummary.js";
 
 export type NoticeLevel = "info" | "warn" | "error";
@@ -81,10 +82,19 @@ export interface TranscriptRowCommon {
   orphanedLoop: boolean;
 }
 
-/** A committed user input: the exact `UserMessage` the turn opened with. */
+/** Presenter context around a user's own blocks; the model saw it, the user did not type it. */
+export interface UserFrame {
+  prefix: ContentBlock[];
+  suffix: ContentBlock[];
+}
+
+/** A committed user input. A pre-feature row still carries its whole message in blocks. */
 export interface UserRow extends TranscriptRowCommon {
   kind: "user";
+  /** The user's own blocks when a frame is present, otherwise the whole message. */
   blocks: ContentBlock[];
+  frame?: UserFrame;
+  principal?: MessagePrincipal;
 }
 
 /** One assistant segment: sealed reasoning, narration, and a refusal if the model declined. */
@@ -153,11 +163,13 @@ export interface NoticeRow extends TranscriptRowCommon {
   kind: "notice";
   level: NoticeLevel;
   text: string;
+  principal?: MessagePrincipal;
 }
 
 /** The content-less tombstone for an interrupted turn. */
 export interface TombstoneRow extends TranscriptRowCommon {
   kind: "tombstone";
+  principal?: MessagePrincipal;
 }
 
 /**
