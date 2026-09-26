@@ -15,7 +15,7 @@ import type {
   PublicGatePage,
   PublicJournalPage,
 } from "@looprig/protocol";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { render, renderHook } from "vitest-browser-react";
 import { FakeClientLink } from "./testing/fake-link.js";
 import { FakeFactoryReads, publicEvent } from "./testing/fake-reads.js";
@@ -187,6 +187,7 @@ interface MountOptions {
   setup?(link: FakeClientLink, reads: FakeFactoryReads): void;
   /** Render under a root-level StrictMode double-mount. */
   strict?: boolean;
+  onView?(view: UseFactorySessionViewResult): void;
 }
 
 async function mountFactoryView(options: MountOptions = {}): Promise<FactoryHarness> {
@@ -212,6 +213,7 @@ async function mountFactoryView(options: MountOptions = {}): Promise<FactoryHarn
     });
     useEffect(() => {
       view.current = value;
+      options.onView?.(value);
     });
     return null;
   }
@@ -471,6 +473,93 @@ test("malformed and oversized live bodies never render", async () => {
   h.link.open[0]!.deliver(liveText("x".repeat(16_385)));
   await new Promise((resolve) => requestAnimationFrame(resolve));
   expect(h.view.current?.liveText).toEqual([]);
+});
+
+test("an oversized correlated delta suppresses further text for its key until StepDone", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  h.link.open[0]!.deliver(liveText("before"));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("before");
+  h.link.open[0]!.deliver(liveText("x".repeat(16_385)));
+  h.link.open[0]!.deliver(liveText("after"));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(h.view.current?.liveText[0]?.text).toBe("before");
+  h.link.open[0]!.deliver(completed(1, "StepDone"));
+  await expect.poll(() => h.view.current?.liveText).toEqual([]);
+  h.link.open[0]!.deliver(liveText("next"));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("next");
+});
+
+test("the 64 KiB budget freezes the growing key at its last visible text", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  for (let i = 0; i < 4; i++) h.link.open[0]!.deliver(liveText("x".repeat(16_000)));
+  await expect.poll(() => h.view.current?.liveText[0]?.text.length).toBe(64_000);
+  h.link.open[0]!.deliver(liveText("y".repeat(2_000)));
+  h.link.open[0]!.deliver(liveText("later"));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(h.view.current?.liveText[0]?.text).toBe("x".repeat(64_000));
+});
+
+test("a turn terminal preserves other loops' previews", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  const other = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  h.link.open[0]!.deliver(liveText("first"));
+  h.link.open[0]!.deliver(liveText("other", other));
+  await expect.poll(() => h.view.current?.liveText).toHaveLength(2);
+  h.link.open[0]!.deliver(completed(1, "TurnDone"));
+  await expect.poll(() => h.view.current?.liveText).toEqual([{ loopId: other, turnId: LIVE_TURN, text: "other" }]);
+});
+
+test("several deltas in one frame publish one preview", async () => {
+  const published: string[] = [];
+  const h = await mountFactoryView({ onView: (view) => {
+    if (view.liveText[0] !== undefined) published.push(view.liveText[0].text);
+  } });
+  await liveReady(h);
+  h.link.open[0]!.deliver(liveText("a"));
+  h.link.open[0]!.deliver(liveText("b"));
+  h.link.open[0]!.deliver(liveText("c"));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("abc");
+  expect(published).toEqual(["abc"]);
+});
+
+test("live text uses a timer when requestAnimationFrame is absent", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  vi.stubGlobal("requestAnimationFrame", undefined);
+  try {
+    h.link.open[0]!.deliver(liveText("timer"));
+    await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("timer");
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+test("StrictMode double-mount publishes live text once", async () => {
+  const h = await mountFactoryView({ strict: true });
+  await liveReady(h);
+  h.link.open[0]!.deliver(liveText("once"));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("once");
+  expect(h.link.open).toHaveLength(1);
+});
+
+test("access revocation clears the preview", async () => {
+  const failedViews: UseFactorySessionViewResult[] = [];
+  const h = await mountFactoryView({
+    setup: (_link, reads) => setPage(reads, 2, [2]),
+    onView: (view) => { if (view.state === "failed") failedViews.push(view); },
+  });
+  await liveReady(h, 2);
+  h.link.open[0]!.deliver(liveText("private"));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("private");
+  h.reads.fail("readJournal", new CoreProtocolError({ error: {
+    code: "not_authorized", message: "revoked", retryable: false,
+  } }));
+  await h.view.current!.browseEarlier();
+  await expect.poll(() => h.view.current?.state).toBe("failed");
+  expect(failedViews.map((view) => view.liveText)).toEqual([[]]);
 });
 
 test("preview is bounded across keys and one key cannot grow forever", async () => {
