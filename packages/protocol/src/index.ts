@@ -75,6 +75,7 @@ export * from "./rows.js";
 export * from "./toolsummary.js";
 export * from "./fold.js";
 export * from "./join.js";
+export * from "./factory-live-text.js";
 export * from "./live.js";
 export * from "./store.js";
 export * from "./content.js";
