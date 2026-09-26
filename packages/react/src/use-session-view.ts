@@ -8,6 +8,7 @@ import {
   DEFAULT_MAX_TAIL_PAGES,
   DEFAULT_MAX_REPAIR_ATTEMPTS,
   DEFAULT_REPAIR_DELAY_MS,
+  decodeFactoryLiveText,
   isRejectedJournalCursor,
   joinFactorySessionView,
   withJournalTip,
@@ -271,6 +272,8 @@ export interface UseFactorySessionViewResult {
   readonly gates: PublicGatePage | null;
   /** Current cold/live events plus one replaceable earlier page, ascending by `journal_seq`. */
   readonly events: readonly PublicJournalEvent[];
+  /** Uncommitted assistant text from this join generation. */
+  readonly liveText: readonly { readonly loopId: string; readonly turnId: string; readonly text: string }[];
   /** Greatest sequence this view has covered, from a page or a publication. */
   readonly coveredThrough: number;
   /** The last error seen, from a cold read or from the binding. */
@@ -315,6 +318,8 @@ type FactorySessionViewSnapshot = Omit<UseFactorySessionViewResult, "browseEarli
 // plus an eviction policy for this map, is a reasonable follow-up; it is
 // simply not done here. It does not need a backward page first.
 const MAX_EARLIER_PAGE_BYTES = DEFAULT_MAX_TAIL_BYTES;
+const MAX_LIVE_TEXT_BYTES = 65_536;
+const MAX_LIVE_TEXT_KEYS = 16;
 const earlierPageEncoder = new TextEncoder();
 
 const COLD: Omit<FactorySessionViewSnapshot, "coveredThrough"> = {
@@ -323,6 +328,7 @@ const COLD: Omit<FactorySessionViewSnapshot, "coveredThrough"> = {
   status: null,
   gates: null,
   events: [],
+  liveText: [],
   error: null,
   earlierState: "idle",
 };
@@ -335,6 +341,12 @@ const COLD: Omit<FactorySessionViewSnapshot, "coveredThrough"> = {
  */
 class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
   readonly #currentEvents = new Map<number, PublicJournalEvent>();
+  readonly #liveText = new Map<string, { loopId: string; turnId: string; text: string }>();
+  readonly #endedTurns = new Set<string>();
+  readonly #suppressedLiveKeys = new Set<string>();
+  #sessionStopped = false;
+  #joinGeneration = 0;
+  #liveFrame: number | undefined;
   readonly #earlierEvents = new Map<number, PublicJournalEvent>();
   #controller: AbortController | undefined;
   #coldController: AbortController | undefined;
@@ -457,6 +469,7 @@ class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
     this.#gateController?.abort();
     if (this.#gateTimer !== undefined) clearTimeout(this.#gateTimer);
     this.#gateTimer = undefined;
+    this.#resetLiveText();
   }
 
   browseEarlier(): Promise<void> {
@@ -658,6 +671,7 @@ class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
       for await (const event of joinFactorySessionView(
         liveReads,
         { subscribe: (options) => {
+          this.#resetLiveText();
           this.publish({ liveState: subscriptions++ === 0 ? "joining" : "repairing" });
           return this.link.bindSubscription(options);
         } },
@@ -675,9 +689,39 @@ class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
         },
       )) {
         if (!this.#current(generation, signal)) return;
-        if (event.kind === "ephemeral") continue;
+        if (event.generation !== this.#joinGeneration) {
+          this.#joinGeneration = event.generation;
+          this.#resetLiveText();
+        }
+        if (event.kind === "ephemeral") {
+          const delta = decodeFactoryLiveText(event.publication.body, this.sessionId);
+          if (delta !== null && !this.#sessionStopped) {
+            const key = `${delta.loopId}:${delta.turnId}`;
+            if (this.#endedTurns.has(key) || this.#suppressedLiveKeys.has(key)) continue;
+            const prior = this.#liveText.get(key);
+            const text = (prior?.text ?? "") + delta.text;
+            const total = [...this.#liveText.values()].reduce((sum, item) =>
+              sum + earlierPageEncoder.encode(item.text).byteLength, 0)
+              - earlierPageEncoder.encode(prior?.text ?? "").byteLength
+              + earlierPageEncoder.encode(text).byteLength;
+            if (total > MAX_LIVE_TEXT_BYTES || (prior === undefined && this.#liveText.size >= MAX_LIVE_TEXT_KEYS)) {
+              this.#liveText.delete(key);
+              this.#suppressedLiveKeys.add(key);
+            } else {
+              this.#liveText.set(key, { ...delta, text });
+            }
+            if (this.#liveFrame === undefined) {
+              this.#liveFrame = requestAnimationFrame(() => {
+                this.#liveFrame = undefined;
+                if (this.#current(generation, signal)) this.publish({ liveText: [...this.#liveText.values()] });
+              });
+            }
+          }
+          continue;
+        }
         let earlierReset = false;
         if (event.kind === "projection") {
+          this.#resetLiveText();
           // A lower committed floor is a protocol-validated reset. Remove rows
           // the server no longer holds before admitting this generation's tail.
           const lowered = projected
@@ -695,6 +739,7 @@ class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
           projected = true;
         } else if (event.kind === "public") {
           this.#currentEvents.set(event.event.journal_seq, event.event);
+          this.#reconcileLiveText(event.event.body);
         }
         liveCoverage = event.coveredThrough;
         this.publish({
@@ -707,9 +752,41 @@ class FactoryColdJoin extends Publisher<FactorySessionViewSnapshot> {
     } catch (cause) {
       if (this.#current(generation, signal)) {
         // A durable snapshot remains useful during a transport repair failure.
+        this.#resetLiveText();
         this.publish({ state: this.snapshot().status === null ? "failed" : "ready", liveState: "failed", error: asError(cause) });
       }
     }
+  }
+
+  #resetLiveText(): void {
+    this.#liveText.clear();
+    this.#endedTurns.clear();
+    this.#suppressedLiveKeys.clear();
+    this.#sessionStopped = false;
+    if (this.#liveFrame !== undefined) cancelAnimationFrame(this.#liveFrame);
+    this.#liveFrame = undefined;
+    if (this.snapshot().liveText.length > 0) this.publish({ liveText: [] });
+  }
+
+  #reconcileLiveText(body: unknown): void {
+    if (typeof body !== "object" || body === null || Array.isArray(body)) return;
+    const value = body as Record<string, unknown>;
+    if (value["type"] === "SessionStopped") {
+      this.#liveText.clear();
+      this.#sessionStopped = true;
+    } else if (value["type"] === "StepDone" && typeof value["loop_id"] === "string") {
+      for (const [key, item] of this.#liveText) if (item.loopId === value["loop_id"]) this.#liveText.delete(key);
+      for (const key of this.#suppressedLiveKeys) if (key.startsWith(`${value["loop_id"]}:`)) this.#suppressedLiveKeys.delete(key);
+    } else if ((value["type"] === "TurnDone" || value["type"] === "TurnFailed"
+      || value["type"] === "TurnInterrupted")
+      && typeof value["loop_id"] === "string" && typeof value["turn_id"] === "string") {
+      const key = `${value["loop_id"]}:${value["turn_id"]}`;
+      this.#liveText.delete(key);
+      this.#endedTurns.add(key);
+    } else return;
+    if (this.#liveFrame !== undefined) cancelAnimationFrame(this.#liveFrame);
+    this.#liveFrame = undefined;
+    this.publish({ liveText: [...this.#liveText.values()] });
   }
 
   #ordered(): readonly PublicJournalEvent[] {

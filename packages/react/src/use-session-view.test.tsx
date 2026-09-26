@@ -408,6 +408,165 @@ test("ephemeral publications do not enter durable history", async () => {
   expect(h.view.current?.coveredThrough).toBe(0);
 });
 
+const LIVE_LOOP = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const LIVE_TURN = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+function liveText(text: string, loopId = LIVE_LOOP, turnId = LIVE_TURN) {
+  return {
+    type: "ephemeral_publication" as const, tenant_id: TENANT, session_id: FSID,
+    body: { v: 1, type: "TokenDelta", session_id: FSID, loop_id: loopId, turn_id: turnId,
+      chunk: { chunk_type: "text", text } },
+  };
+}
+
+function completed(sequence: number, type: string, loopId = LIVE_LOOP, turnId = LIVE_TURN): EnduringPublication {
+  return {
+    ...enduringFor(sequence),
+    body: { v: 1, type, session_id: FSID, loop_id: loopId, turn_id: turnId },
+  };
+}
+
+test("Factory live text uses the existing subscription and never changes durable coverage", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  h.link.open[0]!.deliver(liveText("hello "));
+  h.link.open[0]!.deliver(liveText("world"));
+  await expect.poll(() => h.view.current?.liveText).toStrictEqual([
+    { loopId: LIVE_LOOP, turnId: LIVE_TURN, text: "hello world" },
+  ]);
+  expect(h.view.current?.events).toEqual([]);
+  expect(h.view.current?.coveredThrough).toBe(0);
+  expect(h.link.subscriptions).toHaveLength(1);
+});
+
+test("StepDone clears its loop while a later step in the same turn starts new text", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  h.link.open[0]!.deliver(liveText("first"));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("first");
+  h.link.open[0]!.deliver(completed(1, "StepDone"));
+  await expect.poll(() => h.view.current?.liveText).toEqual([]);
+  h.link.open[0]!.deliver(liveText("second"));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("second");
+});
+
+test.each(["TurnDone", "TurnFailed", "TurnInterrupted", "SessionStopped"])(
+  "%s clears preview and refuses later deltas for the ended turn or session", async (type) => {
+    const h = await mountFactoryView();
+    await liveReady(h);
+    h.link.open[0]!.deliver(liveText("before"));
+    await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("before");
+    h.link.open[0]!.deliver(completed(1, type));
+    await expect.poll(() => h.view.current?.liveText).toEqual([]);
+    h.link.open[0]!.deliver(liveText("late"));
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    expect(h.view.current?.liveText).toEqual([]);
+  },
+);
+
+test("malformed and oversized live bodies never render", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  h.link.open[0]!.deliver({ ...liveText("x"), body: { ...liveText("x").body, session_id: "private" } });
+  h.link.open[0]!.deliver(liveText("x".repeat(16_385)));
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  expect(h.view.current?.liveText).toEqual([]);
+});
+
+test("preview is bounded across keys and one key cannot grow forever", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  const other = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  h.link.open[0]!.deliver(liveText("x".repeat(16_000)));
+  h.link.open[0]!.deliver(liveText("y".repeat(16_000), other));
+  for (let i = 0; i < 5; i++) h.link.open[0]!.deliver(liveText("z".repeat(16_000)));
+  await expect.poll(() => h.view.current?.liveText.length).toBeGreaterThan(0);
+  expect(h.view.current!.liveText.reduce((sum, item) => sum + new TextEncoder().encode(item.text).byteLength, 0))
+    .toBeLessThanOrEqual(65_536);
+});
+
+test("reconnect clears the old preview before a new generation is live", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  const old = h.link.open[0]!;
+  old.deliver(liveText("old"));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("old");
+  h.link.drop();
+  await expect.poll(() => h.view.current?.liveText).toEqual([]);
+  await expect.poll(() => h.link.open.length).toBe(1);
+  old.deliver(liveText("stale"));
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  expect(h.view.current?.liveText).toEqual([]);
+});
+
+test("scope and session identity changes clear the preview", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  h.link.open[0]!.deliver(liveText("old"));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("old");
+  await h.rerender({ sessionId: "another-session" });
+  expect(h.view.current?.liveText).toEqual([]);
+});
+
+test("StepDone removes only its loop, including a delta still waiting for a frame", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  const other = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  h.link.open[0]!.deliver(liveText("other", other));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("other");
+  h.link.open[0]!.deliver(liveText("uncommitted"));
+  h.link.open[0]!.deliver(completed(1, "StepDone"));
+  await expect.poll(() => h.view.current?.coveredThrough).toBe(1);
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  expect(h.view.current?.liveText).toEqual([{ loopId: other, turnId: LIVE_TURN, text: "other" }]);
+});
+
+test("a validated reset projection clears the old generation preview", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  h.link.open[0]!.deliver(liveText("old"));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("old");
+  h.link.open[0]!.reset({
+    type: "session.reset", tenant_id: TENANT, session_id: FSID,
+    journal_tip: 0, last_contiguous: 0,
+  });
+  await expect.poll(() => h.view.current?.liveText).toEqual([]);
+});
+
+test("changing link scope clears the old preview and stale callbacks", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  const old = h.link.open[0]!;
+  old.deliver(liveText("old"));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("old");
+  await h.rerender({ scopeKey: "other-login" });
+  expect(h.view.current?.liveText).toEqual([]);
+  old.deliver(liveText("stale"));
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  expect(h.view.current?.liveText).toEqual([]);
+});
+
+test("failed realtime recovery drops its preview while retaining durable history", async () => {
+  const h = await mountFactoryView({ props: { maxRepairAttempts: 1, repairDelayMs: 0 } });
+  await liveReady(h);
+  h.link.open[0]!.deliver(liveText("transient"));
+  await expect.poll(() => h.view.current?.liveText[0]?.text).toBe("transient");
+  h.link.denied.add(FSID);
+  h.link.drop();
+  await expect.poll(() => h.view.current?.liveState).toBe("failed");
+  expect(h.view.current?.liveText).toEqual([]);
+  expect(h.view.current?.state).toBe("ready");
+});
+
+test("stop cancels a pending preview frame before a different session mounts", async () => {
+  const h = await mountFactoryView();
+  await liveReady(h);
+  h.link.open[0]!.deliver(liveText("old"));
+  await h.rerender({ sessionId: "another-session" });
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  expect(h.view.current?.liveText).toEqual([]);
+});
+
 test("cold capture follows an opaque continuation without a new tail or sequence-zero read", async () => {
   const h = await mountFactoryView({ setup: (link, reads) => {
     link.holdConnect = true;

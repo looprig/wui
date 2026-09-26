@@ -51,6 +51,7 @@ function view(overrides: Partial<UseFactorySessionViewResult> = {}): UseFactoryS
       session_id: "session-1", agent_id: "agent-1", state: "idle", residency: "cold", journal_tip: 2,
     },
     gates: { journal_tip: 2, open_gate_count: 0, gates: [] },
+    liveText: [],
     events: [
       { event_id: "event-1", journal_seq: 1, body: { type: "TurnStarted" } },
       { event_id: "event-2", journal_seq: 2, body: { type: "SessionIdle" } },

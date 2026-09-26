@@ -214,6 +214,7 @@ function view(overrides: Partial<UseFactorySessionViewResult> = {}): UseFactoryS
     status: { session_id: SID, agent_id: "agent-1", state: "waiting_on_gate", residency: "resident", journal_tip: 12 },
     gates: gatePage([gateRecord(GATE_A, 6), gateRecord(GATE_B, 7)]),
     events: [],
+    liveText: [],
     coveredThrough: 12,
     error: null,
     earlierState: "idle",
