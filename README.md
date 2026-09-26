@@ -21,6 +21,21 @@ A composing server should keep Factory's session-journal resolver wired (as
 Carbon does with `WithSessionJournalResolver`); without it the SPA cannot
 match a session's events to the commands it sent.
 
+## Live text (v0.5.0 release note)
+
+`UseFactorySessionViewResult.liveText` is a new **required** field. Consumers
+that construct this type must add `liveText` (usually `[]` in fixtures). Each
+entry is uncommitted assistant text with `loopId`, `turnId`, and `text`; the
+durable `StepDone` event replaces the preview. It does not advance journal
+coverage or add a durable event.
+
+Host sends at most **4 KiB of text per delta**. WUI accepts up to **16 KiB of
+text per delta** so older and newer peers can interoperate within that bound.
+Correlated text deltas that fail shape or size validation stop that key's
+preview until `StepDone`; a 64 KiB total preview budget freezes the current
+text rather than removing it. Live text is transient and clears on reconnect,
+session or scope change, terminal events, and access revocation.
+
 ## Principal, metadata and the presenter frame
 
 Create and input commands may carry optional app-defined `metadata`: string

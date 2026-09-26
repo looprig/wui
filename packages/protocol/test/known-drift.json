@@ -66,7 +66,7 @@
     "test/enduring.test.ts": 67,
     "test/errors.test.ts": 15,
     "test/factory-rest.test.ts": 31,
-    "test/factory-live-text.test.ts": 16,
+    "test/factory-live-text.test.ts": 17,
     "test/fold-contract-fixtures.test.ts": 1,
     "test/fold-gates.test.ts": 39,
     "test/fold-immutability.test.ts": 6,

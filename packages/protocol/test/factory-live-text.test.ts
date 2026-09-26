@@ -16,6 +16,24 @@ test("decodes only a correlated public text delta", () => {
   expect(decodeFactoryLiveText(body(), SESSION)).toStrictEqual({ loopId: LOOP, turnId: TURN, text: "hello" });
 });
 
+test("accepts an escape-heavy 16 KiB text chunk", () => {
+  const text = '"'.repeat(16_384);
+  expect(decodeFactoryLiveText(body(text), SESSION)).toStrictEqual({ loopId: LOOP, turnId: TURN, text });
+});
+
+test("identifies an oversized delta for this session so its key can be suppressed", () => {
+  expect(decodeFactoryLiveText(body("x".repeat(16_385)), SESSION)).toStrictEqual({
+    rejected: true, loopId: LOOP, turnId: TURN,
+  });
+});
+
+test.each([
+  ["nonstring text", body(42)],
+  ["oversized envelope", { ...body(), padding: "x".repeat(102_401) }],
+])("identifies %s as a rejected delta", (_name, value) => {
+  expect(decodeFactoryLiveText(value, SESSION)).toStrictEqual({ rejected: true, loopId: LOOP, turnId: TURN });
+});
+
 test.each([
   ["wrong version", { ...body(), v: 2 }],
   ["wrong kind", { ...body(), type: "ToolCallStarted" }],
@@ -27,9 +45,6 @@ test.each([
   ["malformed turn", { ...body(), turn_id: "bad" }],
   ["thinking chunk", { ...body(), chunk: { chunk_type: "thinking", thinking: "secret" } }],
   ["nontext chunk", { ...body(), chunk: { chunk_type: "tool_use", text: "secret" } }],
-  ["nonstring text", body(42)],
-  ["oversized text", body("x".repeat(16_385))],
-  ["oversized body", { ...body(), padding: "x".repeat(32_769) }],
   ["array body", []],
   ["null body", null],
 ])("refuses %s", (_name, value) => {
