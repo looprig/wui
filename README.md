@@ -1,5 +1,7 @@
 # wui
 
+> **Retired.** WUI v0.5.1 is the final release. Use [`@looprig/client` / `@looprig/react`](https://github.com/looprig/client) for the browser libraries; Carbon now owns the SPA and its embedded bundle. See [RETIREMENT.md](RETIREMENT.md).
+
 The reusable **web** user interface for [looprig](https://github.com/looprig/harness),
 and the browser counterpart to [`tui`](https://github.com/looprig/tui): a React 19 +
 Vite SPA built to a static bundle and embedded in the consumer's binary. The
